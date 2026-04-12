@@ -37,7 +37,7 @@ EMA_FAST = 50
 EMA_SLOW = 200
 RSI_PERIOD = 14
 
-RUN_INTERVAL = 300
+RUN_INTERVAL = 600
 
 client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
