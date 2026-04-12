@@ -1,3 +1,7 @@
+from flask import Flask
+import threading
+
+app = Flask(__name__)
 import math
 import pandas as pd
 import numpy as np
@@ -171,16 +175,26 @@ def run():
 # -----------------------
 # LOOP (RUN DAILY)
 # -----------------------
-import 
 import time
 
-if __name__ == "__main__":
-    print("Starting bot...")
-
+def bot_loop():
+    print("Bot loop started")
     while True:
         try:
             run()
         except Exception as e:
             print("Error:", e)
-time.sleep(60)
+
+        time.sleep(60)
+
+# Start bot in background
+threading.Thread(target=bot_loop).start()
+
+# Web server route (required by Render)
+@app.route("/")
+def home():
+    return "Bot is running"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
 
