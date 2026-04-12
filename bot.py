@@ -15,275 +15,208 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
 app = Flask(__name__)
 
+# =====================
+# ENV VARIABLES
+# =====================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL = "NBIS"
+SYMBOLS = ["NBIS", "WULF", "IREN", "CIFR"]
 
+# =====================
+# SETTINGS
+# =====================
 RISK_PER_TRADE = 0.01
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
-RSI_PERIOD = 14
+
 EMA_FAST = 50
 EMA_SLOW = 200
-BREAKOUT_LOOKBACK = 20
-RUN_INTERVAL_SECONDS = 300
-COOLDOWN_MINUTES = 60
+RSI_PERIOD = 14
 
-last_trade_time = None
+RUN_INTERVAL = 300
 
 client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
-def send_telegram(message: str) -> None:
+trade_log = []
+last_trade_time = None
+
+# =====================
+# TELEGRAM
+# =====================
+def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-    }
+    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
 
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+# =====================
+# INDICATORS
+# =====================
+def ema(series, span):
+    return series.ewm(span=span).mean()
 
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+def rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def fetch_data(symbol: str) -> pd.DataFrame:
-    df = yf.download(symbol, period="6mo", interval="1h", progress=False, auto_adjust=False)
+# =====================
+# DATA
+# =====================
+def get_data(symbol):
+    df = yf.download(symbol, period="3mo", interval="1h", progress=False)
 
     if df is None or df.empty:
-        return pd.DataFrame()
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df.rename(columns=str.title)
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        print(f"Missing columns: {missing}")
-        return pd.DataFrame()
-
-    df = df[required].dropna().copy()
-    return df
-
-def prepare_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or len(df) < 250:
-        return pd.DataFrame()
+        return None
 
     df["ema_fast"] = ema(df["Close"], EMA_FAST)
     df["ema_slow"] = ema(df["Close"], EMA_SLOW)
     df["rsi"] = rsi(df["Close"], RSI_PERIOD)
-    df["breakout_high"] = df["High"].rolling(BREAKOUT_LOOKBACK).max().shift(1)
+
     df.dropna(inplace=True)
+
+    if len(df) < 2:
+        return None
+
     return df
 
-def in_cooldown() -> bool:
-    global last_trade_time
-    if last_trade_time is None:
-        return False
-    return datetime.now(timezone.utc) - last_trade_time < timedelta(minutes=COOLDOWN_MINUTES)
-
-def get_position_qty(symbol: str) -> int:
-    try:
-        positions = client.get_all_positions()
-        for p in positions:
-            if p.symbol == symbol:
-                return int(float(p.qty))
-    except Exception as e:
-        print(f"Position check error: {e}")
-    return 0
-
-def has_open_orders(symbol: str) -> bool:
-    try:
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
-        orders = client.get_orders(filter=req)
-        return len(orders) > 0
-    except Exception as e:
-        print(f"Open order check error: {e}")
-        return False
-
-def calculate_qty(price: float, equity: float) -> int:
+# =====================
+# POSITION SIZE
+# =====================
+def calc_qty(price, equity):
     risk_amount = equity * RISK_PER_TRADE
     risk_per_share = price * STOP_LOSS_PCT
 
-    if risk_per_share <= 0:
+    if risk_per_share == 0:
         return 0
 
     qty = int(risk_amount // risk_per_share)
-    max_affordable = int(equity // price)
-    return max(0, min(qty, max_affordable))
+    return max(0, qty)
 
-def place_buy_order(symbol: str, qty: int) -> None:
-    order = MarketOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY
-    )
-    client.submit_order(order_data=order)
+# =====================
+# STRATEGY
+# =====================
+def run_strategy():
 
-def place_sell_order(symbol: str, qty: int) -> None:
-    order = MarketOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.DAY
-    )
-    client.submit_order(order_data=order)
+    for SYMBOL in SYMBOLS:
+        print(f"\nChecking {SYMBOL}")
 
-def should_buy(df: pd.DataFrame):
-    if df is None or df.empty or len(df) < 2:
-        return False, "Not enough data"
+        df = get_data(SYMBOL)
 
-    row = df.iloc[-1]
-    prev = df.iloc[-2]
+        if df is None:
+            print("No data")
+            continue
 
-    trend_ok = row["ema_fast"] > row["ema_slow"]
-    rsi_ok = row["rsi"] > 55
-    breakout_ok = row["Close"] > row["breakout_high"]
-    rising_now = row["Close"] > prev["Close"]
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
 
-    if not trend_ok:
-        return False, "Trend filter failed"
-    if not rsi_ok:
-        return False, "RSI filter failed"
-    if not breakout_ok:
-        return False, "Breakout filter failed"
-    if not rising_now:
-        return False, "Price momentum failed"
+        price = float(latest["Close"])
 
-    return True, "Buy signal confirmed"
+        # BUY CONDITIONS
+        trend = latest["ema_fast"] > latest["ema_slow"]
+        momentum = latest["rsi"] > 55
+        rising = latest["Close"] > prev["Close"]
 
-def should_sell(entry_price: float, current_price: float):
-    stop_price = entry_price * (1 - STOP_LOSS_PCT)
-    take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
+        if trend and momentum and rising:
+            try:
+                account = client.get_account()
+                equity = float(account.equity)
+            except:
+                continue
 
-    if current_price <= stop_price:
-        return True, f"Stop loss hit at {current_price:.2f}"
-    if current_price >= take_profit_price:
-        return True, f"Take profit hit at {current_price:.2f}"
+            qty = calc_qty(price, equity)
 
-    return False, "Hold"
+            if qty > 0:
+                client.submit_order(
+                    MarketOrderRequest(
+                        symbol=SYMBOL,
+                        qty=qty,
+                        side=OrderSide.BUY,
+                        time_in_force=TimeInForce.DAY
+                    )
+                )
 
-def get_avg_entry_price(symbol: str):
-    try:
-        positions = client.get_all_positions()
-        for p in positions:
-            if p.symbol == symbol:
-                return float(p.avg_entry_price)
-    except Exception as e:
-        print(f"Entry price error: {e}")
-    return None
+                msg = f"BUY {SYMBOL} @ {price}"
+                print(msg)
+                send_telegram(msg)
 
-def run_strategy() -> None:
-    global last_trade_time
+                trade_log.append({
+                    "symbol": SYMBOL,
+                    "type": "BUY",
+                    "price": price,
+                    "time": str(datetime.now())
+                })
 
-    print("Fetching data...")
-    df = fetch_data(SYMBOL)
-    df = prepare_indicators(df)
+        # SELL CONDITIONS (simple exit)
+        try:
+            positions = client.get_all_positions()
+            for p in positions:
+                if p.symbol == SYMBOL:
+                    entry = float(p.avg_entry_price)
+                    qty = int(float(p.qty))
 
-    if df is None or df.empty or len(df) < 2:
-        print("Not enough clean data, skipping...")
-        return
+                    stop = entry * (1 - STOP_LOSS_PCT)
+                    tp = entry * (1 + TAKE_PROFIT_PCT)
 
-    latest_price = float(df.iloc[-1]["Close"])
-    print(f"Latest {SYMBOL} price: {latest_price:.2f}")
+                    if price <= stop or price >= tp:
+                        client.submit_order(
+                            MarketOrderRequest(
+                                symbol=SYMBOL,
+                                qty=qty,
+                                side=OrderSide.SELL,
+                                time_in_force=TimeInForce.DAY
+                            )
+                        )
 
-    qty_held = get_position_qty(SYMBOL)
-    open_orders = has_open_orders(SYMBOL)
+                        msg = f"SELL {SYMBOL} @ {price}"
+                        print(msg)
+                        send_telegram(msg)
 
-    if open_orders:
-        print("Open orders already exist, skipping...")
-        return
+                        trade_log.append({
+                            "symbol": SYMBOL,
+                            "type": "SELL",
+                            "price": price,
+                            "time": str(datetime.now())
+                        })
 
-    if qty_held > 0:
-        entry_price = get_avg_entry_price(SYMBOL)
-        if entry_price is None:
-            print("Could not get entry price, skipping sell check")
-            return
+        except Exception as e:
+            print("Error:", e)
 
-        sell_signal, sell_reason = should_sell(entry_price, latest_price)
-        if sell_signal:
-            place_sell_order(SYMBOL, qty_held)
-            msg = f"SELL {SYMBOL} | Qty: {qty_held} | Reason: {sell_reason}"
-            print(msg)
-            send_telegram(msg)
-            last_trade_time = datetime.now(timezone.utc)
-        else:
-            print(f"Holding position | Entry: {entry_price:.2f} | Current: {latest_price:.2f}")
-        return
-
-    if in_cooldown():
-        print("Cooldown active, skipping new entry")
-        return
-
-    buy_signal, buy_reason = should_buy(df)
-    if not buy_signal:
-        print(f"No buy: {buy_reason}")
-        return
-
-    try:
-        account = client.get_account()
-        equity = float(account.equity)
-    except Exception as e:
-        print(f"Account fetch error: {e}")
-        return
-
-    qty = calculate_qty(latest_price, equity)
-    if qty <= 0:
-        print("Calculated quantity is zero, skipping...")
-        return
-
-    place_buy_order(SYMBOL, qty)
-    msg = (
-        f"BUY {SYMBOL} | Qty: {qty} | Price: {latest_price:.2f} | "
-        f"SL: {latest_price * (1 - STOP_LOSS_PCT):.2f} | "
-        f"TP: {latest_price * (1 + TAKE_PROFIT_PCT):.2f}"
-    )
-    print(msg)
-    send_telegram(msg)
-    last_trade_time = datetime.now(timezone.utc)
-
+# =====================
+# LOOP
+# =====================
 def bot_loop():
-    print("Bot loop started")
-    send_telegram("NBIS bot is live on Render")
+    print("Bot started")
+    send_telegram("Bot is live 🚀")
 
     while True:
         try:
             run_strategy()
         except Exception as e:
-            msg = f"Bot error: {e}"
-            print(msg)
-            send_telegram(msg)
+            print("Loop error:", e)
 
-        time.sleep(RUN_INTERVAL_SECONDS)
+        time.sleep(RUN_INTERVAL)
 
+# =====================
+# WEB (RENDER)
+# =====================
 @app.route("/")
 def home():
     return "Bot is running"
 
+# =====================
+# START
+# =====================
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
+    threading.Thread(target=bot_loop).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
