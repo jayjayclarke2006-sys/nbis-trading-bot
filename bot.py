@@ -69,8 +69,12 @@ def generate_signal(df, equity):
 
     df.dropna(inplace=True)
 
-    row = df.iloc[-1]
-    prev = df.iloc[-2]
+if df is None or df.empty or len(df) < 2:
+    print("Not enough data, skipping...")
+    return None
+
+row = df.iloc[-1]
+prev = df.iloc[-2]
 
     close = row["Close"]
 
@@ -157,11 +161,18 @@ def run():
 # -----------------------
 # LOOP (RUN DAILY)
 # -----------------------
+import 
 import time
 
 if __name__ == "__main__":
     print("Starting bot...")
-    try:
-        run()
+
+    while True:
+        try:
+            run()
+        except Exception as e:
+            print("Error:", e)
+
+        time.sleep(60)
     except Exception as e:
         print("Error:", e)
