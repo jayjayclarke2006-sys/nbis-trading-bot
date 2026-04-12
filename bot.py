@@ -75,7 +75,6 @@ if df is None or df.empty or len(df) < 2:
 
 df.dropna(inplace=True)
 
-# ✅ ADD THIS CHECK
 if len(df) < 2:
     print("Not enough data yet, skipping...")
     return None
