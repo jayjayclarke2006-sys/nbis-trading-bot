@@ -73,6 +73,13 @@ if df is None or df.empty or len(df) < 2:
     print("Not enough data, skipping...")
     return None
 
+df.dropna(inplace=True)
+
+# ✅ ADD THIS CHECK
+if len(df) < 2:
+    print("Not enough data yet, skipping...")
+    return None
+
 row = df.iloc[-1]
 prev = df.iloc[-2]
 
