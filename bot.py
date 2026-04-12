@@ -159,10 +159,9 @@ def run():
 # -----------------------
 import time
 
-while True:
+if __name__ == "__main__":
+    print("Starting bot...")
     try:
         run()
     except Exception as e:
         print("Error:", e)
-
-    time.sleep(86400)  # run every 24 hours
