@@ -2,21 +2,20 @@ from flask import Flask
 import threading
 import time
 import os
-from datetime import datetime, timedelta, timezone
-
+from datetime import datetime
 import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 app = Flask(__name__)
 
 # =====================
-# ENV VARIABLES
+# ENV
 # =====================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
@@ -30,19 +29,14 @@ SYMBOLS = ["NBIS", "WULF", "IREN", "CIFR"]
 # SETTINGS
 # =====================
 RISK_PER_TRADE = 0.01
-STOP_LOSS_PCT = 0.03
-TAKE_PROFIT_PCT = 0.06
+STOP_LOSS = 0.03
+TAKE_PROFIT = 0.06
 
-EMA_FAST = 50
-EMA_SLOW = 200
-RSI_PERIOD = 14
-
-RUN_INTERVAL = 600
+RUN_INTERVAL = 600  # 10 minutes
 
 client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
 trade_log = []
-last_trade_time = None
 
 # =====================
 # TELEGRAM
@@ -51,8 +45,13 @@ def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+        )
+    except:
+        pass
 
 # =====================
 # INDICATORS
@@ -64,8 +63,10 @@ def rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
+
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -73,34 +74,37 @@ def rsi(series, period=14):
 # DATA
 # =====================
 def get_data(symbol):
-    df = yf.download(symbol, period="3mo", interval="1h", progress=False)
+    try:
+        df = yf.download(symbol, period="3mo", interval="1h", progress=False)
 
-    if df is None or df.empty:
+        if df is None or df.empty:
+            return None
+
+        df["ema_fast"] = ema(df["Close"], 50)
+        df["ema_slow"] = ema(df["Close"], 200)
+        df["rsi"] = rsi(df["Close"], 14)
+
+        df.dropna(inplace=True)
+
+        if len(df) < 2:
+            return None
+
+        return df
+
+    except:
         return None
-
-    df["ema_fast"] = ema(df["Close"], EMA_FAST)
-    df["ema_slow"] = ema(df["Close"], EMA_SLOW)
-    df["rsi"] = rsi(df["Close"], RSI_PERIOD)
-
-    df.dropna(inplace=True)
-
-    if len(df) < 2:
-        return None
-
-    return df
 
 # =====================
 # POSITION SIZE
 # =====================
 def calc_qty(price, equity):
     risk_amount = equity * RISK_PER_TRADE
-    risk_per_share = price * STOP_LOSS_PCT
+    risk_per_share = price * STOP_LOSS
 
     if risk_per_share == 0:
         return 0
 
-    qty = int(risk_amount // risk_per_share)
-    return max(0, qty)
+    return int(risk_amount // risk_per_share)
 
 # =====================
 # STRATEGY
@@ -114,6 +118,7 @@ def run_strategy():
 
         if df is None:
             print("No data")
+            time.sleep(2)
             continue
 
         latest = df.iloc[-1]
@@ -156,16 +161,17 @@ def run_strategy():
                     "time": str(datetime.now())
                 })
 
-        # SELL CONDITIONS (simple exit)
+        # SELL LOGIC
         try:
             positions = client.get_all_positions()
+
             for p in positions:
                 if p.symbol == SYMBOL:
                     entry = float(p.avg_entry_price)
                     qty = int(float(p.qty))
 
-                    stop = entry * (1 - STOP_LOSS_PCT)
-                    tp = entry * (1 + TAKE_PROFIT_PCT)
+                    stop = entry * (1 - STOP_LOSS)
+                    tp = entry * (1 + TAKE_PROFIT)
 
                     if price <= stop or price >= tp:
                         client.submit_order(
@@ -191,6 +197,9 @@ def run_strategy():
         except Exception as e:
             print("Error:", e)
 
+        # 🔥 prevents rate limit
+        time.sleep(2)
+
 # =====================
 # LOOP
 # =====================
@@ -207,7 +216,7 @@ def bot_loop():
         time.sleep(RUN_INTERVAL)
 
 # =====================
-# WEB (RENDER)
+# WEB
 # =====================
 @app.route("/")
 def home():
