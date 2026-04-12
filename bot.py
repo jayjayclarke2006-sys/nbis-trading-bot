@@ -75,12 +75,16 @@ if df is None or df.empty or len(df) < 2:
 
 df.dropna(inplace=True)
 
-if len(df) < 2:
+if df is None or df.empty or len(df) < 2:
     print("Not enough data yet, skipping...")
     return None
 
-row = df.iloc[-1]
-prev = df.iloc[-2]
+try:
+    row = df.iloc[-1]
+    prev = df.iloc[-2]
+except Exception as e:
+    print("Index error:", e)
+    return None
 
     close = row["Close"]
 
@@ -178,7 +182,5 @@ if __name__ == "__main__":
             run()
         except Exception as e:
             print("Error:", e)
+time.sleep(60)
 
-        time.sleep(60)
-    except Exception as e:
-        print("Error:", e)
