@@ -75,9 +75,12 @@ def rsi(series, period=14):
 # =====================
 def get_data(symbol):
     try:
+        print(f"Fetching data for {symbol}...")
+
         df = yf.download(symbol, period="3mo", interval="1h", progress=False)
 
         if df is None or df.empty:
+            print("No data returned")
             return None
 
         df["ema_fast"] = ema(df["Close"], 50)
@@ -87,11 +90,13 @@ def get_data(symbol):
         df.dropna(inplace=True)
 
         if len(df) < 2:
+            print("Not enough data")
             return None
 
         return df
 
-    except:
+    except Exception as e:
+        print("Data error:", e)
         return None
 
 # =====================
@@ -110,6 +115,7 @@ def calc_qty(price, equity):
 # STRATEGY
 # =====================
 def run_strategy():
+    print("\n=== Running strategy ===")
 
     for SYMBOL in SYMBOLS:
         print(f"\nChecking {SYMBOL}")
@@ -117,7 +123,6 @@ def run_strategy():
         df = get_data(SYMBOL)
 
         if df is None:
-            print("No data")
             time.sleep(2)
             continue
 
@@ -125,13 +130,19 @@ def run_strategy():
         prev = df.iloc[-2]
 
         price = float(latest["Close"])
+        print(f"Price: {price}")
 
-        # BUY CONDITIONS
+        # CONDITIONS
         trend = latest["ema_fast"] > latest["ema_slow"]
         momentum = latest["rsi"] > 55
         rising = latest["Close"] > prev["Close"]
 
+        print(f"Trend: {trend} | RSI: {latest['rsi']} | Rising: {rising}")
+
+        # BUY
         if trend and momentum and rising:
+            print("BUY SIGNAL DETECTED")
+
             try:
                 account = client.get_account()
                 equity = float(account.equity)
@@ -154,14 +165,7 @@ def run_strategy():
                 print(msg)
                 send_telegram(msg)
 
-                trade_log.append({
-                    "symbol": SYMBOL,
-                    "type": "BUY",
-                    "price": price,
-                    "time": str(datetime.now())
-                })
-
-        # SELL LOGIC
+        # SELL
         try:
             positions = client.get_all_positions()
 
@@ -174,6 +178,8 @@ def run_strategy():
                     tp = entry * (1 + TAKE_PROFIT)
 
                     if price <= stop or price >= tp:
+                        print("SELL SIGNAL")
+
                         client.submit_order(
                             MarketOrderRequest(
                                 symbol=SYMBOL,
@@ -187,17 +193,9 @@ def run_strategy():
                         print(msg)
                         send_telegram(msg)
 
-                        trade_log.append({
-                            "symbol": SYMBOL,
-                            "type": "SELL",
-                            "price": price,
-                            "time": str(datetime.now())
-                        })
-
         except Exception as e:
-            print("Error:", e)
+            print("Position error:", e)
 
-        # 🔥 prevents rate limit
         time.sleep(2)
 
 # =====================
@@ -213,6 +211,7 @@ def bot_loop():
         except Exception as e:
             print("Loop error:", e)
 
+        print(f"Sleeping for {RUN_INTERVAL} seconds...\n")
         time.sleep(RUN_INTERVAL)
 
 # =====================
