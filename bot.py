@@ -32,7 +32,7 @@ RISK_PER_TRADE = 0.01
 STOP_LOSS = 0.03
 TAKE_PROFIT = 0.06
 
-RUN_INTERVAL = 600  # 10 minutes
+RUN_INTERVAL = 300  # 5 minutes
 
 client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 
