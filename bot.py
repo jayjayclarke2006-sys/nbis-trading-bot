@@ -2,7 +2,6 @@ from flask import Flask
 import threading
 import time
 import os
-from datetime import datetime
 import requests
 import yfinance as yf
 import pandas as pd
@@ -32,11 +31,9 @@ RISK_PER_TRADE = 0.01
 STOP_LOSS = 0.03
 TAKE_PROFIT = 0.06
 
-RUN_INTERVAL = 300  # 5 minutes
+RUN_INTERVAL = 600  # 10 minutes (SAFE)
 
 client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-
-trade_log = []
 
 # =====================
 # TELEGRAM
@@ -97,6 +94,11 @@ def get_data(symbol):
 
     except Exception as e:
         print("Data error:", e)
+
+        if "Rate limited" in str(e):
+            print("Rate limited — sleeping 30 seconds...")
+            time.sleep(30)
+
         return None
 
 # =====================
@@ -196,6 +198,7 @@ def run_strategy():
         except Exception as e:
             print("Position error:", e)
 
+        # small delay between stocks
         time.sleep(2)
 
 # =====================
