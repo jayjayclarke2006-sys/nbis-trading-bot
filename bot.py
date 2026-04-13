@@ -1,5 +1,4 @@
 from flask import Flask
-import threading
 import time
 import os
 import requests
@@ -14,7 +13,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 app = Flask(__name__)
 
 # =====================
-# ENV
+# ENV VARIABLES
 # =====================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
@@ -22,33 +21,23 @@ SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+
 SYMBOLS = ["NBIS", "WULF", "IREN", "CIFR"]
 
-# =====================
-# SETTINGS
-# =====================
-RISK_PER_TRADE = 0.01
-STOP_LOSS = 0.03
-TAKE_PROFIT = 0.06
-
-RUN_INTERVAL = 600  # 10 minutes (SAFE)
-
-client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+RUN_INTERVAL = 600  # 10 mins
 
 # =====================
 # TELEGRAM
 # =====================
 def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}
         )
     except:
-        pass
+        print("Telegram failed")
 
 # =====================
 # INDICATORS
@@ -60,10 +49,8 @@ def rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -72,22 +59,21 @@ def rsi(series, period=14):
 # =====================
 def get_data(symbol):
     try:
-        print(f"Fetching data for {symbol}...")
+        print(f"Fetching {symbol}...")
 
         df = yf.download(symbol, period="3mo", interval="1h", progress=False)
 
         if df is None or df.empty:
-            print("No data returned")
+            print("No data")
             return None
 
         df["ema_fast"] = ema(df["Close"], 50)
         df["ema_slow"] = ema(df["Close"], 200)
-        df["rsi"] = rsi(df["Close"], 14)
+        df["rsi"] = rsi(df["Close"])
 
         df.dropna(inplace=True)
 
         if len(df) < 2:
-            print("Not enough data")
             return None
 
         return df
@@ -96,129 +82,108 @@ def get_data(symbol):
         print("Data error:", e)
 
         if "Rate limited" in str(e):
-            print("Rate limited — sleeping 30 seconds...")
+            print("Sleeping due to rate limit...")
             time.sleep(30)
 
         return None
 
 # =====================
-# POSITION SIZE
-# =====================
-def calc_qty(price, equity):
-    risk_amount = equity * RISK_PER_TRADE
-    risk_per_share = price * STOP_LOSS
-
-    if risk_per_share == 0:
-        return 0
-
-    return int(risk_amount // risk_per_share)
-
-# =====================
 # STRATEGY
 # =====================
-def run_strategy():
-    print("\n=== Running strategy ===")
+def run_bot():
+    print("Bot loop started")
 
-    for SYMBOL in SYMBOLS:
-        print(f"\nChecking {SYMBOL}")
+    send_telegram("Bot is live 🚀")
 
-        df = get_data(SYMBOL)
+    while True:
+        print("\n=== NEW CYCLE ===")
 
-        if df is None:
-            time.sleep(2)
-            continue
+        for symbol in SYMBOLS:
+            print(f"\nChecking {symbol}")
 
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
+            df = get_data(symbol)
 
-        price = float(latest["Close"])
-        print(f"Price: {price}")
-
-        # CONDITIONS
-        trend = latest["ema_fast"] > latest["ema_slow"]
-        momentum = latest["rsi"] > 55
-        rising = latest["Close"] > prev["Close"]
-
-        print(f"Trend: {trend} | RSI: {latest['rsi']} | Rising: {rising}")
-
-        # BUY
-        if trend and momentum and rising:
-            print("BUY SIGNAL DETECTED")
-
-            try:
-                account = client.get_account()
-                equity = float(account.equity)
-            except:
+            if df is None:
+                time.sleep(2)
                 continue
 
-            qty = calc_qty(price, equity)
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
 
-            if qty > 0:
-                client.submit_order(
-                    MarketOrderRequest(
-                        symbol=SYMBOL,
-                        qty=qty,
-                        side=OrderSide.BUY,
-                        time_in_force=TimeInForce.DAY
-                    )
-                )
+            price = float(latest["Close"])
+            print("Price:", price)
 
-                msg = f"BUY {SYMBOL} @ {price}"
-                print(msg)
-                send_telegram(msg)
+            trend = latest["ema_fast"] > latest["ema_slow"]
+            momentum = latest["rsi"] > 55
+            rising = latest["Close"] > prev["Close"]
 
-        # SELL
-        try:
-            positions = client.get_all_positions()
+            print(f"Trend={trend} RSI={latest['rsi']} Rising={rising}")
 
-            for p in positions:
-                if p.symbol == SYMBOL:
-                    entry = float(p.avg_entry_price)
-                    qty = int(float(p.qty))
+            # BUY
+            if trend and momentum and rising:
+                print("BUY SIGNAL")
 
-                    stop = entry * (1 - STOP_LOSS)
-                    tp = entry * (1 + TAKE_PROFIT)
+                try:
+                    account = client.get_account()
+                    equity = float(account.equity)
 
-                    if price <= stop or price >= tp:
-                        print("SELL SIGNAL")
+                    qty = int((equity * 0.01) / (price * 0.03))
 
+                    if qty > 0:
                         client.submit_order(
                             MarketOrderRequest(
-                                symbol=SYMBOL,
+                                symbol=symbol,
                                 qty=qty,
-                                side=OrderSide.SELL,
+                                side=OrderSide.BUY,
                                 time_in_force=TimeInForce.DAY
                             )
                         )
 
-                        msg = f"SELL {SYMBOL} @ {price}"
+                        msg = f"BUY {symbol} @ {price}"
                         print(msg)
                         send_telegram(msg)
 
-        except Exception as e:
-            print("Position error:", e)
+                except Exception as e:
+                    print("Buy error:", e)
 
-        # small delay between stocks
-        time.sleep(2)
+            # SELL
+            try:
+                positions = client.get_all_positions()
 
-# =====================
-# LOOP
-# =====================
-def bot_loop():
-    print("Bot started")
-    send_telegram("Bot is live 🚀")
+                for p in positions:
+                    if p.symbol == symbol:
+                        entry = float(p.avg_entry_price)
+                        qty = int(float(p.qty))
 
-    while True:
-        try:
-            run_strategy()
-        except Exception as e:
-            print("Loop error:", e)
+                        stop = entry * 0.97
+                        tp = entry * 1.06
 
-        print(f"Sleeping for {RUN_INTERVAL} seconds...\n")
+                        if price <= stop or price >= tp:
+                            print("SELL SIGNAL")
+
+                            client.submit_order(
+                                MarketOrderRequest(
+                                    symbol=symbol,
+                                    qty=qty,
+                                    side=OrderSide.SELL,
+                                    time_in_force=TimeInForce.DAY
+                                )
+                            )
+
+                            msg = f"SELL {symbol} @ {price}"
+                            print(msg)
+                            send_telegram(msg)
+
+            except Exception as e:
+                print("Sell error:", e)
+
+            time.sleep(2)
+
+        print(f"\nSleeping {RUN_INTERVAL}s...\n")
         time.sleep(RUN_INTERVAL)
 
 # =====================
-# WEB
+# WEB ROUTE
 # =====================
 @app.route("/")
 def home():
@@ -226,11 +191,12 @@ def home():
 
 # =====================
 # START
-# ===if __name__ == "__main__":
+# =====================
+if __name__ == "__main__":
+    print("Starting bot...")
+
+    import threading
+    threading.Thread(target=run_bot).start()
+
     port = int(os.environ.get("PORT", 10000))
-
-    # start bot loop in same thread
-    print("Starting bot loop...")
-    threading.Thread(target=bot_loop, daemon=True).start()
-
-    app.run(host="0.0.0.0", port=port)==================
+    app.run(host="0.0.0.0", port=port)
