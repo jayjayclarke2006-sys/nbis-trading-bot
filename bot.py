@@ -107,21 +107,21 @@ def run_bot():
                 time.sleep(2)
                 continue
 
-            latest = df.iloc[-1]
-            prev = df.iloc[-2]
+            # 🔥 FIXED (no Series issues)
+            price = float(df["Close"].iloc[-1])
+            prev_close = float(df["Close"].iloc[-2])
 
-            # 🔥 FIXED HERE
-            latest = latest.squeeze()
-            prev = prev.squeeze()
+            ema_fast = float(df["ema_fast"].iloc[-1])
+            ema_slow = float(df["ema_slow"].iloc[-1])
+            rsi_val = float(df["rsi"].iloc[-1])
 
-            price = float(latest["Close"].item())
             print("Price:", price)
 
-            trend = latest["ema_fast"] > latest["ema_slow"]
-            momentum = latest["rsi"] > 55
-            rising = latest["Close"] > prev["Close"]
+            trend = ema_fast > ema_slow
+            momentum = rsi_val > 55
+            rising = price > prev_close
 
-            print(f"Trend={trend} RSI={latest['rsi']} Rising={rising}")
+            print(f"Trend={trend} RSI={rsi_val} Rising={rising}")
 
             # BUY
             if trend and momentum and rising:
