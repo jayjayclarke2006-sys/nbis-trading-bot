@@ -1,7 +1,8 @@
 import os
 import time
 import threading
-from typing import Dict, Set
+from datetime import datetime
+from typing import Dict, Set, Optional
 
 import requests
 import yfinance as yf
@@ -15,7 +16,7 @@ from flask import Flask
 # =========================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")
+BASE_URL = os.getenv("APCA_API_BASE_URL")  # https://paper-api.alpaca.markets
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -42,8 +43,16 @@ VOLUME_LOOKBACK = 20
 EMA_FAST = 20
 EMA_SLOW = 50
 
-BUY_COOLDOWN_SECONDS = 1800   # 30 min
-SELL_COOLDOWN_SECONDS = 300   # 5 min
+# fake breakout protection
+BREAKOUT_BUFFER_PCT = 0.0025   # 0.25% above breakout level
+MIN_CLOSES_ABOVE_BREAKOUT = 2  # last 2 closes must stay above breakout level
+
+BUY_COOLDOWN_SECONDS = 1800
+SELL_COOLDOWN_SECONDS = 300
+
+# daily report time (container/server local time)
+REPORT_HOUR = 21
+REPORT_MINUTE = 0
 
 # =========================
 # APP / API
@@ -57,12 +66,23 @@ api = tradeapi.REST(
     api_version="v2"
 )
 
+# =========================
+# STATE
+# =========================
 highest_seen: Dict[str, float] = {}
 last_buy_time: Dict[str, float] = {}
 last_sell_time: Dict[str, float] = {}
+cycle_traded: Set[str] = set()
 
-# per-cycle protection
-cycle_submitted_symbols: Set[str] = set()
+# track entry info for cleaner PnL messaging
+entry_info: Dict[str, Dict[str, float]] = {}
+
+# daily stats
+daily_realized_pnl = 0.0
+daily_wins = 0
+daily_losses = 0
+daily_trades_closed = 0
+last_report_date = None
 
 # =========================
 # TELEGRAM
@@ -101,7 +121,7 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 # =========================
 # DATA
 # =========================
-def get_data(symbol: str) -> pd.DataFrame | None:
+def get_data(symbol: str) -> Optional[pd.DataFrame]:
     try:
         print(f"Fetching {symbol}...")
 
@@ -141,7 +161,8 @@ def get_data(symbol: str) -> pd.DataFrame | None:
 
         df.dropna(inplace=True)
 
-        if len(df) < max(VOLUME_LOOKBACK + 1, BREAKOUT_LOOKBACK + 1, EMA_SLOW + 1):
+        needed = max(VOLUME_LOOKBACK + 1, BREAKOUT_LOOKBACK + 2, EMA_SLOW + 1)
+        if len(df) < needed:
             print(f"{symbol}: not enough cleaned data")
             return None
 
@@ -157,7 +178,7 @@ def get_data(symbol: str) -> pd.DataFrame | None:
 # =========================
 # BROKER HELPERS
 # =========================
-def get_equity() -> float | None:
+def get_equity() -> Optional[float]:
     try:
         account = api.get_account()
         return float(account.equity)
@@ -212,25 +233,57 @@ def in_sell_cooldown(symbol: str) -> bool:
     return ts is not None and (time.time() - ts) < SELL_COOLDOWN_SECONDS
 
 # =========================
+# SIGNAL QUALITY
+# =========================
+def breakout_is_valid(df: pd.DataFrame) -> bool:
+    price = float(df["Close"].iloc[-1])
+    recent_high = float(df["recent_high"].iloc[-1])
+
+    breakout_level = recent_high * (1 + BREAKOUT_BUFFER_PCT)
+
+    last_close = float(df["Close"].iloc[-1])
+    prev_close = float(df["Close"].iloc[-2])
+
+    holds_above = (
+        last_close > breakout_level and
+        prev_close > recent_high
+    )
+
+    return price > breakout_level and holds_above
+
+# =========================
+# TELEGRAM FILL HELPERS
+# =========================
+def get_filled_avg_price(order_id: str) -> Optional[float]:
+    try:
+        time.sleep(2)
+        order_info = api.get_order(order_id)
+        if order_info.filled_avg_price:
+            return float(order_info.filled_avg_price)
+    except Exception as e:
+        print("Order fill fetch error:", e)
+    return None
+
+# =========================
 # BUY LOGIC
 # =========================
 def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_orders: Dict[str, list]) -> None:
-    global cycle_submitted_symbols
+    global cycle_traded
 
-    if symbol in cycle_submitted_symbols:
-        print(f"{symbol}: already submitted this cycle, skipping")
+    if symbol in cycle_traded:
+        print(f"{symbol}: already traded this cycle")
         return
 
     if symbol in open_orders and len(open_orders[symbol]) > 0:
-        print(f"{symbol}: open order already pending, skipping")
+        print(f"{symbol}: open order already pending")
         return
 
     if symbol in positions:
-        print(f"{symbol}: already in position, skipping new buy")
+        print(f"{symbol}: already in position")
         return
 
     if in_buy_cooldown(symbol):
-        print(f"{symbol}: buy cooldown active, skipping")
+        print(f"{symbol}: buy cooldown active")
         return
 
     price = float(df["Close"].iloc[-1])
@@ -245,25 +298,25 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
     trend = ema_fast_val > ema_slow_val
     momentum = RSI_MIN <= rsi_val <= RSI_MAX
     rising = price > prev_close
-    breakout = price > recent_high
     strong_volume = volume_now > avg_volume
+    valid_breakout = breakout_is_valid(df)
 
     print(
         f"{symbol} | Price={price:.2f} Prev={prev_close:.2f} "
         f"EMA{EMA_FAST}={ema_fast_val:.2f} EMA{EMA_SLOW}={ema_slow_val:.2f} "
         f"RSI={rsi_val:.2f} Vol={volume_now:.0f}/{avg_volume:.0f} "
-        f"Trend={trend} Momentum={momentum} Rising={rising} Breakout={breakout} StrongVol={strong_volume}"
+        f"RecentHigh={recent_high:.2f} Trend={trend} Momentum={momentum} "
+        f"Rising={rising} ValidBreakout={valid_breakout} StrongVol={strong_volume}"
     )
 
-    if not (trend and momentum and rising and breakout and strong_volume):
+    if not (trend and momentum and rising and valid_breakout and strong_volume):
         return
 
     equity = get_equity()
     if equity is None:
         return
 
-    open_positions = count_open_positions(positions)
-    if open_positions >= MAX_TOTAL_POSITIONS:
+    if count_open_positions(positions) >= MAX_TOTAL_POSITIONS:
         print(f"{symbol}: max total positions reached")
         return
 
@@ -291,19 +344,20 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
             type="market",
             time_in_force="day",
         )
-        cycle_submitted_symbols.add(symbol)
+
+        cycle_traded.add(symbol)
         last_buy_time[symbol] = time.time()
-        highest_seen[symbol] = price
 
-    time.sleep(2)  # wait for fill
+        fill_price = get_filled_avg_price(order.id)
+        actual_fill = fill_price if fill_price is not None else price
 
-order_info = api.get_order(order.id)
+        highest_seen[symbol] = actual_fill
+        entry_info[symbol] = {"price": actual_fill, "qty": qty}
 
-fill_price = order_info.filled_avg_price if order_info.filled_avg_price else "market"
+        msg = f"BUY {symbol} @ {actual_fill:.2f} | Qty {qty}"
+        print(msg)
+        send_telegram(msg)
 
-msg = f"BUY {symbol} @ {fill_price} | Qty {qty}"
-send_telegram(msg)
-        print(f"{symbol}: submitted buy order id {getattr(order, 'id', 'unknown')}")
     except Exception as e:
         print(f"{symbol} buy error:", e)
 
@@ -311,19 +365,21 @@ send_telegram(msg)
 # SELL LOGIC
 # =========================
 def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
-    global cycle_submitted_symbols
+    global cycle_traded
+    global daily_realized_pnl, daily_wins, daily_losses, daily_trades_closed
+
     symbol = position.symbol
 
-    if symbol in cycle_submitted_symbols:
-        print(f"{symbol}: already submitted this cycle, skipping sell")
+    if symbol in cycle_traded:
+        print(f"{symbol}: already traded this cycle")
         return
 
     if symbol in open_orders and len(open_orders[symbol]) > 0:
-        print(f"{symbol}: open order already pending, skipping sell")
+        print(f"{symbol}: open order already pending")
         return
 
     if in_sell_cooldown(symbol):
-        print(f"{symbol}: sell cooldown active, skipping")
+        print(f"{symbol}: sell cooldown active")
         return
 
     qty = int(float(position.qty))
@@ -373,33 +429,74 @@ def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
             type="market",
             time_in_force="day",
         )
-        cycle_submitted_symbols.add(symbol)
+
+        cycle_traded.add(symbol)
         last_sell_time[symbol] = time.time()
-    time.sleep(2)
 
-order_info = api.get_order(order.id)
-fill_price = order_info.filled_avg_price if order_info.filled_avg_price else "market"
+        fill_price = get_filled_avg_price(order.id)
+        actual_fill = fill_price if fill_price is not None else price
 
-msg = f"{reason} {symbol} @ {fill_price} | Qty {qty}"
-send_telegram(msg)
+        pnl_dollars = (actual_fill - entry) * qty
+        pnl_pct = ((actual_fill - entry) / entry) * 100
+
+        daily_realized_pnl += pnl_dollars
+        daily_trades_closed += 1
+        if pnl_dollars >= 0:
+            daily_wins += 1
+        else:
+            daily_losses += 1
+
+        msg = (
+            f"{reason} {symbol} @ {actual_fill:.2f} | Qty {qty}\n"
+            f"P/L: ${pnl_dollars:.2f} ({pnl_pct:.2f}%)"
+        )
         print(msg)
         send_telegram(msg)
+
         highest_seen.pop(symbol, None)
-        print(f"{symbol}: submitted sell order id {getattr(order, 'id', 'unknown')}")
+        entry_info.pop(symbol, None)
+
     except Exception as e:
         print(f"{symbol} sell error:", e)
+
+# =========================
+# DAILY REPORT
+# =========================
+def maybe_send_daily_report() -> None:
+    global last_report_date
+    global daily_realized_pnl, daily_wins, daily_losses, daily_trades_closed
+
+    now = datetime.now()
+    today = now.date()
+
+    if now.hour == REPORT_HOUR and now.minute >= REPORT_MINUTE:
+        if last_report_date != today:
+            summary = (
+                f"Daily Summary 📊\n"
+                f"Closed trades: {daily_trades_closed}\n"
+                f"Wins: {daily_wins}\n"
+                f"Losses: {daily_losses}\n"
+                f"Realized P/L: ${daily_realized_pnl:.2f}"
+            )
+            send_telegram(summary)
+            last_report_date = today
+
+            daily_realized_pnl = 0.0
+            daily_wins = 0
+            daily_losses = 0
+            daily_trades_closed = 0
 
 # =========================
 # MAIN LOOP
 # =========================
 def run_bot() -> None:
-    global cycle_submitted_symbols
+    global cycle_traded
     print("Bot loop started")
     send_telegram("Bot is live 🚀")
 
     while True:
         try:
-            cycle_submitted_symbols = set()
+            cycle_traded = set()
             print("\n=== NEW CYCLE ===")
 
             positions = get_positions_dict()
@@ -425,6 +522,8 @@ def run_bot() -> None:
                 except Exception as e:
                     print(f"Loop error for {symbol}:", e)
                     time.sleep(2)
+
+            maybe_send_daily_report()
 
             print(f"\nSleeping {CHECK_INTERVAL}s...\n")
             time.sleep(CHECK_INTERVAL)
