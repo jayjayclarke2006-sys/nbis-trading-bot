@@ -1,6 +1,8 @@
 import os
 import time
 import threading
+from typing import Dict
+
 import requests
 import yfinance as yf
 import pandas as pd
@@ -13,7 +15,7 @@ from flask import Flask
 # =========================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")  # use: https://paper-api.alpaca.markets
+BASE_URL = os.getenv("APCA_API_BASE_URL")  # https://paper-api.alpaca.markets
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -30,7 +32,7 @@ RISK_PER_TRADE = 0.01     # 1% risk model
 
 TAKE_PROFIT_PCT = 0.06    # +6%
 STOP_LOSS_PCT = 0.03      # -3%
-TRAILING_STOP_PCT = 0.025 # 2.5% off highest seen since entry
+TRAILING_STOP_PCT = 0.025 # 2.5% below highest seen
 EARLY_EXIT_RSI = 65
 
 RSI_MIN = 55
@@ -39,6 +41,9 @@ BREAKOUT_LOOKBACK = 10
 VOLUME_LOOKBACK = 20
 EMA_FAST = 20
 EMA_SLOW = 50
+
+BUY_COOLDOWN_SECONDS = 900   # 15 min anti-spam
+SELL_COOLDOWN_SECONDS = 300  # 5 min anti-spam
 
 # =========================
 # APP / API
@@ -52,8 +57,12 @@ api = tradeapi.REST(
     api_version="v2"
 )
 
-# Tracks highest price seen since bot started for trailing stops
-highest_seen = {}
+# highest price seen since entry for trailing stop
+highest_seen: Dict[str, float] = {}
+
+# anti-spam memory
+last_buy_time: Dict[str, float] = {}
+last_sell_time: Dict[str, float] = {}
 
 # =========================
 # TELEGRAM
@@ -146,7 +155,7 @@ def get_data(symbol: str) -> pd.DataFrame | None:
         return None
 
 # =========================
-# HELPERS
+# BROKER HELPERS
 # =========================
 def get_equity() -> float | None:
     try:
@@ -156,24 +165,35 @@ def get_equity() -> float | None:
         print("Equity error:", e)
         return None
 
-def get_positions_dict():
+def get_positions_dict() -> Dict[str, object]:
     try:
         return {p.symbol: p for p in api.list_positions()}
     except Exception as e:
         print("Positions error:", e)
         return {}
 
-def count_open_positions(positions: dict) -> int:
+def get_open_orders_dict() -> Dict[str, list]:
+    try:
+        orders = api.list_orders(status="open")
+        out: Dict[str, list] = {}
+        for order in orders:
+            out.setdefault(order.symbol, []).append(order)
+        return out
+    except Exception as e:
+        print("Open orders error:", e)
+        return {}
+
+def count_open_positions(positions: Dict[str, object]) -> int:
     return len(positions)
 
-def get_position_value(symbol: str, current_price: float, positions: dict) -> float:
-    if symbol in positions:
-        try:
-            qty = float(positions[symbol].qty)
-            return qty * current_price
-        except Exception:
-            return 0.0
-    return 0.0
+def get_position_value(symbol: str, current_price: float, positions: Dict[str, object]) -> float:
+    if symbol not in positions:
+        return 0.0
+    try:
+        qty = float(positions[symbol].qty)
+        return qty * current_price
+    except Exception:
+        return 0.0
 
 def calc_qty(price: float, equity: float) -> int:
     risk_amount = equity * RISK_PER_TRADE
@@ -183,10 +203,28 @@ def calc_qty(price: float, equity: float) -> int:
     qty = int(risk_amount // risk_per_share)
     return max(0, qty)
 
+def in_buy_cooldown(symbol: str) -> bool:
+    ts = last_buy_time.get(symbol)
+    return ts is not None and (time.time() - ts) < BUY_COOLDOWN_SECONDS
+
+def in_sell_cooldown(symbol: str) -> bool:
+    ts = last_sell_time.get(symbol)
+    return ts is not None and (time.time() - ts) < SELL_COOLDOWN_SECONDS
+
 # =========================
 # BUY LOGIC
 # =========================
-def try_buy(symbol: str, df: pd.DataFrame, positions: dict) -> None:
+def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_orders: Dict[str, list]) -> None:
+    # anti-spam: skip if any open order already exists for symbol
+    if symbol in open_orders and len(open_orders[symbol]) > 0:
+        print(f"{symbol}: open order already pending, skipping")
+        return
+
+    # anti-spam: cooldown after recent buy
+    if in_buy_cooldown(symbol):
+        print(f"{symbol}: buy cooldown active, skipping")
+        return
+
     price = float(df["Close"].iloc[-1])
     prev_close = float(df["Close"].iloc[-2])
     ema_fast_val = float(df["ema_fast"].iloc[-1])
@@ -218,7 +256,7 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: dict) -> None:
 
     open_positions = count_open_positions(positions)
 
-    # Allow stacking in an existing symbol, but limit totally new symbols
+    # allow stacking only in already-held names; cap totally new names
     if symbol not in positions and open_positions >= MAX_TOTAL_POSITIONS:
         print(f"{symbol}: max total positions reached")
         return
@@ -252,6 +290,7 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: dict) -> None:
             type="market",
             time_in_force="day",
         )
+        last_buy_time[symbol] = time.time()
         highest_seen[symbol] = price
         msg = f"BUY {symbol} @ {price:.2f} | Qty {qty}"
         print(msg)
@@ -262,15 +301,25 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: dict) -> None:
 # =========================
 # SELL LOGIC
 # =========================
-def try_sell(position, df: pd.DataFrame) -> None:
+def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
     symbol = position.symbol
+
+    # anti-spam: skip if any open order already exists for symbol
+    if symbol in open_orders and len(open_orders[symbol]) > 0:
+        print(f"{symbol}: open order already pending, skipping sell")
+        return
+
+    # anti-spam: cooldown after recent sell
+    if in_sell_cooldown(symbol):
+        print(f"{symbol}: sell cooldown active, skipping")
+        return
+
     qty = int(float(position.qty))
     entry = float(position.avg_entry_price)
     price = float(df["Close"].iloc[-1])
     prev_close = float(df["Close"].iloc[-2])
     rsi_val = float(df["rsi"].iloc[-1])
 
-    # update trailing high
     if symbol not in highest_seen:
         highest_seen[symbol] = price
     highest_seen[symbol] = max(highest_seen[symbol], price)
@@ -286,8 +335,9 @@ def try_sell(position, df: pd.DataFrame) -> None:
 
     print(
         f"{symbol} SELL CHECK | Entry={entry:.2f} Price={price:.2f} "
-        f"TP={tp_price:.2f} SL={stop_price:.2f} TrailHigh={highest_seen[symbol]:.2f} "
-        f"TrailStop={trailing_stop_price:.2f} RSI={rsi_val:.2f}"
+        f"TP={tp_price:.2f} SL={stop_price:.2f} "
+        f"TrailHigh={highest_seen[symbol]:.2f} TrailStop={trailing_stop_price:.2f} "
+        f"RSI={rsi_val:.2f}"
     )
 
     reason = None
@@ -300,21 +350,24 @@ def try_sell(position, df: pd.DataFrame) -> None:
     elif hit_early_exit:
         reason = "EARLY EXIT"
 
-    if reason:
-        try:
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side="sell",
-                type="market",
-                time_in_force="day",
-            )
-            msg = f"{reason} {symbol} @ {price:.2f} | Qty {qty}"
-            print(msg)
-            send_telegram(msg)
-            highest_seen.pop(symbol, None)
-        except Exception as e:
-            print(f"{symbol} sell error:", e)
+    if not reason:
+        return
+
+    try:
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="sell",
+            type="market",
+            time_in_force="day",
+        )
+        last_sell_time[symbol] = time.time()
+        msg = f"{reason} {symbol} @ {price:.2f} | Qty {qty}"
+        print(msg)
+        send_telegram(msg)
+        highest_seen.pop(symbol, None)
+    except Exception as e:
+        print(f"{symbol} sell error:", e)
 
 # =========================
 # MAIN LOOP
@@ -328,6 +381,7 @@ def run_bot() -> None:
             print("\n=== NEW CYCLE ===")
 
             positions = get_positions_dict()
+            open_orders = get_open_orders_dict()
 
             for symbol in SYMBOLS:
                 try:
@@ -336,10 +390,13 @@ def run_bot() -> None:
                         time.sleep(2)
                         continue
 
+                    # refresh open orders each symbol loop
+                    open_orders = get_open_orders_dict()
+
                     if symbol in positions:
-                        try_sell(positions[symbol], df)
+                        try_sell(positions[symbol], df, open_orders)
                     else:
-                        try_buy(symbol, df, positions)
+                        try_buy(symbol, df, positions, open_orders)
 
                     time.sleep(2)
 
