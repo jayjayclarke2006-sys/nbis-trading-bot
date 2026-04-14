@@ -295,9 +295,14 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
         last_buy_time[symbol] = time.time()
         highest_seen[symbol] = price
 
-        msg = f"BUY {symbol} | Qty {qty}"
-        print(msg)
-        send_telegram(msg)
+    time.sleep(2)  # wait for fill
+
+order_info = api.get_order(order.id)
+
+fill_price = order_info.filled_avg_price if order_info.filled_avg_price else "market"
+
+msg = f"BUY {symbol} @ {fill_price} | Qty {qty}"
+send_telegram(msg)
         print(f"{symbol}: submitted buy order id {getattr(order, 'id', 'unknown')}")
     except Exception as e:
         print(f"{symbol} buy error:", e)
@@ -370,7 +375,13 @@ def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
         )
         cycle_submitted_symbols.add(symbol)
         last_sell_time[symbol] = time.time()
-        msg = f"{reason} {symbol} | Qty {qty}"
+    time.sleep(2)
+
+order_info = api.get_order(order.id)
+fill_price = order_info.filled_avg_price if order_info.filled_avg_price else "market"
+
+msg = f"{reason} {symbol} @ {fill_price} | Qty {qty}"
+send_telegram(msg)
         print(msg)
         send_telegram(msg)
         highest_seen.pop(symbol, None)
