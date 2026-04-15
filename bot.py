@@ -26,33 +26,37 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # =========================
 SYMBOLS = ["NBIS", "WULF", "IREN", "CIFR"]
 
-CHECK_INTERVAL = 300  # 5 minutes
+CHECK_INTERVAL = 300  # 5 min
 MAX_TOTAL_POSITIONS = 3
 MAX_POSITION_PCT = 0.25
-RISK_PER_TRADE = 0.01
+RISK_PER_TRADE = 0.008  # slightly smaller risk per trade
 
 TAKE_PROFIT_PCT = 0.06
-STOP_LOSS_PCT = 0.03
-TRAILING_STOP_PCT = 0.025
-EARLY_EXIT_RSI = 65
+STOP_LOSS_PCT = 0.025          # tighter hard stop
+TRAILING_STOP_PCT = 0.02       # tighter trailing stop
+EARLY_EXIT_RSI = 62
 
 RSI_MIN = 55
-RSI_MAX = 72
+RSI_MAX = 70
 BREAKOUT_LOOKBACK = 10
 VOLUME_LOOKBACK = 20
 EMA_FAST = 20
 EMA_SLOW = 50
 
-# fake breakout protection
-BREAKOUT_BUFFER_PCT = 0.0025   # 0.25% above breakout level
-MIN_CLOSES_ABOVE_BREAKOUT = 2  # last 2 closes must stay above breakout level
+BREAKOUT_BUFFER_PCT = 0.0025
+MIN_CLOSES_ABOVE_BREAKOUT = 2
 
 BUY_COOLDOWN_SECONDS = 1800
 SELL_COOLDOWN_SECONDS = 300
 
-# daily report time (container/server local time)
 REPORT_HOUR = 21
 REPORT_MINUTE = 0
+
+# risk control extras
+FAIL_FAST_BARS = 3                 # if breakout fails quickly, get out
+FAIL_FAST_LOSS_PCT = 0.01          # 1% adverse move soon after entry = exit
+MAX_RED_HOLD_BARS = 6              # don't sit in weak red trade too long
+MAX_RED_HOLD_LOSS_PCT = 0.015      # if still red by 1.5% after hold window = exit
 
 # =========================
 # APP / API
@@ -74,10 +78,8 @@ last_buy_time: Dict[str, float] = {}
 last_sell_time: Dict[str, float] = {}
 cycle_traded: Set[str] = set()
 
-# track entry info for cleaner PnL messaging
 entry_info: Dict[str, Dict[str, float]] = {}
 
-# daily stats
 daily_realized_pnl = 0.0
 daily_wins = 0
 daily_losses = 0
@@ -92,7 +94,6 @@ def send_telegram(message: str) -> None:
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             print("Telegram not configured")
             return
-
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
@@ -111,10 +112,8 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
@@ -123,8 +122,6 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 # =========================
 def get_data(symbol: str) -> Optional[pd.DataFrame]:
     try:
-        print(f"Fetching {symbol}...")
-
         df = yf.download(
             symbol,
             period="5d",
@@ -143,9 +140,8 @@ def get_data(symbol: str) -> Optional[pd.DataFrame]:
         df.columns = [str(c) for c in df.columns]
 
         required = ["Open", "High", "Low", "Close", "Volume"]
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            print(f"{symbol}: missing columns {missing}")
+        if any(c not in df.columns for c in required):
+            print(f"{symbol}: missing columns")
             return None
 
         df = df[required].copy()
@@ -171,17 +167,15 @@ def get_data(symbol: str) -> Optional[pd.DataFrame]:
     except Exception as e:
         print(f"{symbol} data error:", e)
         if "Rate limited" in str(e):
-            print("Rate limited, sleeping 30s...")
             time.sleep(30)
         return None
 
 # =========================
-# BROKER HELPERS
+# HELPERS
 # =========================
 def get_equity() -> Optional[float]:
     try:
-        account = api.get_account()
-        return float(account.equity)
+        return float(api.get_account().equity)
     except Exception as e:
         print("Equity error:", e)
         return None
@@ -204,15 +198,11 @@ def get_open_orders_dict() -> Dict[str, list]:
         print("Open orders error:", e)
         return {}
 
-def count_open_positions(positions: Dict[str, object]) -> int:
-    return len(positions)
-
 def get_position_value(symbol: str, current_price: float, positions: Dict[str, object]) -> float:
     if symbol not in positions:
         return 0.0
     try:
-        qty = float(positions[symbol].qty)
-        return qty * current_price
+        return float(positions[symbol].qty) * current_price
     except Exception:
         return 0.0
 
@@ -221,8 +211,7 @@ def calc_qty(price: float, equity: float) -> int:
     risk_per_share = price * STOP_LOSS_PCT
     if risk_per_share <= 0:
         return 0
-    qty = int(risk_amount // risk_per_share)
-    return max(0, qty)
+    return max(0, int(risk_amount // risk_per_share))
 
 def in_buy_cooldown(symbol: str) -> bool:
     ts = last_buy_time.get(symbol)
@@ -232,36 +221,21 @@ def in_sell_cooldown(symbol: str) -> bool:
     ts = last_sell_time.get(symbol)
     return ts is not None and (time.time() - ts) < SELL_COOLDOWN_SECONDS
 
-# =========================
-# SIGNAL QUALITY
-# =========================
 def breakout_is_valid(df: pd.DataFrame) -> bool:
-    price = float(df["Close"].iloc[-1])
     recent_high = float(df["recent_high"].iloc[-1])
-
     breakout_level = recent_high * (1 + BREAKOUT_BUFFER_PCT)
-
     last_close = float(df["Close"].iloc[-1])
     prev_close = float(df["Close"].iloc[-2])
+    return last_close > breakout_level and prev_close > recent_high
 
-    holds_above = (
-        last_close > breakout_level and
-        prev_close > recent_high
-    )
-
-    return price > breakout_level and holds_above
-
-# =========================
-# TELEGRAM FILL HELPERS
-# =========================
 def get_filled_avg_price(order_id: str) -> Optional[float]:
     try:
         time.sleep(2)
-        order_info = api.get_order(order_id)
-        if order_info.filled_avg_price:
-            return float(order_info.filled_avg_price)
+        order = api.get_order(order_id)
+        if order.filled_avg_price:
+            return float(order.filled_avg_price)
     except Exception as e:
-        print("Order fill fetch error:", e)
+        print("Fill fetch error:", e)
     return None
 
 # =========================
@@ -271,19 +245,14 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
     global cycle_traded
 
     if symbol in cycle_traded:
-        print(f"{symbol}: already traded this cycle")
         return
-
-    if symbol in open_orders and len(open_orders[symbol]) > 0:
-        print(f"{symbol}: open order already pending")
+    if symbol in open_orders and open_orders[symbol]:
         return
-
     if symbol in positions:
-        print(f"{symbol}: already in position")
         return
-
     if in_buy_cooldown(symbol):
-        print(f"{symbol}: buy cooldown active")
+        return
+    if len(positions) >= MAX_TOTAL_POSITIONS:
         return
 
     price = float(df["Close"].iloc[-1])
@@ -293,7 +262,6 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
     rsi_val = float(df["rsi"].iloc[-1])
     volume_now = float(df["Volume"].iloc[-1])
     avg_volume = float(df["avg_volume"].iloc[-1])
-    recent_high = float(df["recent_high"].iloc[-1])
 
     trend = ema_fast_val > ema_slow_val
     momentum = RSI_MIN <= rsi_val <= RSI_MAX
@@ -301,39 +269,19 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
     strong_volume = volume_now > avg_volume
     valid_breakout = breakout_is_valid(df)
 
-    print(
-        f"{symbol} | Price={price:.2f} Prev={prev_close:.2f} "
-        f"EMA{EMA_FAST}={ema_fast_val:.2f} EMA{EMA_SLOW}={ema_slow_val:.2f} "
-        f"RSI={rsi_val:.2f} Vol={volume_now:.0f}/{avg_volume:.0f} "
-        f"RecentHigh={recent_high:.2f} Trend={trend} Momentum={momentum} "
-        f"Rising={rising} ValidBreakout={valid_breakout} StrongVol={strong_volume}"
-    )
-
-    if not (trend and momentum and rising and valid_breakout and strong_volume):
+    if not (trend and momentum and rising and strong_volume and valid_breakout):
         return
 
     equity = get_equity()
     if equity is None:
         return
 
-    if count_open_positions(positions) >= MAX_TOTAL_POSITIONS:
-        print(f"{symbol}: max total positions reached")
-        return
-
-    current_position_value = get_position_value(symbol, price, positions)
     max_allowed_value = equity * MAX_POSITION_PCT
-    remaining_value = max_allowed_value - current_position_value
-
-    if remaining_value <= price:
-        print(f"{symbol}: position cap reached")
-        return
-
     qty_risk = calc_qty(price, equity)
-    qty_cap = int(remaining_value // price)
+    qty_cap = int(max_allowed_value // price)
     qty = min(qty_risk, qty_cap)
 
     if qty <= 0:
-        print(f"{symbol}: qty <= 0")
         return
 
     try:
@@ -352,11 +300,14 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
         actual_fill = fill_price if fill_price is not None else price
 
         highest_seen[symbol] = actual_fill
-        entry_info[symbol] = {"price": actual_fill, "qty": qty}
+        entry_info[symbol] = {
+            "price": actual_fill,
+            "qty": qty,
+            "entry_time": time.time(),
+            "entry_bar_index": len(df) - 1,
+        }
 
-        msg = f"BUY {symbol} @ {actual_fill:.2f} | Qty {qty}"
-        print(msg)
-        send_telegram(msg)
+        send_telegram(f"BUY {symbol} @ {actual_fill:.2f} | Qty {qty}")
 
     except Exception as e:
         print(f"{symbol} buy error:", e)
@@ -365,21 +316,15 @@ def try_buy(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_or
 # SELL LOGIC
 # =========================
 def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
-    global cycle_traded
-    global daily_realized_pnl, daily_wins, daily_losses, daily_trades_closed
+    global cycle_traded, daily_realized_pnl, daily_wins, daily_losses, daily_trades_closed
 
     symbol = position.symbol
 
     if symbol in cycle_traded:
-        print(f"{symbol}: already traded this cycle")
         return
-
-    if symbol in open_orders and len(open_orders[symbol]) > 0:
-        print(f"{symbol}: open order already pending")
+    if symbol in open_orders and open_orders[symbol]:
         return
-
     if in_sell_cooldown(symbol):
-        print(f"{symbol}: sell cooldown active")
         return
 
     qty = int(float(position.qty))
@@ -387,38 +332,53 @@ def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
     price = float(df["Close"].iloc[-1])
     prev_close = float(df["Close"].iloc[-2])
     rsi_val = float(df["rsi"].iloc[-1])
+    recent_high = float(df["recent_high"].iloc[-1])
 
     if symbol not in highest_seen:
         highest_seen[symbol] = price
     highest_seen[symbol] = max(highest_seen[symbol], price)
 
+    pnl_pct_now = (price - entry) / entry
+
     stop_price = entry * (1 - STOP_LOSS_PCT)
     tp_price = entry * (1 + TAKE_PROFIT_PCT)
     trailing_stop_price = highest_seen[symbol] * (1 - TRAILING_STOP_PCT)
 
-    hit_stop = price <= stop_price
-    hit_tp = price >= tp_price
-    hit_trailing = price <= trailing_stop_price and highest_seen[symbol] > entry
-    hit_early_exit = (rsi_val > EARLY_EXIT_RSI) and (price < prev_close)
-
-    print(
-        f"{symbol} SELL CHECK | Entry={entry:.2f} Price={price:.2f} "
-        f"TP={tp_price:.2f} SL={stop_price:.2f} "
-        f"TrailHigh={highest_seen[symbol]:.2f} TrailStop={trailing_stop_price:.2f} "
-        f"RSI={rsi_val:.2f}"
-    )
-
     reason = None
-    if hit_tp:
+
+    # 1. hard stop
+    if price <= stop_price:
+        reason = "HARD STOP"
+
+    # 2. take profit
+    elif price >= tp_price:
         reason = "TAKE PROFIT"
-    elif hit_stop:
-        reason = "STOP LOSS"
-    elif hit_trailing:
+
+    # 3. trailing stop after trade has moved in your favor
+    elif highest_seen[symbol] > entry and price <= trailing_stop_price:
         reason = "TRAILING STOP"
-    elif hit_early_exit:
+
+    # 4. fake breakout / breakout failure
+    elif price < recent_high and pnl_pct_now < 0:
+        reason = "BREAKOUT FAIL"
+
+    # 5. fast failure soon after entry
+    elif symbol in entry_info:
+        entry_seconds = time.time() - entry_info[symbol]["entry_time"]
+        if entry_seconds <= FAIL_FAST_BARS * CHECK_INTERVAL and pnl_pct_now <= -FAIL_FAST_LOSS_PCT:
+            reason = "FAIL FAST"
+
+    # 6. weak red hold for too long
+    if reason is None and symbol in entry_info:
+        entry_seconds = time.time() - entry_info[symbol]["entry_time"]
+        if entry_seconds >= MAX_RED_HOLD_BARS * CHECK_INTERVAL and pnl_pct_now <= -MAX_RED_HOLD_LOSS_PCT:
+            reason = "WEAK HOLD EXIT"
+
+    # 7. early exit on momentum loss
+    if reason is None and rsi_val > EARLY_EXIT_RSI and price < prev_close:
         reason = "EARLY EXIT"
 
-    if not reason:
+    if reason is None:
         return
 
     try:
@@ -446,12 +406,10 @@ def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
         else:
             daily_losses += 1
 
-        msg = (
+        send_telegram(
             f"{reason} {symbol} @ {actual_fill:.2f} | Qty {qty}\n"
             f"P/L: ${pnl_dollars:.2f} ({pnl_pct:.2f}%)"
         )
-        print(msg)
-        send_telegram(msg)
 
         highest_seen.pop(symbol, None)
         entry_info.pop(symbol, None)
@@ -460,7 +418,7 @@ def try_sell(position, df: pd.DataFrame, open_orders: Dict[str, list]) -> None:
         print(f"{symbol} sell error:", e)
 
 # =========================
-# DAILY REPORT
+# DAILY SUMMARY
 # =========================
 def maybe_send_daily_report() -> None:
     global last_report_date
@@ -471,16 +429,14 @@ def maybe_send_daily_report() -> None:
 
     if now.hour == REPORT_HOUR and now.minute >= REPORT_MINUTE:
         if last_report_date != today:
-            summary = (
+            send_telegram(
                 f"Daily Summary 📊\n"
                 f"Closed trades: {daily_trades_closed}\n"
                 f"Wins: {daily_wins}\n"
                 f"Losses: {daily_losses}\n"
                 f"Realized P/L: ${daily_realized_pnl:.2f}"
             )
-            send_telegram(summary)
             last_report_date = today
-
             daily_realized_pnl = 0.0
             daily_wins = 0
             daily_losses = 0
@@ -491,13 +447,11 @@ def maybe_send_daily_report() -> None:
 # =========================
 def run_bot() -> None:
     global cycle_traded
-    print("Bot loop started")
     send_telegram("Bot is live 🚀")
 
     while True:
         try:
             cycle_traded = set()
-            print("\n=== NEW CYCLE ===")
 
             positions = get_positions_dict()
             open_orders = get_open_orders_dict()
@@ -520,12 +474,10 @@ def run_bot() -> None:
                     time.sleep(2)
 
                 except Exception as e:
-                    print(f"Loop error for {symbol}:", e)
+                    print(f"{symbol} loop error:", e)
                     time.sleep(2)
 
             maybe_send_daily_report()
-
-            print(f"\nSleeping {CHECK_INTERVAL}s...\n")
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
@@ -533,18 +485,12 @@ def run_bot() -> None:
             time.sleep(CHECK_INTERVAL)
 
 # =========================
-# RENDER KEEP-ALIVE
+# RENDER WEB
 # =========================
 @app.route("/")
 def home():
     return "Bot is running"
 
-def run_web():
-    app.run(host="0.0.0.0", port=10000)
-
-# =========================
-# START
-# =========================
 if __name__ == "__main__":
     threading.Thread(target=run_bot, daemon=True).start()
-    run_web()
+    app.run(host="0.0.0.0", port=10000)
