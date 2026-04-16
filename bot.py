@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import threading
 from datetime import datetime
 from typing import Dict, Optional, Set
@@ -50,17 +49,17 @@ VOLUME_LOOKBACK = 20
 BREAKOUT_LOOKBACK = 10
 RSI_MIN = 55
 RSI_MAX = 70
-RVOL_MIN = 1.5  # relative volume minimum
-BREAKOUT_BUFFER_PCT = 0.0025  # 0.25%
-MAX_CHASE_FROM_BREAKOUT_PCT = 0.015  # don't chase >1.5% above breakout
-MAX_EXT_FROM_EMA_FAST_PCT = 0.02     # don't buy too stretched
+RVOL_MIN = 1.5
+BREAKOUT_BUFFER_PCT = 0.0025
+MAX_CHASE_FROM_BREAKOUT_PCT = 0.015
+MAX_EXT_FROM_EMA_FAST_PCT = 0.02
 
 # Exits
 HARD_STOP_PCT = 0.025
 FAIL_FAST_BARS = 3
 FAIL_FAST_LOSS_PCT = 0.01
-FIRST_TARGET_R = 1.5           # take partial at 1.5R
-FINAL_TARGET_R = 3.0           # optional final hard target
+FIRST_TARGET_R = 1.5
+FINAL_TARGET_R = 3.0
 TRAILING_STOP_ATR_MULT = 2.0
 EARLY_EXIT_RSI = 64
 WEAK_HOLD_BARS = 6
@@ -95,13 +94,11 @@ last_sell_time: Dict[str, float] = {}
 
 highest_seen: Dict[str, float] = {}
 
-# in-memory trade state
 trade_state: Dict[str, Dict[str, float]] = {}
 # {
 #   symbol: {
 #       "entry_price": float,
 #       "entry_time": float,
-#       "entry_bar_count": int,
 #       "risk_per_share": float,
 #       "initial_qty": int,
 #       "partial_taken": 0 or 1,
@@ -367,6 +364,41 @@ def score_setup(df: pd.DataFrame) -> int:
     return score
 
 # =========================
+# NEW HYBRID PULLBACK LOGIC
+# =========================
+def is_pullback_entry(df: pd.DataFrame) -> bool:
+    try:
+        ema9 = df["Close"].ewm(span=9).mean()
+        ema20 = df["Close"].ewm(span=20).mean()
+
+        trend_up = float(ema9.iloc[-1]) > float(ema20.iloc[-1])
+
+        recent_high = float(df["High"].rolling(10).max().iloc[-2])
+        current_price = float(df["Close"].iloc[-1])
+        prev_close = float(df["Close"].iloc[-2])
+        ema_fast_now = float(df["ema_fast"].iloc[-1])
+        rsi_now = float(df["rsi"].iloc[-1])
+        avg_volume = float(df["avg_volume"].iloc[-1])
+        current_volume = float(df["Volume"].iloc[-1])
+
+        # pullback into strong trend
+        pullback = current_price < recent_high * 0.98
+
+        # bounce confirmation
+        bounce = current_price > prev_close
+
+        # not too weak / not too overextended
+        not_stretched = abs((current_price - ema_fast_now) / max(ema_fast_now, 1e-9)) <= 0.025
+        rsi_ok = 50 <= rsi_now <= 67
+        volume_ok = current_volume >= avg_volume * 1.1
+
+        return trend_up and pullback and bounce and not_stretched and rsi_ok and volume_ok
+
+    except Exception as e:
+        print("Pullback check error:", e)
+        return False
+
+# =========================
 # ENTRY LOGIC
 # =========================
 def try_enter(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_orders: Dict[str, list], equity: float) -> None:
@@ -415,12 +447,18 @@ def try_enter(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_
     not_chasing = chase_pct <= MAX_CHASE_FROM_BREAKOUT_PCT
     not_stretched = ema_extension_pct <= MAX_EXT_FROM_EMA_FAST_PCT
 
-    if not (trend_ok and momentum_ok and breakout_ok and volume_ok and candle_ok and not_chasing and not_stretched):
+    breakout_condition = (
+        trend_ok and momentum_ok and breakout_ok and volume_ok and candle_ok and not_chasing and not_stretched
+    )
+
+    pullback_condition = is_pullback_entry(df)
+
+    if not (breakout_condition or pullback_condition):
         return
 
     setup_score = score_setup(df)
-    if setup_score < 70:
-        print(f"{symbol}: setup score too low ({setup_score})")
+    if breakout_condition and setup_score < 70:
+        print(f"{symbol}: breakout score too low ({setup_score})")
         return
 
     total_exposure = get_open_exposure_value(positions)
@@ -471,15 +509,18 @@ def try_enter(symbol: str, df: pd.DataFrame, positions: Dict[str, object], open_
         trade_state[symbol] = {
             "entry_price": actual_fill,
             "entry_time": time.time(),
-            "entry_bar_count": len(df),
             "risk_per_share": risk_per_share,
             "initial_qty": qty,
             "partial_taken": 0,
             "break_even_active": 0,
         }
 
+        entry_type = "PULLBACK" if pullback_condition and not breakout_condition else "BREAKOUT"
+        if breakout_condition and pullback_condition:
+            entry_type = "HYBRID"
+
         send_telegram(
-            f"ENTRY {symbol}\n"
+            f"ENTRY {symbol} ({entry_type})\n"
             f"Price: ${actual_fill:.2f}\n"
             f"Qty: {qty}\n"
             f"Exposure: ${actual_fill * qty:.2f}\n"
@@ -522,7 +563,6 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
     state = trade_state.get(symbol, {
         "entry_price": entry,
         "entry_time": time.time(),
-        "entry_bar_count": len(df),
         "risk_per_share": max(entry * HARD_STOP_PCT, 0.01),
         "initial_qty": qty,
         "partial_taken": 0,
@@ -539,7 +579,7 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
 
     bars_in_trade_est = max(1, int((time.time() - state["entry_time"]) // CHECK_INTERVAL))
 
-    # 1. Partial profits at first target
+    # 1. Partial profits
     if state["partial_taken"] == 0 and current_r >= FIRST_TARGET_R and qty >= 2:
         sell_qty = max(1, qty // 2)
 
