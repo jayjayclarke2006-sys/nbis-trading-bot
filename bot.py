@@ -16,7 +16,7 @@ from flask import Flask
 # =========================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")  # https://paper-api.alpaca.markets
+BASE_URL = os.getenv("APCA_API_BASE_URL")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -30,42 +30,40 @@ SHORT_MARKET_SYMBOLS = ["SPY", "QQQ"]
 
 CHECK_INTERVAL = 300  # 5 min
 
-# Exposure
 MAX_TOTAL_POSITIONS = 4
 MAX_TOTAL_EXPOSURE_PCT = 0.28
 MAX_POSITION_PCT = 0.07
 
-# Risk
 RISK_PER_TRADE_LONG = 0.0075
 RISK_PER_TRADE_SHORT = 0.005
+
 BASE_DAILY_MAX_LOSS_PCT = 0.02
 MAX_DAILY_MAX_LOSS_PCT = 0.05
 YESTERDAY_GAIN_GIVEBACK_PCT = 0.50
 
-# Long entry filters
 EMA_FAST = 20
 EMA_SLOW = 50
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VOLUME_LOOKBACK = 20
 BREAKOUT_LOOKBACK = 10
+
 RSI_MIN = 55
 RSI_MAX = 70
 RVOL_MIN = 1.5
-BREAKOUT_BUFFER_PCT = 0.0025
-MAX_CHASE_FROM_BREAKOUT_PCT = 0.015
-MAX_EXT_FROM_EMA_FAST_PCT = 0.02
 
-# Short entry filters
-ENABLE_SHORTS = True
 SHORT_RSI_MIN = 30
 SHORT_RSI_MAX = 45
 SHORT_RVOL_MIN = 1.5
+
+BREAKOUT_BUFFER_PCT = 0.0025
 BREAKDOWN_BUFFER_PCT = 0.0025
+
+MAX_CHASE_FROM_BREAKOUT_PCT = 0.015
 MAX_CHASE_FROM_BREAKDOWN_PCT = 0.015
+MAX_EXT_FROM_EMA_FAST_PCT = 0.02
 MAX_EXT_FROM_EMA_FAST_SHORT_PCT = 0.02
 
-# Exits - long
 HARD_STOP_PCT = 0.025
 FAIL_FAST_BARS = 3
 FAIL_FAST_LOSS_PCT = 0.01
@@ -76,7 +74,6 @@ EARLY_EXIT_RSI = 64
 WEAK_HOLD_BARS = 6
 WEAK_HOLD_LOSS_PCT = 0.0125
 
-# Exits - short
 SHORT_HARD_STOP_PCT = 0.02
 SHORT_FAIL_FAST_BARS = 3
 SHORT_FAIL_FAST_LOSS_PCT = 0.008
@@ -87,11 +84,11 @@ SHORT_EARLY_EXIT_RSI = 38
 SHORT_WEAK_HOLD_BARS = 6
 SHORT_WEAK_HOLD_LOSS_PCT = 0.01
 
-# Cooldowns
+ENABLE_SHORTS = True
+
 BUY_COOLDOWN_SECONDS = 1800
 SELL_COOLDOWN_SECONDS = 300
 
-# Daily summary
 REPORT_HOUR = 21
 REPORT_MINUTE = 0
 
@@ -130,7 +127,6 @@ trade_state: Dict[str, Dict[str, float]] = {}
 #   }
 # }
 
-# daily stats
 daily_realized_pnl = 0.0
 daily_closed_trades = 0
 daily_wins = 0
@@ -461,7 +457,7 @@ def score_short_setup(df: pd.DataFrame) -> int:
     return score
 
 # =========================
-# HYBRID PULLBACKS
+# HYBRID PULLBACKS / CONTINUATION
 # =========================
 def is_pullback_entry(df: pd.DataFrame) -> bool:
     try:
@@ -487,6 +483,28 @@ def is_pullback_entry(df: pd.DataFrame) -> bool:
         return trend_up and pullback and bounce and not_stretched and rsi_ok and volume_ok
     except Exception as e:
         print("Pullback check error:", e)
+        return False
+
+def is_smart_continuation_entry(df: pd.DataFrame) -> bool:
+    try:
+        close = df["Close"]
+        open_ = df["Open"]
+        volume = df["Volume"]
+
+        ema9 = close.ewm(span=9).mean()
+        ema20 = close.ewm(span=20).mean()
+        ema50 = close.ewm(span=50).mean()
+
+        strong_trend = close.iloc[-1] > ema9.iloc[-1] > ema20.iloc[-1] > ema50.iloc[-1]
+        pullback = close.iloc[-2] < close.iloc[-3] and close.iloc[-1] > close.iloc[-2]
+        shallow = close.iloc[-1] > ema20.iloc[-1]
+        bullish = close.iloc[-1] > open_.iloc[-1]
+        avg_vol = volume.rolling(20).mean()
+        volume_ok = volume.iloc[-1] > avg_vol.iloc[-1] * 0.8
+
+        return strong_trend and pullback and shallow and bullish and volume_ok
+    except Exception as e:
+        print("Continuation check error:", e)
         return False
 
 def is_short_pullback_entry(df: pd.DataFrame) -> bool:
@@ -566,8 +584,9 @@ def try_enter_long(symbol: str, df: pd.DataFrame, positions: Dict[str, object], 
         trend_ok and momentum_ok and breakout_ok and volume_ok and candle_ok and not_chasing and not_stretched
     )
     pullback_condition = is_pullback_entry(df)
+    continuation_condition = is_smart_continuation_entry(df)
 
-    if not (breakout_condition or pullback_condition):
+    if not (breakout_condition or pullback_condition or continuation_condition):
         return False
 
     setup_score = score_long_setup(df)
@@ -627,8 +646,12 @@ def try_enter_long(symbol: str, df: pd.DataFrame, positions: Dict[str, object], 
             "break_even_active": 0,
         }
 
-        entry_type = "PULLBACK" if pullback_condition and not breakout_condition else "BREAKOUT"
-        if breakout_condition and pullback_condition:
+        entry_type = "BREAKOUT"
+        if continuation_condition and not breakout_condition and not pullback_condition:
+            entry_type = "CONTINUATION"
+        elif pullback_condition and not breakout_condition:
+            entry_type = "PULLBACK"
+        elif breakout_condition and (pullback_condition or continuation_condition):
             entry_type = "HYBRID"
 
         send_telegram(
@@ -667,7 +690,6 @@ def try_enter_short(symbol: str, df: pd.DataFrame, positions: Dict[str, object],
     if not market_is_healthy_for_shorts():
         return False
     if not is_shortable_symbol(symbol):
-        print(f"{symbol}: not shortable/easy_to_borrow")
         return False
 
     row = df.iloc[-1]
@@ -761,8 +783,10 @@ def try_enter_short(symbol: str, df: pd.DataFrame, positions: Dict[str, object],
             "break_even_active": 0,
         }
 
-        entry_type = "PULLBACK" if pullback_condition and not breakdown_condition else "BREAKDOWN"
-        if breakdown_condition and pullback_condition:
+        entry_type = "BREAKDOWN"
+        if pullback_condition and not breakdown_condition:
+            entry_type = "SHORT PULLBACK"
+        elif breakdown_condition and pullback_condition:
             entry_type = "HYBRID"
 
         send_telegram(
@@ -833,7 +857,6 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
     exit_side = "sell"
     pnl_dollars = 0.0
     pnl_pct = 0.0
-    actual_fill_fallback = price
     label = "EXIT"
 
     if side == "long":
@@ -905,7 +928,7 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
 
         exit_side = "sell"
 
-    else:  # short
+    else:
         pnl_pct_now = (entry - price) / entry
         current_r = (entry - price) / risk_per_share if risk_per_share > 0 else 0
 
@@ -991,7 +1014,7 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
         last_sell_time[symbol] = time.time()
 
         fill_price = get_filled_avg_price(order.id)
-        actual_fill = fill_price if fill_price is not None else actual_fill_fallback
+        actual_fill = fill_price if fill_price is not None else price
 
         if side == "long":
             pnl_dollars = (actual_fill - entry) * qty
