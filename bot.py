@@ -1232,11 +1232,11 @@ def run_bot() -> None:
                 except Exception as e:
                     print(f"{symbol} loop error:", e)
                     time.sleep(2)
-
-            check_btc_signal()
+                    
+       check_btc_signal()
 maybe_send_daily_summary()
-time.sleep(CHECK_INTERVAL)
-
+time.sleep(CHECK_INTERVAL)             
+              
         except Exception as e:
             print("Main loop error:", e)
             time.sleep(CHECK_INTERVAL)
