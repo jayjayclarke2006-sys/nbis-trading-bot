@@ -1,4 +1,4 @@
-import os
+
 import time
 import threading
 from datetime import datetime
@@ -91,16 +91,7 @@ SELL_COOLDOWN_SECONDS = 300
 
 REPORT_HOUR = 21
 REPORT_MINUTE = 0
-# =========================
-# BTC ALERT SETTINGS
-# =========================
-BTC_SYMBOL = "BTC-USD"
-BTC_TIMEFRAME = "5m"
-BTC_PERIOD = "5d"
 
-BTC_ALERT_SCORE = 80
-BTC_ATR_SL_MULT = 1.5
-BTC_ATR_TP_MULT = 2.5
 # =========================
 # APP / API
 # =========================
@@ -221,114 +212,7 @@ def download_data(symbol: str, period: str = "10d", interval: str = "5m") -> Opt
 
 def build_signal_frame(df_5m: pd.DataFrame) -> Optional[pd.DataFrame]:
     df = df_5m.copy()
-# =========================
-# BTC DATA + SIGNALS
-# =========================
-def get_btc_data():
-    try:
-        df = yf.download(
-            BTC_SYMBOL,
-            period=BTC_PERIOD,
-            interval=BTC_TIMEFRAME,
-            progress=False
-        )
 
-        if df is None or df.empty:
-            return None
-
-        df["ema_fast"] = ema(df["Close"], EMA_FAST)
-        df["ema_slow"] = ema(df["Close"], EMA_SLOW)
-        df["rsi"] = rsi(df["Close"], RSI_PERIOD)
-        df["atr"] = atr(df, ATR_PERIOD)
-
-        df["avg_volume"] = df["Volume"].rolling(VOLUME_LOOKBACK).mean()
-        df["recent_high"] = df["High"].rolling(BREAKOUT_LOOKBACK).max().shift(1)
-        df["recent_low"] = df["Low"].rolling(BREAKOUT_LOOKBACK).min().shift(1)
-
-        df.dropna(inplace=True)
-        return df
-
-    except Exception as e:
-        print("BTC data error:", e)
-        return None
-
-
-def check_btc_signal():
-    df = get_btc_data()
-    if df is None:
-        return
-
-    row = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    price = float(row["Close"])
-    atr_now = float(row["atr"])
-    rsi_now = float(row["rsi"])
-    ema_fast = float(row["ema_fast"])
-    ema_slow = float(row["ema_slow"])
-    avg_vol = float(row["avg_volume"])
-    vol = float(row["Volume"])
-    recent_high = float(row["recent_high"])
-    recent_low = float(row["recent_low"])
-
-    # =================
-    # LONG SETUP
-    # =================
-    long_score = 0
-
-    if ema_fast > ema_slow:
-        long_score += 25
-    if RSI_MIN <= rsi_now <= RSI_MAX:
-        long_score += 20
-    if vol >= avg_vol * RVOL_MIN:
-        long_score += 25
-    if price > recent_high * (1 + BREAKOUT_BUFFER_PCT):
-        long_score += 20
-    if price > float(prev["Close"]):
-        long_score += 10
-
-    # =================
-    # SHORT SETUP
-    # =================
-    short_score = 0
-
-    if ema_fast < ema_slow:
-        short_score += 25
-    if SHORT_RSI_MIN <= rsi_now <= SHORT_RSI_MAX:
-        short_score += 20
-    if vol >= avg_vol * SHORT_RVOL_MIN:
-        short_score += 25
-    if price < recent_low * (1 - BREAKDOWN_BUFFER_PCT):
-        short_score += 20
-    if price < float(prev["Close"]):
-        short_score += 10
-
-    # =================
-    # EXECUTION
-    # =================
-    if long_score >= BTC_ALERT_SCORE:
-        sl = price - (atr_now * BTC_ATR_SL_MULT)
-        tp = price + (atr_now * BTC_ATR_TP_MULT)
-
-        send_telegram(
-            f"🚨 BTC LONG 🚨\n\n"
-            f"Price: ${price:.2f}\n"
-            f"Score: {long_score}\n\n"
-            f"TP: ${tp:.2f}\n"
-            f"SL: ${sl:.2f}"
-        )
-
-    elif short_score >= BTC_ALERT_SCORE:
-        sl = price + (atr_now * BTC_ATR_SL_MULT)
-        tp = price - (atr_now * BTC_ATR_TP_MULT)
-
-        send_telegram(
-            f"🚨 BTC SHORT 🚨\n\n"
-            f"Price: ${price:.2f}\n"
-            f"Score: {short_score}\n\n"
-            f"TP: ${tp:.2f}\n"
-            f"SL: ${sl:.2f}"
-        )
     df["ema_fast"] = ema(df["Close"], EMA_FAST)
     df["ema_slow"] = ema(df["Close"], EMA_SLOW)
     df["rsi"] = rsi(df["Close"], RSI_PERIOD)
@@ -1232,11 +1116,10 @@ def run_bot() -> None:
                 except Exception as e:
                     print(f"{symbol} loop error:", e)
                     time.sleep(2)
-                    
-       check_btc_signal()
-maybe_send_daily_summary()
-time.sleep(CHECK_INTERVAL)             
-              
+
+            maybe_send_daily_summary()
+            time.sleep(CHECK_INTERVAL)
+
         except Exception as e:
             print("Main loop error:", e)
             time.sleep(CHECK_INTERVAL)
