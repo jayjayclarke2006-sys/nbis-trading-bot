@@ -31,6 +31,10 @@ PARTIAL_ATR_TRIGGER = 1.5
 MIN_VOLATILITY_PCT = 0.001
 MAX_EMA9_DISTANCE_PCT = 0.01
 
+MAX_SCALE_INS = 2
+SCALE_IN_ATR_STEP = 0.5
+SCALE_IN_COOLDOWN_SECONDS = 120
+
 ASSETS = {
     "BTC": {
         "ticker": "BTC-USD",
@@ -50,6 +54,7 @@ STATE = {
         "IN_TRADE": False,
         "TRADE_SIDE": None,
         "ENTRY_PRICE": 0.0,
+        "AVG_ENTRY_PRICE": 0.0,
         "STOP_LOSS": 0.0,
         "TAKE_PROFIT": 0.0,
         "PARTIAL_SENT": False,
@@ -58,6 +63,10 @@ STATE = {
         "HIGHEST_PRICE": 0.0,
         "LOWEST_PRICE": 0.0,
         "LAST_TRADE_TIME": 0.0,
+        "LAST_SCALE_TIME": 0.0,
+        "SCALE_COUNT": 0,
+        "ENTRY_TYPE": None,
+        "CONFIDENCE_LABEL": None,
     }
     for key in ASSETS
 }
@@ -230,7 +239,11 @@ def long_score(df1: pd.DataFrame, df5: pd.DataFrame):
         score += 10
         reasons.append("holding EMA9")
 
-    return int(score), reasons
+    if r1["close"] > r1["hh10"] * 1.001:
+        score += 5
+        reasons.append("micro breakout")
+
+    return int(min(score, 100)), reasons
 
 def short_score(df1: pd.DataFrame, df5: pd.DataFrame):
     r1 = df1.iloc[-1]
@@ -276,7 +289,27 @@ def short_score(df1: pd.DataFrame, df5: pd.DataFrame):
         score += 10
         reasons.append("below EMA9")
 
-    return int(score), reasons
+    if r1["close"] < r1["ll10"] * 0.999:
+        score += 5
+        reasons.append("micro breakdown")
+
+    return int(min(score, 100)), reasons
+
+# =========================
+# CONFIDENCE GRADING
+# =========================
+def confidence_grade(score: int) -> str:
+    if score >= 100:
+        return "S"
+    if score >= 90:
+        return "A+"
+    if score >= 80:
+        return "A"
+    if score >= 70:
+        return "B+"
+    if score >= 60:
+        return "B"
+    return "C"
 
 # =========================
 # ENTRY LOGIC
@@ -328,19 +361,34 @@ def sniper_short(df1: pd.DataFrame) -> bool:
     return bool(ema_reject and rsi_reject and lower_high)
 
 # =========================
+# CONFIRMATION LOGIC
+# =========================
+def confirm_long(df1: pd.DataFrame) -> bool:
+    r = df1.iloc[-1]
+    p = df1.iloc[-2]
+
+    strong_close = r["close"] > p["high"]
+    ema_hold = r["close"] > r["ema9"]
+
+    return bool(strong_close and ema_hold)
+
+def confirm_short(df1: pd.DataFrame) -> bool:
+    r = df1.iloc[-1]
+    p = df1.iloc[-2]
+
+    strong_close = r["close"] < p["low"]
+    ema_hold = r["close"] < r["ema9"]
+
+    return bool(strong_close and ema_hold)
+
+# =========================
 # A SETUP LOGIC
 # =========================
 def a_setup_long(sig: dict) -> bool:
-    return (
-        sig["long_score"] >= A_SETUP_SCORE and
-        sig["trend"] == "BULLISH"
-    )
+    return sig["long_score"] >= A_SETUP_SCORE and sig["trend"] == "BULLISH" and sig["confirm_long"]
 
 def a_setup_short(sig: dict) -> bool:
-    return (
-        sig["short_score"] >= A_SETUP_SCORE and
-        sig["trend"] == "BEARISH"
-    )
+    return sig["short_score"] >= A_SETUP_SCORE and sig["trend"] == "BEARISH" and sig["confirm_short"]
 
 # =========================
 # HEARTBEAT
@@ -406,16 +454,22 @@ def get_signal(asset_key: str):
         "short_breakout": breakout_short(df1),
         "long_sniper": sniper_long(df1),
         "short_sniper": sniper_short(df1),
+        "confirm_long": confirm_long(df1),
+        "confirm_short": confirm_short(df1),
     }
 
 # =========================
-# TRADE MANAGEMENT
+# TRADE HELPERS
 # =========================
+def entry_size_label(score: int) -> str:
+    return "FULL" if score >= FULL_SIZE_SCORE else "SNIPER"
+
 def reset_trade(asset_key: str):
     state = STATE[asset_key]
     state["IN_TRADE"] = False
     state["TRADE_SIDE"] = None
     state["ENTRY_PRICE"] = 0.0
+    state["AVG_ENTRY_PRICE"] = 0.0
     state["STOP_LOSS"] = 0.0
     state["TAKE_PROFIT"] = 0.0
     state["PARTIAL_SENT"] = False
@@ -423,27 +477,140 @@ def reset_trade(asset_key: str):
     state["HIGHEST_PRICE"] = 0.0
     state["LOWEST_PRICE"] = 0.0
     state["LAST_TRADE_TIME"] = time.time()
+    state["LAST_SCALE_TIME"] = 0.0
+    state["SCALE_COUNT"] = 0
+    state["ENTRY_TYPE"] = None
+    state["CONFIDENCE_LABEL"] = None
 
+def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: list, price: float, atr_now: float):
+    state = STATE[asset_key]
+    name = ASSETS[asset_key]["name"]
+
+    state["ENTRY_PRICE"] = price
+    state["AVG_ENTRY_PRICE"] = price
+    state["HIGHEST_PRICE"] = price
+    state["LOWEST_PRICE"] = price
+    state["TRADE_SIDE"] = side
+    state["IN_TRADE"] = True
+    state["SCALE_COUNT"] = 1
+    state["LAST_SCALE_TIME"] = time.time()
+    state["ENTRY_TYPE"] = trigger
+    state["CONFIDENCE_LABEL"] = confidence_grade(score)
+
+    if side == "LONG":
+        state["STOP_LOSS"] = price - (atr_now * ATR_SL_MULT)
+        state["TAKE_PROFIT"] = price + (atr_now * ATR_TP_MULT)
+        emoji = "🚀"
+    else:
+        state["STOP_LOSS"] = price + (atr_now * ATR_SL_MULT)
+        state["TAKE_PROFIT"] = price - (atr_now * ATR_TP_MULT)
+        emoji = "📉"
+
+    size = entry_size_label(score)
+
+    send(
+        f"{emoji} {name} {side} ENTRY\n\n"
+        f"Trigger: {trigger}\n"
+        f"Size: {size}\n"
+        f"Confidence: {state['CONFIDENCE_LABEL']}\n"
+        f"Scale: 1/{MAX_SCALE_INS}\n"
+        f"Price: ${price:.2f}\n"
+        f"Score: {score}\n"
+        f"Reasons: {', '.join(reasons[:4])}\n\n"
+        f"SL: ${state['STOP_LOSS']:.2f}\n"
+        f"TP: ${state['TAKE_PROFIT']:.2f}"
+    )
+
+def can_scale_in(asset_key: str) -> bool:
+    state = STATE[asset_key]
+    if not state["IN_TRADE"]:
+        return False
+    if state["SCALE_COUNT"] >= MAX_SCALE_INS:
+        return False
+    if time.time() - state["LAST_SCALE_TIME"] < SCALE_IN_COOLDOWN_SECONDS:
+        return False
+    return True
+
+def maybe_scale_in(asset_key: str, sig: dict):
+    state = STATE[asset_key]
+    name = ASSETS[asset_key]["name"]
+
+    if not can_scale_in(asset_key):
+        return
+
+    price = sig["price"]
+    atr_now = sig["atr"]
+
+    if state["TRADE_SIDE"] == "LONG":
+        favorable_move = price >= state["AVG_ENTRY_PRICE"] + (atr_now * SCALE_IN_ATR_STEP)
+        confirmation_ok = sig["confirm_long"]
+        score_ok = sig["long_score"] >= LONG_ALERT_SCORE
+
+        if favorable_move and confirmation_ok and score_ok:
+            old_avg = state["AVG_ENTRY_PRICE"]
+            state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
+            state["SCALE_COUNT"] += 1
+            state["LAST_SCALE_TIME"] = time.time()
+            state["HIGHEST_PRICE"] = max(state["HIGHEST_PRICE"], price)
+
+            send(
+                f"➕ {name} LONG SCALE-IN\n\n"
+                f"Entry type: {state['ENTRY_TYPE']}\n"
+                f"New add price: ${price:.2f}\n"
+                f"Old avg: ${old_avg:.2f}\n"
+                f"New avg: ${state['AVG_ENTRY_PRICE']:.2f}\n"
+                f"Scale: {state['SCALE_COUNT']}/{MAX_SCALE_INS}\n"
+                f"Confidence: {state['CONFIDENCE_LABEL']}"
+            )
+
+    elif state["TRADE_SIDE"] == "SHORT":
+        favorable_move = price <= state["AVG_ENTRY_PRICE"] - (atr_now * SCALE_IN_ATR_STEP)
+        confirmation_ok = sig["confirm_short"]
+        score_ok = sig["short_score"] >= SHORT_ALERT_SCORE
+
+        if favorable_move and confirmation_ok and score_ok:
+            old_avg = state["AVG_ENTRY_PRICE"]
+            state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
+            state["SCALE_COUNT"] += 1
+            state["LAST_SCALE_TIME"] = time.time()
+            state["LOWEST_PRICE"] = min(state["LOWEST_PRICE"], price)
+
+            send(
+                f"➕ {name} SHORT SCALE-IN\n\n"
+                f"Entry type: {state['ENTRY_TYPE']}\n"
+                f"New add price: ${price:.2f}\n"
+                f"Old avg: ${old_avg:.2f}\n"
+                f"New avg: ${state['AVG_ENTRY_PRICE']:.2f}\n"
+                f"Scale: {state['SCALE_COUNT']}/{MAX_SCALE_INS}\n"
+                f"Confidence: {state['CONFIDENCE_LABEL']}"
+            )
+
+# =========================
+# TRADE MANAGEMENT
+# =========================
 def manage_trade(asset_key: str, sig: dict):
     state = STATE[asset_key]
     name = ASSETS[asset_key]["name"]
 
     price = sig["price"]
     atr_now = sig["atr"]
+    entry_ref = state["AVG_ENTRY_PRICE"] if state["AVG_ENTRY_PRICE"] > 0 else state["ENTRY_PRICE"]
+
+    maybe_scale_in(asset_key, sig)
 
     if state["TRADE_SIDE"] == "LONG":
         state["HIGHEST_PRICE"] = max(state["HIGHEST_PRICE"], price)
 
-        if (not state["BREAK_EVEN_ACTIVE"]) and price >= state["ENTRY_PRICE"] + (atr_now * BREAK_EVEN_ATR_TRIGGER):
-            state["STOP_LOSS"] = max(state["STOP_LOSS"], state["ENTRY_PRICE"])
+        if (not state["BREAK_EVEN_ACTIVE"]) and price >= entry_ref + (atr_now * BREAK_EVEN_ATR_TRIGGER):
+            state["STOP_LOSS"] = max(state["STOP_LOSS"], entry_ref)
             state["BREAK_EVEN_ACTIVE"] = True
             send(f"⚡ {name} LONG BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not state["PARTIAL_SENT"]) and price >= state["ENTRY_PRICE"] + (atr_now * PARTIAL_ATR_TRIGGER):
+        if (not state["PARTIAL_SENT"]) and price >= entry_ref + (atr_now * PARTIAL_ATR_TRIGGER):
             state["PARTIAL_SENT"] = True
             send(f"💰 {name} LONG PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if state["BREAK_EVEN_ACTIVE"] and price > state["ENTRY_PRICE"] + atr_now:
+        if state["BREAK_EVEN_ACTIVE"] and price > entry_ref + atr_now:
             new_sl = state["HIGHEST_PRICE"] - (atr_now * ATR_TRAIL_MULT)
             if new_sl > state["STOP_LOSS"]:
                 state["STOP_LOSS"] = new_sl
@@ -462,16 +629,16 @@ def manage_trade(asset_key: str, sig: dict):
     elif state["TRADE_SIDE"] == "SHORT":
         state["LOWEST_PRICE"] = min(state["LOWEST_PRICE"], price)
 
-        if (not state["BREAK_EVEN_ACTIVE"]) and price <= state["ENTRY_PRICE"] - (atr_now * BREAK_EVEN_ATR_TRIGGER):
-            state["STOP_LOSS"] = min(state["STOP_LOSS"], state["ENTRY_PRICE"])
+        if (not state["BREAK_EVEN_ACTIVE"]) and price <= entry_ref - (atr_now * BREAK_EVEN_ATR_TRIGGER):
+            state["STOP_LOSS"] = min(state["STOP_LOSS"], entry_ref)
             state["BREAK_EVEN_ACTIVE"] = True
             send(f"⚡ {name} SHORT BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not state["PARTIAL_SENT"]) and price <= state["ENTRY_PRICE"] - (atr_now * PARTIAL_ATR_TRIGGER):
+        if (not state["PARTIAL_SENT"]) and price <= entry_ref - (atr_now * PARTIAL_ATR_TRIGGER):
             state["PARTIAL_SENT"] = True
             send(f"💰 {name} SHORT PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if state["BREAK_EVEN_ACTIVE"] and price < state["ENTRY_PRICE"] - atr_now:
+        if state["BREAK_EVEN_ACTIVE"] and price < entry_ref - atr_now:
             new_sl = state["LOWEST_PRICE"] + (atr_now * ATR_TRAIL_MULT)
             if new_sl < state["STOP_LOSS"]:
                 state["STOP_LOSS"] = new_sl
@@ -491,13 +658,12 @@ def manage_trade(asset_key: str, sig: dict):
 # MAIN LOOP
 # =========================
 def run():
-    send("🔥 BTC + GOLD FINAL ELITE BOT LIVE 🔥")
+    send("🔥 BTC + GOLD ELITE SCALING BOT LIVE 🔥")
 
     while True:
         try:
             for asset_key in ASSETS:
                 state = STATE[asset_key]
-                name = ASSETS[asset_key]["name"]
 
                 sig = get_signal(asset_key)
 
@@ -519,145 +685,73 @@ def run():
                     if not not_too_extended(price, ema9_value):
                         continue
 
-                    # =========================
-                    # A SETUP ENTRY
-                    # =========================
+                    # A SETUP
                     if a_setup_long(sig):
-                        state["ENTRY_PRICE"] = price
-                        state["STOP_LOSS"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_SL_MULT)
-                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_TP_MULT)
-                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["TRADE_SIDE"] = "LONG"
-                        state["IN_TRADE"] = True
-
-                        size = "FULL" if sig["long_score"] >= FULL_SIZE_SCORE else "SNIPER"
-
-                        send(
-                            f"🚀 {name} LONG ENTRY\n\n"
-                            f"Trigger: A SETUP\n"
-                            f"Size: {size}\n"
-                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
-                            f"Score: {sig['long_score']}\n"
-                            f"Reasons: {', '.join(sig['long_reasons'][:4])}\n\n"
-                            f"SL: ${state['STOP_LOSS']:.2f}\n"
-                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                        start_trade(
+                            asset_key=asset_key,
+                            side="LONG",
+                            trigger="A SETUP",
+                            score=sig["long_score"],
+                            reasons=sig["long_reasons"],
+                            price=price,
+                            atr_now=sig["atr"],
                         )
 
                     elif a_setup_short(sig):
-                        state["ENTRY_PRICE"] = price
-                        state["STOP_LOSS"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_SL_MULT)
-                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_TP_MULT)
-                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["TRADE_SIDE"] = "SHORT"
-                        state["IN_TRADE"] = True
-
-                        size = "FULL" if sig["short_score"] >= FULL_SIZE_SCORE else "SNIPER"
-
-                        send(
-                            f"📉 {name} SHORT ENTRY\n\n"
-                            f"Trigger: A SETUP\n"
-                            f"Size: {size}\n"
-                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
-                            f"Score: {sig['short_score']}\n"
-                            f"Reasons: {', '.join(sig['short_reasons'][:4])}\n\n"
-                            f"SL: ${state['STOP_LOSS']:.2f}\n"
-                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                        start_trade(
+                            asset_key=asset_key,
+                            side="SHORT",
+                            trigger="A SETUP",
+                            score=sig["short_score"],
+                            reasons=sig["short_reasons"],
+                            price=price,
+                            atr_now=sig["atr"],
                         )
 
-                    # =========================
-                    # BREAKOUT ENTRY
-                    # =========================
-                    elif sig["long_score"] >= LONG_ALERT_SCORE and sig["long_breakout"]:
-                        state["ENTRY_PRICE"] = price
-                        state["STOP_LOSS"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_SL_MULT)
-                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_TP_MULT)
-                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["TRADE_SIDE"] = "LONG"
-                        state["IN_TRADE"] = True
-
-                        size = "FULL" if sig["long_score"] >= FULL_SIZE_SCORE else "SNIPER"
-
-                        send(
-                            f"🚀 {name} LONG ENTRY\n\n"
-                            f"Trigger: BREAKOUT\n"
-                            f"Size: {size}\n"
-                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
-                            f"Score: {sig['long_score']}\n"
-                            f"Reasons: {', '.join(sig['long_reasons'][:4])}\n\n"
-                            f"SL: ${state['STOP_LOSS']:.2f}\n"
-                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                    # BREAKOUT
+                    elif sig["long_score"] >= LONG_ALERT_SCORE and sig["long_breakout"] and sig["confirm_long"]:
+                        start_trade(
+                            asset_key=asset_key,
+                            side="LONG",
+                            trigger="BREAKOUT",
+                            score=sig["long_score"],
+                            reasons=sig["long_reasons"],
+                            price=price,
+                            atr_now=sig["atr"],
                         )
 
-                    elif sig["short_score"] >= SHORT_ALERT_SCORE and sig["short_breakout"]:
-                        state["ENTRY_PRICE"] = price
-                        state["STOP_LOSS"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_SL_MULT)
-                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_TP_MULT)
-                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["TRADE_SIDE"] = "SHORT"
-                        state["IN_TRADE"] = True
-
-                        size = "FULL" if sig["short_score"] >= FULL_SIZE_SCORE else "SNIPER"
-
-                        send(
-                            f"📉 {name} SHORT ENTRY\n\n"
-                            f"Trigger: BREAKOUT\n"
-                            f"Size: {size}\n"
-                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
-                            f"Score: {sig['short_score']}\n"
-                            f"Reasons: {', '.join(sig['short_reasons'][:4])}\n\n"
-                            f"SL: ${state['STOP_LOSS']:.2f}\n"
-                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                    elif sig["short_score"] >= SHORT_ALERT_SCORE and sig["short_breakout"] and sig["confirm_short"]:
+                        start_trade(
+                            asset_key=asset_key,
+                            side="SHORT",
+                            trigger="BREAKOUT",
+                            score=sig["short_score"],
+                            reasons=sig["short_reasons"],
+                            price=price,
+                            atr_now=sig["atr"],
                         )
 
-                    # =========================
-                    # SNIPER ENTRY
-                    # =========================
-                    elif sig["long_score"] >= LONG_ALERT_SCORE and sig["long_sniper"]:
-                        state["ENTRY_PRICE"] = price
-                        state["STOP_LOSS"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_SL_MULT)
-                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_TP_MULT)
-                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["TRADE_SIDE"] = "LONG"
-                        state["IN_TRADE"] = True
-
-                        size = "FULL" if sig["long_score"] >= FULL_SIZE_SCORE else "SNIPER"
-
-                        send(
-                            f"🚀 {name} LONG ENTRY\n\n"
-                            f"Trigger: SNIPER\n"
-                            f"Size: {size}\n"
-                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
-                            f"Score: {sig['long_score']}\n"
-                            f"Reasons: {', '.join(sig['long_reasons'][:4])}\n\n"
-                            f"SL: ${state['STOP_LOSS']:.2f}\n"
-                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                    # SNIPER
+                    elif sig["long_score"] >= LONG_ALERT_SCORE and sig["long_sniper"] and sig["confirm_long"]:
+                        start_trade(
+                            asset_key=asset_key,
+                            side="LONG",
+                            trigger="SNIPER",
+                            score=sig["long_score"],
+                            reasons=sig["long_reasons"],
+                            price=price,
+                            atr_now=sig["atr"],
                         )
 
-                    elif sig["short_score"] >= SHORT_ALERT_SCORE and sig["short_sniper"]:
-                        state["ENTRY_PRICE"] = price
-                        state["STOP_LOSS"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_SL_MULT)
-                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_TP_MULT)
-                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
-                        state["TRADE_SIDE"] = "SHORT"
-                        state["IN_TRADE"] = True
-
-                        size = "FULL" if sig["short_score"] >= FULL_SIZE_SCORE else "SNIPER"
-
-                        send(
-                            f"📉 {name} SHORT ENTRY\n\n"
-                            f"Trigger: SNIPER\n"
-                            f"Size: {size}\n"
-                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
-                            f"Score: {sig['short_score']}\n"
-                            f"Reasons: {', '.join(sig['short_reasons'][:4])}\n\n"
-                            f"SL: ${state['STOP_LOSS']:.2f}\n"
-                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                    elif sig["short_score"] >= SHORT_ALERT_SCORE and sig["short_sniper"] and sig["confirm_short"]:
+                        start_trade(
+                            asset_key=asset_key,
+                            side="SHORT",
+                            trigger="SNIPER",
+                            score=sig["short_score"],
+                            reasons=sig["short_reasons"],
+                            price=price,
+                            atr_now=sig["atr"],
                         )
 
                 else:
