@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import pandas as pd
+import yfinance as yf
 
 # =========================
 # ENV
@@ -12,7 +13,6 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 # =========================
 # CONFIG
 # =========================
-SYMBOL = "BTCUSDT"
 CHECK_INTERVAL = 60
 HEARTBEAT_SECONDS = 1800
 COOLDOWN_SECONDS = 600
@@ -27,23 +27,39 @@ ATR_TRAIL_MULT = 1.5
 BREAK_EVEN_ATR_TRIGGER = 1.0
 PARTIAL_ATR_TRIGGER = 1.5
 
-MIN_VOLATILITY_PCT = 0.001   # 0.1%
-MAX_EMA9_DISTANCE_PCT = 0.01 # 1%
+MIN_VOLATILITY_PCT = 0.001
+MAX_EMA9_DISTANCE_PCT = 0.01
+
+ASSETS = {
+    "BTC": {
+        "ticker": "BTC-USD",
+        "name": "BTC",
+    },
+    "GOLD": {
+        "ticker": "GC=F",
+        "name": "GOLD",
+    },
+}
 
 # =========================
 # STATE
 # =========================
-IN_TRADE = False
-TRADE_SIDE = None  # LONG / SHORT
-ENTRY_PRICE = 0.0
-STOP_LOSS = 0.0
-TAKE_PROFIT = 0.0
-PARTIAL_SENT = False
-BREAK_EVEN_ACTIVE = False
-LAST_HEARTBEAT_TS = 0.0
-HIGHEST_PRICE = 0.0
-LOWEST_PRICE = 0.0
-LAST_TRADE_TIME = 0.0
+STATE = {
+    key: {
+        "IN_TRADE": False,
+        "TRADE_SIDE": None,
+        "ENTRY_PRICE": 0.0,
+        "STOP_LOSS": 0.0,
+        "TAKE_PROFIT": 0.0,
+        "PARTIAL_SENT": False,
+        "BREAK_EVEN_ACTIVE": False,
+        "LAST_HEARTBEAT_TS": 0.0,
+        "HIGHEST_PRICE": 0.0,
+        "LOWEST_PRICE": 0.0,
+        "LAST_TRADE_TIME": 0.0,
+    }
+    for key in ASSETS
+}
 
 # =========================
 # TELEGRAM
@@ -61,24 +77,47 @@ def send(msg: str):
 # =========================
 # DATA
 # =========================
-def get_klines(interval: str, limit: int = 120) -> pd.DataFrame:
+def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
+        ticker = ASSETS[asset_key]["ticker"]
 
-        if not isinstance(data, list) or len(data) < 30:
+        # yfinance minute data only works with short periods
+        period = "7d" if interval == "1m" else "60d"
+
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+        )
+
+        if df is None or df.empty:
             return pd.DataFrame()
 
-        df = pd.DataFrame(data, columns=[
-            "time", "open", "high", "low", "close", "volume",
-            "ct", "qav", "nt", "tbv", "tqv", "ignore"
-        ])
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
-        for col in ["open", "high", "low", "close", "volume"]:
+        df = df.rename(columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        })
+
+        needed = ["open", "high", "low", "close", "volume"]
+        for col in needed:
+            if col not in df.columns:
+                return pd.DataFrame()
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+        df = df[needed].copy()
         df.dropna(inplace=True)
+
+        if len(df) < 30:
+            return pd.DataFrame()
+
         return df
     except Exception:
         return pd.DataFrame()
@@ -291,34 +330,35 @@ def sniper_short(df1: pd.DataFrame) -> bool:
 # =========================
 # HEARTBEAT
 # =========================
-def maybe_send_heartbeat(df1: pd.DataFrame, df5: pd.DataFrame):
-    global LAST_HEARTBEAT_TS
-
+def maybe_send_heartbeat(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame):
     now = time.time()
-    if now - LAST_HEARTBEAT_TS < HEARTBEAT_SECONDS:
+    state = STATE[asset_key]
+
+    if now - state["LAST_HEARTBEAT_TS"] < HEARTBEAT_SECONDS:
         return
 
     ls, _ = long_score(df1, df5)
     ss, _ = short_score(df1, df5)
     r1 = df1.iloc[-1]
+    name = ASSETS[asset_key]["name"]
 
     send(
-        f"💓 BTC HEARTBEAT\n\n"
+        f"💓 {name} HEARTBEAT\n\n"
         f"Price: ${float(r1['close']):.2f}\n"
         f"RSI: {float(r1['rsi']):.1f}\n"
         f"Trend: {market_trend(df1, df5)}\n"
         f"Long score: {ls}\n"
         f"Short score: {ss}\n"
-        f"In trade: {'YES' if IN_TRADE else 'NO'}"
+        f"In trade: {'YES' if state['IN_TRADE'] else 'NO'}"
     )
-    LAST_HEARTBEAT_TS = now
+    state["LAST_HEARTBEAT_TS"] = now
 
 # =========================
 # SIGNAL ENGINE
 # =========================
-def get_signal():
-    df1_raw = get_klines("1m")
-    df5_raw = get_klines("5m")
+def get_signal(asset_key: str):
+    df1_raw = get_klines(asset_key, "1m")
+    df5_raw = get_klines(asset_key, "5m")
 
     df1 = add_indicators(df1_raw)
     df5 = add_indicators(df5_raw)
@@ -356,172 +396,167 @@ def get_signal():
 # =========================
 # TRADE MANAGEMENT
 # =========================
-def reset_trade():
-    global IN_TRADE, TRADE_SIDE, ENTRY_PRICE, STOP_LOSS, TAKE_PROFIT
-    global PARTIAL_SENT, BREAK_EVEN_ACTIVE, HIGHEST_PRICE, LOWEST_PRICE
-    global LAST_TRADE_TIME
+def reset_trade(asset_key: str):
+    state = STATE[asset_key]
+    state["IN_TRADE"] = False
+    state["TRADE_SIDE"] = None
+    state["ENTRY_PRICE"] = 0.0
+    state["STOP_LOSS"] = 0.0
+    state["TAKE_PROFIT"] = 0.0
+    state["PARTIAL_SENT"] = False
+    state["BREAK_EVEN_ACTIVE"] = False
+    state["HIGHEST_PRICE"] = 0.0
+    state["LOWEST_PRICE"] = 0.0
+    state["LAST_TRADE_TIME"] = time.time()
 
-    IN_TRADE = False
-    TRADE_SIDE = None
-    ENTRY_PRICE = 0.0
-    STOP_LOSS = 0.0
-    TAKE_PROFIT = 0.0
-    PARTIAL_SENT = False
-    BREAK_EVEN_ACTIVE = False
-    HIGHEST_PRICE = 0.0
-    LOWEST_PRICE = 0.0
-    LAST_TRADE_TIME = time.time()
-
-def manage_trade(sig: dict):
-    global STOP_LOSS, PARTIAL_SENT, BREAK_EVEN_ACTIVE, HIGHEST_PRICE, LOWEST_PRICE
+def manage_trade(asset_key: str, sig: dict):
+    state = STATE[asset_key]
+    name = ASSETS[asset_key]["name"]
 
     price = sig["price"]
     atr_now = sig["atr"]
 
-    if TRADE_SIDE == "LONG":
-        HIGHEST_PRICE = max(HIGHEST_PRICE, price)
+    if state["TRADE_SIDE"] == "LONG":
+        state["HIGHEST_PRICE"] = max(state["HIGHEST_PRICE"], price)
 
-        if (not BREAK_EVEN_ACTIVE) and price >= ENTRY_PRICE + (atr_now * BREAK_EVEN_ATR_TRIGGER):
-            STOP_LOSS = max(STOP_LOSS, ENTRY_PRICE)
-            BREAK_EVEN_ACTIVE = True
-            send(f"⚡ BTC LONG BREAK-EVEN\nNew SL: ${STOP_LOSS:.2f}")
+        if (not state["BREAK_EVEN_ACTIVE"]) and price >= state["ENTRY_PRICE"] + (atr_now * BREAK_EVEN_ATR_TRIGGER):
+            state["STOP_LOSS"] = max(state["STOP_LOSS"], state["ENTRY_PRICE"])
+            state["BREAK_EVEN_ACTIVE"] = True
+            send(f"⚡ {name} LONG BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not PARTIAL_SENT) and price >= ENTRY_PRICE + (atr_now * PARTIAL_ATR_TRIGGER):
-            PARTIAL_SENT = True
-            send(f"💰 BTC LONG PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
+        if (not state["PARTIAL_SENT"]) and price >= state["ENTRY_PRICE"] + (atr_now * PARTIAL_ATR_TRIGGER):
+            state["PARTIAL_SENT"] = True
+            send(f"💰 {name} LONG PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if BREAK_EVEN_ACTIVE and price > ENTRY_PRICE + atr_now:
-            new_sl = HIGHEST_PRICE - (atr_now * ATR_TRAIL_MULT)
-            if new_sl > STOP_LOSS:
-                STOP_LOSS = new_sl
-                send(f"📈 BTC LONG TRAILING STOP\nNew SL: ${STOP_LOSS:.2f}")
+        if state["BREAK_EVEN_ACTIVE"] and price > state["ENTRY_PRICE"] + atr_now:
+            new_sl = state["HIGHEST_PRICE"] - (atr_now * ATR_TRAIL_MULT)
+            if new_sl > state["STOP_LOSS"]:
+                state["STOP_LOSS"] = new_sl
+                send(f"📈 {name} LONG TRAILING STOP\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if price <= STOP_LOSS:
-            send(f"❌ BTC LONG STOP HIT\nExit: ${price:.2f}")
-            reset_trade()
+        if price <= state["STOP_LOSS"]:
+            send(f"❌ {name} LONG STOP HIT\nExit: ${price:.2f}")
+            reset_trade(asset_key)
             return
 
-        if price >= TAKE_PROFIT:
-            send(f"🎯 BTC LONG TARGET HIT\nExit: ${price:.2f}")
-            reset_trade()
+        if price >= state["TAKE_PROFIT"]:
+            send(f"🎯 {name} LONG TARGET HIT\nExit: ${price:.2f}")
+            reset_trade(asset_key)
             return
 
-    elif TRADE_SIDE == "SHORT":
-        LOWEST_PRICE = min(LOWEST_PRICE, price)
+    elif state["TRADE_SIDE"] == "SHORT":
+        state["LOWEST_PRICE"] = min(state["LOWEST_PRICE"], price)
 
-        if (not BREAK_EVEN_ACTIVE) and price <= ENTRY_PRICE - (atr_now * BREAK_EVEN_ATR_TRIGGER):
-            STOP_LOSS = min(STOP_LOSS, ENTRY_PRICE)
-            BREAK_EVEN_ACTIVE = True
-            send(f"⚡ BTC SHORT BREAK-EVEN\nNew SL: ${STOP_LOSS:.2f}")
+        if (not state["BREAK_EVEN_ACTIVE"]) and price <= state["ENTRY_PRICE"] - (atr_now * BREAK_EVEN_ATR_TRIGGER):
+            state["STOP_LOSS"] = min(state["STOP_LOSS"], state["ENTRY_PRICE"])
+            state["BREAK_EVEN_ACTIVE"] = True
+            send(f"⚡ {name} SHORT BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not PARTIAL_SENT) and price <= ENTRY_PRICE - (atr_now * PARTIAL_ATR_TRIGGER):
-            PARTIAL_SENT = True
-            send(f"💰 BTC SHORT PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
+        if (not state["PARTIAL_SENT"]) and price <= state["ENTRY_PRICE"] - (atr_now * PARTIAL_ATR_TRIGGER):
+            state["PARTIAL_SENT"] = True
+            send(f"💰 {name} SHORT PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if BREAK_EVEN_ACTIVE and price < ENTRY_PRICE - atr_now:
-            new_sl = LOWEST_PRICE + (atr_now * ATR_TRAIL_MULT)
-            if new_sl < STOP_LOSS:
-                STOP_LOSS = new_sl
-                send(f"📉 BTC SHORT TRAILING STOP\nNew SL: ${STOP_LOSS:.2f}")
+        if state["BREAK_EVEN_ACTIVE"] and price < state["ENTRY_PRICE"] - atr_now:
+            new_sl = state["LOWEST_PRICE"] + (atr_now * ATR_TRAIL_MULT)
+            if new_sl < state["STOP_LOSS"]:
+                state["STOP_LOSS"] = new_sl
+                send(f"📉 {name} SHORT TRAILING STOP\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if price >= STOP_LOSS:
-            send(f"❌ BTC SHORT STOP HIT\nExit: ${price:.2f}")
-            reset_trade()
+        if price >= state["STOP_LOSS"]:
+            send(f"❌ {name} SHORT STOP HIT\nExit: ${price:.2f}")
+            reset_trade(asset_key)
             return
 
-        if price <= TAKE_PROFIT:
-            send(f"🎯 BTC SHORT TARGET HIT\nExit: ${price:.2f}")
-            reset_trade()
+        if price <= state["TAKE_PROFIT"]:
+            send(f"🎯 {name} SHORT TARGET HIT\nExit: ${price:.2f}")
+            reset_trade(asset_key)
             return
 
 # =========================
 # MAIN LOOP
 # =========================
 def run():
-    global IN_TRADE, TRADE_SIDE, ENTRY_PRICE, STOP_LOSS, TAKE_PROFIT
-    global HIGHEST_PRICE, LOWEST_PRICE
-
-    send("🔥 BTC FINAL ELITE BOT LIVE 🔥")
+    send("🔥 BTC + GOLD FINAL ELITE BOT LIVE 🔥")
 
     while True:
         try:
-            sig = get_signal()
+            for asset_key in ASSETS:
+                state = STATE[asset_key]
+                name = ASSETS[asset_key]["name"]
 
-            if sig is None:
-                time.sleep(15)
-                continue
+                sig = get_signal(asset_key)
 
-            maybe_send_heartbeat(sig["df1"], sig["df5"])
-
-            if not IN_TRADE:
-                if time.time() - LAST_TRADE_TIME < COOLDOWN_SECONDS:
-                    time.sleep(CHECK_INTERVAL)
+                if sig is None:
                     continue
 
-                if sig["trend"] == "CHOPPY":
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+                maybe_send_heartbeat(asset_key, sig["df1"], sig["df5"])
 
-                price = sig["price"]
-                ema9_value = float(sig["df1"].iloc[-1]["ema9"])
+                if not state["IN_TRADE"]:
+                    if time.time() - state["LAST_TRADE_TIME"] < COOLDOWN_SECONDS:
+                        continue
 
-                if not not_too_extended(price, ema9_value):
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+                    if sig["trend"] == "CHOPPY":
+                        continue
 
-                if sig["long_score"] >= LONG_ALERT_SCORE and (sig["long_breakout"] or sig["long_sniper"]):
-                    ENTRY_PRICE = price
-                    STOP_LOSS = ENTRY_PRICE - (sig["atr"] * ATR_SL_MULT)
-                    TAKE_PROFIT = ENTRY_PRICE + (sig["atr"] * ATR_TP_MULT)
-                    HIGHEST_PRICE = ENTRY_PRICE
-                    LOWEST_PRICE = ENTRY_PRICE
-                    TRADE_SIDE = "LONG"
-                    IN_TRADE = True
+                    price = sig["price"]
+                    ema9_value = float(sig["df1"].iloc[-1]["ema9"])
 
-                    trigger = "BREAKOUT" if sig["long_breakout"] else "SNIPER"
-                    size = "FULL" if sig["long_score"] >= FULL_SIZE_SCORE else "SNIPER"
+                    if not not_too_extended(price, ema9_value):
+                        continue
 
-                    send(
-                        f"🚀 BTC LONG ENTRY\n\n"
-                        f"Trigger: {trigger}\n"
-                        f"Size: {size}\n"
-                        f"Price: ${ENTRY_PRICE:.2f}\n"
-                        f"Score: {sig['long_score']}\n"
-                        f"Reasons: {', '.join(sig['long_reasons'][:4])}\n\n"
-                        f"SL: ${STOP_LOSS:.2f}\n"
-                        f"TP: ${TAKE_PROFIT:.2f}"
-                    )
+                    if sig["long_score"] >= LONG_ALERT_SCORE and (sig["long_breakout"] or sig["long_sniper"]):
+                        state["ENTRY_PRICE"] = price
+                        state["STOP_LOSS"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_SL_MULT)
+                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_TP_MULT)
+                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
+                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
+                        state["TRADE_SIDE"] = "LONG"
+                        state["IN_TRADE"] = True
 
-                elif sig["short_score"] >= SHORT_ALERT_SCORE and (sig["short_breakout"] or sig["short_sniper"]):
-                    ENTRY_PRICE = price
-                    STOP_LOSS = ENTRY_PRICE + (sig["atr"] * ATR_SL_MULT)
-                    TAKE_PROFIT = ENTRY_PRICE - (sig["atr"] * ATR_TP_MULT)
-                    HIGHEST_PRICE = ENTRY_PRICE
-                    LOWEST_PRICE = ENTRY_PRICE
-                    TRADE_SIDE = "SHORT"
-                    IN_TRADE = True
+                        trigger = "BREAKOUT" if sig["long_breakout"] else "SNIPER"
+                        size = "FULL" if sig["long_score"] >= FULL_SIZE_SCORE else "SNIPER"
 
-                    trigger = "BREAKDOWN" if sig["short_breakout"] else "SNIPER"
-                    size = "FULL" if sig["short_score"] >= FULL_SIZE_SCORE else "SNIPER"
+                        send(
+                            f"🚀 {name} LONG ENTRY\n\n"
+                            f"Trigger: {trigger}\n"
+                            f"Size: {size}\n"
+                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
+                            f"Score: {sig['long_score']}\n"
+                            f"Reasons: {', '.join(sig['long_reasons'][:4])}\n\n"
+                            f"SL: ${state['STOP_LOSS']:.2f}\n"
+                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                        )
 
-                    send(
-                        f"📉 BTC SHORT ENTRY\n\n"
-                        f"Trigger: {trigger}\n"
-                        f"Size: {size}\n"
-                        f"Price: ${ENTRY_PRICE:.2f}\n"
-                        f"Score: {sig['short_score']}\n"
-                        f"Reasons: {', '.join(sig['short_reasons'][:4])}\n\n"
-                        f"SL: ${STOP_LOSS:.2f}\n"
-                        f"TP: ${TAKE_PROFIT:.2f}"
-                    )
+                    elif sig["short_score"] >= SHORT_ALERT_SCORE and (sig["short_breakout"] or sig["short_sniper"]):
+                        state["ENTRY_PRICE"] = price
+                        state["STOP_LOSS"] = state["ENTRY_PRICE"] + (sig["atr"] * ATR_SL_MULT)
+                        state["TAKE_PROFIT"] = state["ENTRY_PRICE"] - (sig["atr"] * ATR_TP_MULT)
+                        state["HIGHEST_PRICE"] = state["ENTRY_PRICE"]
+                        state["LOWEST_PRICE"] = state["ENTRY_PRICE"]
+                        state["TRADE_SIDE"] = "SHORT"
+                        state["IN_TRADE"] = True
 
-            else:
-                manage_trade(sig)
+                        trigger = "BREAKDOWN" if sig["short_breakout"] else "SNIPER"
+                        size = "FULL" if sig["short_score"] >= FULL_SIZE_SCORE else "SNIPER"
+
+                        send(
+                            f"📉 {name} SHORT ENTRY\n\n"
+                            f"Trigger: {trigger}\n"
+                            f"Size: {size}\n"
+                            f"Price: ${state['ENTRY_PRICE']:.2f}\n"
+                            f"Score: {sig['short_score']}\n"
+                            f"Reasons: {', '.join(sig['short_reasons'][:4])}\n\n"
+                            f"SL: ${state['STOP_LOSS']:.2f}\n"
+                            f"TP: ${state['TAKE_PROFIT']:.2f}"
+                        )
+
+                else:
+                    manage_trade(asset_key, sig)
 
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            send(f"BTC BOT ERROR: {e}")
+            send(f"BOT ERROR: {e}")
             time.sleep(15)
 
 if __name__ == "__main__":
