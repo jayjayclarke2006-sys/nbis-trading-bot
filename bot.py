@@ -1,7 +1,7 @@
 import os
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import Dict, Optional, Set
 
 import requests
@@ -33,6 +33,7 @@ CHECK_INTERVAL = 300  # 5 min
 MAX_TOTAL_POSITIONS = 4
 MAX_TOTAL_EXPOSURE_PCT = 0.28
 MAX_POSITION_PCT = 0.07
+MAX_CORRELATED_TRADES = 2  # hedge-fund style clustering control
 
 RISK_PER_TRADE_LONG = 0.0075
 RISK_PER_TRADE_SHORT = 0.005
@@ -43,46 +44,53 @@ YESTERDAY_GAIN_GIVEBACK_PCT = 0.50
 
 EMA_FAST = 20
 EMA_SLOW = 50
+EMA_PULLBACK = 9
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 VOLUME_LOOKBACK = 20
 BREAKOUT_LOOKBACK = 10
 
 RSI_MIN = 55
-RSI_MAX = 70
-RVOL_MIN = 1.5
+RSI_MAX = 68
+RVOL_MIN = 1.35
 
-SHORT_RSI_MIN = 30
-SHORT_RSI_MAX = 45
-SHORT_RVOL_MIN = 1.5
+SHORT_RSI_MIN = 32
+SHORT_RSI_MAX = 48
+SHORT_RVOL_MIN = 1.35
 
 BREAKOUT_BUFFER_PCT = 0.0025
 BREAKDOWN_BUFFER_PCT = 0.0025
 
-MAX_CHASE_FROM_BREAKOUT_PCT = 0.015
-MAX_CHASE_FROM_BREAKDOWN_PCT = 0.015
-MAX_EXT_FROM_EMA_FAST_PCT = 0.02
-MAX_EXT_FROM_EMA_FAST_SHORT_PCT = 0.02
+# anti-chase tightened
+MAX_CHASE_FROM_BREAKOUT_PCT = 0.004
+MAX_CHASE_FROM_BREAKDOWN_PCT = 0.004
+MAX_EXT_FROM_EMA_FAST_PCT = 0.012
+MAX_EXT_FROM_EMA_FAST_SHORT_PCT = 0.012
+MAX_CANDLE_BODY_ATR_MULT = 0.85
 
+# long management
 HARD_STOP_PCT = 0.025
 FAIL_FAST_BARS = 3
 FAIL_FAST_LOSS_PCT = 0.01
 FIRST_TARGET_R = 1.5
-FINAL_TARGET_R = 3.0
-TRAILING_STOP_ATR_MULT = 2.0
-EARLY_EXIT_RSI = 64
-WEAK_HOLD_BARS = 6
-WEAK_HOLD_LOSS_PCT = 0.0125
+FINAL_TARGET_R = 3.5
+TRAILING_STOP_ATR_MULT = 2.4
+BREAK_EVEN_TRIGGER_R = 1.0
+EARLY_EXIT_RSI = 72
+WEAK_HOLD_BARS = 8
+WEAK_HOLD_LOSS_PCT = 0.015
 
+# short management
 SHORT_HARD_STOP_PCT = 0.02
 SHORT_FAIL_FAST_BARS = 3
 SHORT_FAIL_FAST_LOSS_PCT = 0.008
 SHORT_FIRST_TARGET_R = 1.25
-SHORT_FINAL_TARGET_R = 2.5
-SHORT_TRAILING_STOP_ATR_MULT = 1.8
-SHORT_EARLY_EXIT_RSI = 38
-SHORT_WEAK_HOLD_BARS = 6
-SHORT_WEAK_HOLD_LOSS_PCT = 0.01
+SHORT_FINAL_TARGET_R = 3.0
+SHORT_TRAILING_STOP_ATR_MULT = 2.1
+SHORT_BREAK_EVEN_TRIGGER_R = 1.0
+SHORT_EARLY_EXIT_RSI = 28
+SHORT_WEAK_HOLD_BARS = 8
+SHORT_WEAK_HOLD_LOSS_PCT = 0.012
 
 ENABLE_SHORTS = True
 
@@ -91,6 +99,10 @@ SELL_COOLDOWN_SECONDS = 300
 
 REPORT_HOUR = 21
 REPORT_MINUTE = 0
+
+# session filter (US liquid hours)
+ALLOW_NEW_ENTRIES_AFTER = dt_time(9, 40)
+ALLOW_NEW_ENTRIES_BEFORE = dt_time(15, 15)
 
 # =========================
 # APP / API
@@ -124,6 +136,8 @@ trade_state: Dict[str, Dict[str, float]] = {}
 #       "initial_qty": int,
 #       "partial_taken": 0 or 1,
 #       "break_even_active": 0 or 1,
+#       "entry_type": str,
+#       "setup_score": float,
 #   }
 # }
 
@@ -215,11 +229,14 @@ def build_signal_frame(df_5m: pd.DataFrame) -> Optional[pd.DataFrame]:
 
     df["ema_fast"] = ema(df["Close"], EMA_FAST)
     df["ema_slow"] = ema(df["Close"], EMA_SLOW)
+    df["ema_pullback"] = ema(df["Close"], EMA_PULLBACK)
     df["rsi"] = rsi(df["Close"], RSI_PERIOD)
     df["atr"] = atr(df, ATR_PERIOD)
     df["avg_volume"] = df["Volume"].rolling(VOLUME_LOOKBACK).mean()
     df["recent_high"] = df["High"].rolling(BREAKOUT_LOOKBACK).max().shift(1)
     df["recent_low"] = df["Low"].rolling(BREAKOUT_LOOKBACK).min().shift(1)
+    df["body"] = (df["Close"] - df["Open"]).abs()
+    df["rvol"] = df["Volume"] / df["avg_volume"].replace(0, np.nan)
 
     df.dropna(inplace=True)
     if len(df) < max(EMA_SLOW + 5, VOLUME_LOOKBACK + 5, BREAKOUT_LOOKBACK + 5):
@@ -337,6 +354,16 @@ def daily_loss_limit_hit(equity: float) -> bool:
     return daily_realized_pnl <= -cap
 
 # =========================
+# SESSION / CLUSTER FILTERS
+# =========================
+def entries_allowed_now() -> bool:
+    now = datetime.now().time()
+    return ALLOW_NEW_ENTRIES_AFTER <= now <= ALLOW_NEW_ENTRIES_BEFORE
+
+def count_correlated_positions(positions: Dict[str, object]) -> int:
+    return sum(1 for s in positions if s in SYMBOLS)
+
+# =========================
 # MARKET FILTERS
 # =========================
 def market_is_healthy_for_longs() -> bool:
@@ -407,15 +434,15 @@ def score_long_setup(df: pd.DataFrame) -> int:
     if float(row["ema_fast"]) > float(row["ema_slow"]):
         score += 25
 
-    if 58 <= float(row["rsi"]) <= 68:
+    if 58 <= float(row["rsi"]) <= 66:
         score += 20
-    elif 55 <= float(row["rsi"]) <= 70:
+    elif 55 <= float(row["rsi"]) <= 68:
         score += 10
 
-    rvol = float(row["Volume"]) / max(float(row["avg_volume"]), 1.0)
+    rvol = float(row["rvol"])
     if rvol >= 2.0:
         score += 25
-    elif rvol >= 1.5:
+    elif rvol >= 1.4:
         score += 15
 
     breakout_level = float(row["recent_high"]) * (1 + BREAKOUT_BUFFER_PCT)
@@ -436,15 +463,15 @@ def score_short_setup(df: pd.DataFrame) -> int:
     if float(row["ema_fast"]) < float(row["ema_slow"]):
         score += 25
 
-    if 32 <= float(row["rsi"]) <= 42:
+    if 34 <= float(row["rsi"]) <= 42:
         score += 20
-    elif 30 <= float(row["rsi"]) <= 45:
+    elif 32 <= float(row["rsi"]) <= 45:
         score += 10
 
-    rvol = float(row["Volume"]) / max(float(row["avg_volume"]), 1.0)
+    rvol = float(row["rvol"])
     if rvol >= 2.0:
         score += 25
-    elif rvol >= 1.5:
+    elif rvol >= 1.4:
         score += 15
 
     breakdown_level = float(row["recent_low"]) * (1 - BREAKDOWN_BUFFER_PCT)
@@ -461,74 +488,81 @@ def score_short_setup(df: pd.DataFrame) -> int:
 # =========================
 def is_pullback_entry(df: pd.DataFrame) -> bool:
     try:
-        ema9 = df["Close"].ewm(span=9).mean()
-        ema20 = df["Close"].ewm(span=20).mean()
+        row = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
 
-        trend_up = float(ema9.iloc[-1]) > float(ema20.iloc[-1])
+        trend_up = float(row["ema_fast"]) > float(row["ema_slow"])
+        breakout_happened = float(prev2["Close"]) > float(prev2["recent_high"]) * (1 + BREAKOUT_BUFFER_PCT * 0.5)
+        pullback_to_fast = float(row["Low"]) <= float(row["ema_fast"])
+        close_back_above_fast = float(row["Close"]) > float(row["ema_fast"])
+        bounce = float(row["Close"]) > float(prev["Close"])
+        rsi_ok = 50 <= float(row["rsi"]) <= 65
+        volume_ok = float(row["rvol"]) >= 1.0
+        body_ok = float(row["body"]) <= float(row["atr"]) * MAX_CANDLE_BODY_ATR_MULT
 
-        recent_high = float(df["High"].rolling(10).max().iloc[-2])
-        current_price = float(df["Close"].iloc[-1])
-        prev_close = float(df["Close"].iloc[-2])
-        ema_fast_now = float(df["ema_fast"].iloc[-1])
-        rsi_now = float(df["rsi"].iloc[-1])
-        avg_volume = float(df["avg_volume"].iloc[-1])
-        current_volume = float(df["Volume"].iloc[-1])
-
-        pullback = current_price < recent_high * 0.98
-        bounce = current_price > prev_close
-        not_stretched = abs((current_price - ema_fast_now) / max(ema_fast_now, 1e-9)) <= 0.025
-        rsi_ok = 50 <= rsi_now <= 67
-        volume_ok = current_volume >= avg_volume * 1.1
-
-        return trend_up and pullback and bounce and not_stretched and rsi_ok and volume_ok
+        return all([
+            trend_up,
+            breakout_happened,
+            pullback_to_fast,
+            close_back_above_fast,
+            bounce,
+            rsi_ok,
+            volume_ok,
+            body_ok,
+        ])
     except Exception as e:
         print("Pullback check error:", e)
         return False
 
 def is_smart_continuation_entry(df: pd.DataFrame) -> bool:
     try:
-        close = df["Close"]
-        open_ = df["Open"]
-        volume = df["Volume"]
+        row = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        ema9 = close.ewm(span=9).mean()
-        ema20 = close.ewm(span=20).mean()
-        ema50 = close.ewm(span=50).mean()
+        strong_trend = (
+            float(row["Close"]) > float(row["ema_pullback"]) > float(row["ema_fast"]) > float(row["ema_slow"])
+        ) or (
+            float(row["Close"]) > float(row["ema_fast"]) > float(row["ema_slow"])
+        )
 
-        strong_trend = close.iloc[-1] > ema9.iloc[-1] > ema20.iloc[-1] > ema50.iloc[-1]
-        pullback = close.iloc[-2] < close.iloc[-3] and close.iloc[-1] > close.iloc[-2]
-        shallow = close.iloc[-1] > ema20.iloc[-1]
-        bullish = close.iloc[-1] > open_.iloc[-1]
-        avg_vol = volume.rolling(20).mean()
-        volume_ok = volume.iloc[-1] > avg_vol.iloc[-1] * 0.8
+        shallow = float(row["Low"]) >= float(row["ema_fast"]) * 0.995
+        bullish = float(row["Close"]) > float(prev["Close"])
+        volume_ok = float(row["rvol"]) >= 0.9
+        not_stretched = abs((float(row["Close"]) - float(row["ema_fast"])) / max(float(row["ema_fast"]), 1e-9)) <= MAX_EXT_FROM_EMA_FAST_PCT
+        rsi_ok = 55 <= float(row["rsi"]) <= 66
+        body_ok = float(row["body"]) <= float(row["atr"]) * MAX_CANDLE_BODY_ATR_MULT
 
-        return strong_trend and pullback and shallow and bullish and volume_ok
+        return all([strong_trend, shallow, bullish, volume_ok, not_stretched, rsi_ok, body_ok])
     except Exception as e:
         print("Continuation check error:", e)
         return False
 
 def is_short_pullback_entry(df: pd.DataFrame) -> bool:
     try:
-        ema9 = df["Close"].ewm(span=9).mean()
-        ema20 = df["Close"].ewm(span=20).mean()
+        row = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
 
-        trend_down = float(ema9.iloc[-1]) < float(ema20.iloc[-1])
+        trend_down = float(row["ema_fast"]) < float(row["ema_slow"])
+        breakdown_happened = float(prev2["Close"]) < float(prev2["recent_low"]) * (1 - BREAKDOWN_BUFFER_PCT * 0.5)
+        rally_to_fast = float(row["High"]) >= float(row["ema_fast"])
+        close_back_below_fast = float(row["Close"]) < float(row["ema_fast"])
+        rejection = float(row["Close"]) < float(prev["Close"])
+        rsi_ok = 35 <= float(row["rsi"]) <= 50
+        volume_ok = float(row["rvol"]) >= 1.0
+        body_ok = float(row["body"]) <= float(row["atr"]) * MAX_CANDLE_BODY_ATR_MULT
 
-        recent_low = float(df["Low"].rolling(10).min().iloc[-2])
-        current_price = float(df["Close"].iloc[-1])
-        prev_close = float(df["Close"].iloc[-2])
-        ema_fast_now = float(df["ema_fast"].iloc[-1])
-        rsi_now = float(df["rsi"].iloc[-1])
-        avg_volume = float(df["avg_volume"].iloc[-1])
-        current_volume = float(df["Volume"].iloc[-1])
-
-        rally = current_price > recent_low * 1.02
-        rejection = current_price < prev_close
-        not_stretched = abs((current_price - ema_fast_now) / max(ema_fast_now, 1e-9)) <= 0.025
-        rsi_ok = 33 <= rsi_now <= 50
-        volume_ok = current_volume >= avg_volume * 1.1
-
-        return trend_down and rally and rejection and not_stretched and rsi_ok and volume_ok
+        return all([
+            trend_down,
+            breakdown_happened,
+            rally_to_fast,
+            close_back_below_fast,
+            rejection,
+            rsi_ok,
+            volume_ok,
+            body_ok,
+        ])
     except Exception as e:
         print("Short pullback check error:", e)
         return False
@@ -549,9 +583,13 @@ def try_enter_long(symbol: str, df: pd.DataFrame, positions: Dict[str, object], 
         return False
     if len(positions) >= MAX_TOTAL_POSITIONS:
         return False
+    if count_correlated_positions(positions) >= MAX_CORRELATED_TRADES:
+        return False
     if daily_loss_limit_hit(equity):
         return False
     if not market_is_healthy_for_longs():
+        return False
+    if not entries_allowed_now():
         return False
 
     row = df.iloc[-1]
@@ -566,6 +604,7 @@ def try_enter_long(symbol: str, df: pd.DataFrame, positions: Dict[str, object], 
     recent_high = float(row["recent_high"])
     avg_volume = float(row["avg_volume"])
     volume_now = float(row["Volume"])
+    body_now = float(row["body"])
 
     breakout_level = recent_high * (1 + BREAKOUT_BUFFER_PCT)
     chase_pct = (price - breakout_level) / breakout_level if breakout_level > 0 else 0
@@ -579,18 +618,30 @@ def try_enter_long(symbol: str, df: pd.DataFrame, positions: Dict[str, object], 
     candle_ok = price > prev_close
     not_chasing = chase_pct <= MAX_CHASE_FROM_BREAKOUT_PCT
     not_stretched = ema_extension_pct <= MAX_EXT_FROM_EMA_FAST_PCT
+    body_ok = body_now <= atr_now * MAX_CANDLE_BODY_ATR_MULT
 
     breakout_condition = (
-        trend_ok and momentum_ok and breakout_ok and volume_ok and candle_ok and not_chasing and not_stretched
+        trend_ok and momentum_ok and breakout_ok and volume_ok and candle_ok and not_chasing and not_stretched and body_ok
     )
     pullback_condition = is_pullback_entry(df)
     continuation_condition = is_smart_continuation_entry(df)
 
-    if not (breakout_condition or pullback_condition or continuation_condition):
+    # priority: pullback > continuation > breakout
+    if pullback_condition:
+        entry_type = "PULLBACK"
+    elif continuation_condition:
+        entry_type = "CONTINUATION"
+    elif breakout_condition:
+        entry_type = "BREAKOUT"
+    else:
         return False
 
     setup_score = score_long_setup(df)
-    if breakout_condition and setup_score < 70:
+    if entry_type == "BREAKOUT" and setup_score < 75:
+        return False
+    if entry_type == "CONTINUATION" and setup_score < 55:
+        return False
+    if entry_type == "PULLBACK" and setup_score < 50:
         return False
 
     total_exposure = get_open_exposure_value(positions)
@@ -605,7 +656,11 @@ def try_enter_long(symbol: str, df: pd.DataFrame, positions: Dict[str, object], 
     if total_remaining <= price or symbol_remaining <= price:
         return False
 
-    stop_price = min(price * (1 - HARD_STOP_PCT), price - atr_now)
+    stop_price = min(price * (1 - HARD_STOP_PCT), price - atr_now * 1.2)
+    # for pullback, use a little smarter stop under fast EMA area if possible
+    if entry_type == "PULLBACK":
+        stop_price = min(stop_price, min(float(row["ema_fast"]), float(row["Low"])) - (atr_now * 0.35))
+
     risk_per_share = price - stop_price
     if risk_per_share <= 0:
         return False
@@ -644,15 +699,9 @@ def try_enter_long(symbol: str, df: pd.DataFrame, positions: Dict[str, object], 
             "initial_qty": qty,
             "partial_taken": 0,
             "break_even_active": 0,
+            "entry_type": entry_type,
+            "setup_score": float(setup_score),
         }
-
-        entry_type = "BREAKOUT"
-        if continuation_condition and not breakout_condition and not pullback_condition:
-            entry_type = "CONTINUATION"
-        elif pullback_condition and not breakout_condition:
-            entry_type = "PULLBACK"
-        elif breakout_condition and (pullback_condition or continuation_condition):
-            entry_type = "HYBRID"
 
         send_telegram(
             f"ENTRY LONG {symbol} ({entry_type})\n"
@@ -685,11 +734,15 @@ def try_enter_short(symbol: str, df: pd.DataFrame, positions: Dict[str, object],
         return False
     if len(positions) >= MAX_TOTAL_POSITIONS:
         return False
+    if count_correlated_positions(positions) >= MAX_CORRELATED_TRADES:
+        return False
     if daily_loss_limit_hit(equity):
         return False
     if not market_is_healthy_for_shorts():
         return False
     if not is_shortable_symbol(symbol):
+        return False
+    if not entries_allowed_now():
         return False
 
     row = df.iloc[-1]
@@ -704,10 +757,11 @@ def try_enter_short(symbol: str, df: pd.DataFrame, positions: Dict[str, object],
     recent_low = float(row["recent_low"])
     avg_volume = float(row["avg_volume"])
     volume_now = float(row["Volume"])
+    body_now = float(row["body"])
 
     breakdown_level = recent_low * (1 - BREAKDOWN_BUFFER_PCT)
-    chase_pct = (breakdown_level - price) / recent_low if recent_low > 0 else 0
-    ema_extension_pct = (ema_fast_now - price) / ema_fast_now if ema_fast_now > 0 else 0
+    chase_pct = (breakdown_level - price) / max(abs(breakdown_level), 1e-9)
+    ema_extension_pct = (ema_fast_now - price) / max(abs(ema_fast_now), 1e-9)
     rvol = volume_now / max(avg_volume, 1.0)
 
     trend_ok = ema_fast_now < ema_slow_now
@@ -717,17 +771,24 @@ def try_enter_short(symbol: str, df: pd.DataFrame, positions: Dict[str, object],
     candle_ok = price < prev_close
     not_chasing = chase_pct <= MAX_CHASE_FROM_BREAKDOWN_PCT
     not_stretched = ema_extension_pct <= MAX_EXT_FROM_EMA_FAST_SHORT_PCT
+    body_ok = body_now <= atr_now * MAX_CANDLE_BODY_ATR_MULT
 
     breakdown_condition = (
-        trend_ok and momentum_ok and breakdown_ok and volume_ok and candle_ok and not_chasing and not_stretched
+        trend_ok and momentum_ok and breakdown_ok and volume_ok and candle_ok and not_chasing and not_stretched and body_ok
     )
     pullback_condition = is_short_pullback_entry(df)
 
-    if not (breakdown_condition or pullback_condition):
+    if pullback_condition:
+        entry_type = "SHORT PULLBACK"
+    elif breakdown_condition:
+        entry_type = "BREAKDOWN"
+    else:
         return False
 
     setup_score = score_short_setup(df)
-    if breakdown_condition and setup_score < 70:
+    if entry_type == "BREAKDOWN" and setup_score < 75:
+        return False
+    if entry_type == "SHORT PULLBACK" and setup_score < 50:
         return False
 
     total_exposure = get_open_exposure_value(positions)
@@ -742,7 +803,10 @@ def try_enter_short(symbol: str, df: pd.DataFrame, positions: Dict[str, object],
     if total_remaining <= price or symbol_remaining <= price:
         return False
 
-    stop_price = max(price * (1 + SHORT_HARD_STOP_PCT), price + atr_now)
+    stop_price = max(price * (1 + SHORT_HARD_STOP_PCT), price + atr_now * 1.15)
+    if entry_type == "SHORT PULLBACK":
+        stop_price = max(stop_price, max(float(row["ema_fast"]), float(row["High"])) + (atr_now * 0.35))
+
     risk_per_share = stop_price - price
     if risk_per_share <= 0:
         return False
@@ -781,13 +845,9 @@ def try_enter_short(symbol: str, df: pd.DataFrame, positions: Dict[str, object],
             "initial_qty": qty,
             "partial_taken": 0,
             "break_even_active": 0,
+            "entry_type": entry_type,
+            "setup_score": float(setup_score),
         }
-
-        entry_type = "BREAKDOWN"
-        if pullback_condition and not breakdown_condition:
-            entry_type = "SHORT PULLBACK"
-        elif breakdown_condition and pullback_condition:
-            entry_type = "HYBRID"
 
         send_telegram(
             f"ENTRY SHORT {symbol} ({entry_type})\n"
@@ -823,8 +883,8 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
     prev_close = float(prev["Close"])
     rsi_now = float(row["rsi"])
     atr_now = float(row["atr"])
-    recent_high = float(row["recent_high"])
-    recent_low = float(row["recent_low"])
+    ema_fast_now = float(row["ema_fast"])
+    ema_slow_now = float(row["ema_slow"])
 
     qty_signed = int(float(position.qty))
     qty = abs(qty_signed)
@@ -838,6 +898,8 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
         "initial_qty": qty,
         "partial_taken": 0,
         "break_even_active": 0,
+        "entry_type": "UNKNOWN",
+        "setup_score": 0.0,
     })
 
     side = state["side"]
@@ -894,7 +956,6 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
                     daily_losses += 1
 
                 state["partial_taken"] = 1
-                state["break_even_active"] = 1
                 trade_state[symbol] = state
 
                 send_telegram(
@@ -909,6 +970,10 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
                 print(f"{symbol} long partial error:", e)
                 return
 
+        if state["break_even_active"] == 0 and current_r >= BREAK_EVEN_TRIGGER_R:
+            state["break_even_active"] = 1
+            trade_state[symbol] = state
+
         if price <= hard_stop:
             reason = "HARD STOP"
         elif state["break_even_active"] == 1 and price <= break_even_stop:
@@ -917,8 +982,10 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
             reason = "FINAL TARGET"
         elif highest_seen[symbol] > entry and price <= trailing_stop:
             reason = "TRAILING STOP"
-        elif price < recent_high and pnl_pct_now < 0:
-            reason = "BREAKOUT FAIL"
+        elif price < ema_fast_now and pnl_pct_now < 0:
+            reason = "STRUCTURE BREAK"
+        elif ema_fast_now < ema_slow_now and pnl_pct_now < 0:
+            reason = "TREND LOSS"
         elif bars_in_trade_est <= FAIL_FAST_BARS and pnl_pct_now <= -FAIL_FAST_LOSS_PCT:
             reason = "FAIL FAST"
         elif bars_in_trade_est >= WEAK_HOLD_BARS and pnl_pct_now <= -WEAK_HOLD_LOSS_PCT:
@@ -963,7 +1030,6 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
                     daily_losses += 1
 
                 state["partial_taken"] = 1
-                state["break_even_active"] = 1
                 trade_state[symbol] = state
 
                 send_telegram(
@@ -978,6 +1044,10 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
                 print(f"{symbol} short partial error:", e)
                 return
 
+        if state["break_even_active"] == 0 and current_r >= SHORT_BREAK_EVEN_TRIGGER_R:
+            state["break_even_active"] = 1
+            trade_state[symbol] = state
+
         if price >= hard_stop:
             reason = "HARD STOP"
         elif state["break_even_active"] == 1 and price >= break_even_stop:
@@ -986,8 +1056,10 @@ def try_manage_position(symbol: str, position, df: pd.DataFrame, open_orders: Di
             reason = "FINAL TARGET"
         elif lowest_seen[symbol] < entry and price >= trailing_stop:
             reason = "TRAILING STOP"
-        elif price > recent_low and pnl_pct_now < 0:
-            reason = "BREAKDOWN FAIL"
+        elif price > ema_fast_now and pnl_pct_now < 0:
+            reason = "STRUCTURE BREAK"
+        elif ema_fast_now > ema_slow_now and pnl_pct_now < 0:
+            reason = "TREND LOSS"
         elif bars_in_trade_est <= SHORT_FAIL_FAST_BARS and pnl_pct_now <= -SHORT_FAIL_FAST_LOSS_PCT:
             reason = "FAIL FAST"
         elif bars_in_trade_est >= SHORT_WEAK_HOLD_BARS and pnl_pct_now <= -SHORT_WEAK_HOLD_LOSS_PCT:
