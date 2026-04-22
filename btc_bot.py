@@ -20,7 +20,7 @@ COOLDOWN_SECONDS = 600
 
 LONG_ALERT_SCORE = 60
 SHORT_ALERT_SCORE = 60
-A_SETUP_SCORE = 70
+A_SETUP_SCORE = 68
 FULL_SIZE_SCORE = 75
 
 MAX_SCALE_INS = 2
@@ -39,7 +39,9 @@ ASSETS = {
     },
 }
 
-# Separate settings so BTC can breathe and GOLD can stay tighter
+# =========================
+# ASSET CONFIG
+# =========================
 ASSET_CONFIG = {
     "BTC": {
         "ATR_SL_MULT": 2.2,
@@ -55,21 +57,29 @@ ASSET_CONFIG = {
         "LONG_RSI_MAX": 69.0,
         "SHORT_RSI_MIN": 31.0,
         "MAX_BODY_ATR_MULT": 0.85,
+        "ALLOW_CHOP": False,
+        "BREAKOUT_BUFFER_LONG": 1.0015,
+        "BREAKOUT_BUFFER_SHORT": 0.9985,
+        "STRICT_TREND": True,
     },
     "GOLD": {
-        "ATR_SL_MULT": 1.5,
+        "ATR_SL_MULT": 1.4,
         "ATR_TP_MULT": 3.2,
-        "ATR_TRAIL_MULT": 1.7,
+        "ATR_TRAIL_MULT": 1.6,
         "BREAK_EVEN_ATR_TRIGGER": 1.1,
-        "PARTIAL_ATR_TRIGGER": 1.7,
-        "TRAILING_ACTIVATION_ATR": 1.4,
-        "TRAIL_UPDATE_MIN_ATR": 0.20,
-        "MIN_VOLATILITY_PCT": 0.0006,
-        "MAX_EMA9_DISTANCE_PCT": 0.0040,
+        "PARTIAL_ATR_TRIGGER": 1.6,
+        "TRAILING_ACTIVATION_ATR": 1.3,
+        "TRAIL_UPDATE_MIN_ATR": 0.18,
+        "MIN_VOLATILITY_PCT": 0.0005,
+        "MAX_EMA9_DISTANCE_PCT": 0.0100,
         "SCALE_IN_ATR_STEP": 0.6,
-        "LONG_RSI_MAX": 66.0,
-        "SHORT_RSI_MIN": 34.0,
+        "LONG_RSI_MAX": 67.0,
+        "SHORT_RSI_MIN": 33.0,
         "MAX_BODY_ATR_MULT": 0.80,
+        "ALLOW_CHOP": True,
+        "BREAKOUT_BUFFER_LONG": 1.0005,
+        "BREAKOUT_BUFFER_SHORT": 0.9995,
+        "STRICT_TREND": False,
     },
 }
 
@@ -175,7 +185,6 @@ def get_yfinance_klines(asset_key: str, interval: str) -> pd.DataFrame:
             auto_adjust=False,
         )
 
-        # GOLD fallback inside Yahoo: if 1m fails, try 5m
         if (df is None or df.empty) and asset_key == "GOLD" and interval == "1m":
             df = yf.download(
                 ticker,
@@ -216,12 +225,10 @@ def get_yfinance_klines(asset_key: str, interval: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def get_klines(asset_key: str, interval: str):
-    # Primary feed: Twelve Data
     df = get_twelvedata_klines(asset_key, interval)
     if not df.empty:
         return df, "TWELVEDATA"
 
-    # Fallback: Yahoo
     df = get_yfinance_klines(asset_key, interval)
     if not df.empty:
         return df, "YFINANCE"
@@ -262,6 +269,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["vol_ma"] = out["volume"].rolling(20).mean()
     out["hh10"] = out["high"].rolling(10).max().shift(1)
     out["ll10"] = out["low"].rolling(10).min().shift(1)
+    out["body"] = (out["close"] - out["open"]).abs()
     out.dropna(inplace=True)
 
     if len(out) < 25:
@@ -272,14 +280,25 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # MARKET FILTERS
 # =========================
-def market_trend(df1: pd.DataFrame, df5: pd.DataFrame) -> str:
+def market_trend(df1: pd.DataFrame, df5: pd.DataFrame, asset_key: str) -> str:
     r1 = df1.iloc[-1]
     r5 = df5.iloc[-1]
+    cfg = ASSET_CONFIG[asset_key]
 
-    if r5["ema9"] > r5["ema21"] and r1["ema9"] > r1["ema21"]:
-        return "BULLISH"
-    if r5["ema9"] < r5["ema21"] and r1["ema9"] < r1["ema21"]:
-        return "BEARISH"
+    if cfg["STRICT_TREND"]:
+        if r5["ema9"] > r5["ema21"] > r5["ema50"] and r1["ema9"] > r1["ema21"]:
+            return "BULLISH"
+        if r5["ema9"] < r5["ema21"] < r5["ema50"] and r1["ema9"] < r1["ema21"]:
+            return "BEARISH"
+    else:
+        if r5["ema9"] > r5["ema21"] and r1["ema9"] > r1["ema21"]:
+            return "BULLISH"
+        if r5["ema9"] < r5["ema21"] and r1["ema9"] < r1["ema21"]:
+            return "BEARISH"
+
+    if cfg.get("ALLOW_CHOP", False):
+        return "RANGE"
+
     return "CHOPPY"
 
 def has_enough_volatility(asset_key: str, price: float, atr_now: float) -> bool:
@@ -328,20 +347,29 @@ def short_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
 # =========================
 # SCORING
 # =========================
-def long_score(df1: pd.DataFrame, df5: pd.DataFrame):
+def long_score(df1: pd.DataFrame, df5: pd.DataFrame, asset_key: str):
     r1 = df1.iloc[-1]
     p1 = df1.iloc[-2]
     r5 = df5.iloc[-1]
+    cfg = ASSET_CONFIG[asset_key]
 
     score = 0
     reasons = []
 
-    if r5["ema9"] > r5["ema21"] > r5["ema50"]:
-        score += 25
-        reasons.append("5m strong uptrend")
-    elif r5["ema9"] > r5["ema21"]:
-        score += 15
-        reasons.append("5m bullish bias")
+    if cfg["STRICT_TREND"]:
+        if r5["ema9"] > r5["ema21"] > r5["ema50"]:
+            score += 25
+            reasons.append("5m strong uptrend")
+        elif r5["ema9"] > r5["ema21"]:
+            score += 15
+            reasons.append("5m bullish bias")
+    else:
+        if r5["ema9"] > r5["ema21"]:
+            score += 20
+            reasons.append("5m bullish trend")
+        elif r1["ema9"] > r1["ema21"]:
+            score += 10
+            reasons.append("1m bullish recovery")
 
     if r1["ema9"] > r1["ema21"] > r1["ema50"]:
         score += 20
@@ -360,7 +388,7 @@ def long_score(df1: pd.DataFrame, df5: pd.DataFrame):
     if r1["volume"] > r1["vol_ma"] * 1.5:
         score += 15
         reasons.append("strong volume")
-    elif r1["volume"] > r1["vol_ma"] * 1.15:
+    elif r1["volume"] > r1["vol_ma"] * 1.10:
         score += 8
         reasons.append("volume confirm")
 
@@ -372,26 +400,35 @@ def long_score(df1: pd.DataFrame, df5: pd.DataFrame):
         score += 10
         reasons.append("holding EMA9")
 
-    if r1["close"] > r1["hh10"] * 1.001:
+    if r1["close"] > r1["hh10"] * cfg["BREAKOUT_BUFFER_LONG"]:
         score += 5
         reasons.append("micro breakout")
 
     return int(min(score, 100)), reasons
 
-def short_score(df1: pd.DataFrame, df5: pd.DataFrame):
+def short_score(df1: pd.DataFrame, df5: pd.DataFrame, asset_key: str):
     r1 = df1.iloc[-1]
     p1 = df1.iloc[-2]
     r5 = df5.iloc[-1]
+    cfg = ASSET_CONFIG[asset_key]
 
     score = 0
     reasons = []
 
-    if r5["ema9"] < r5["ema21"] < r5["ema50"]:
-        score += 25
-        reasons.append("5m strong downtrend")
-    elif r5["ema9"] < r5["ema21"]:
-        score += 15
-        reasons.append("5m bearish bias")
+    if cfg["STRICT_TREND"]:
+        if r5["ema9"] < r5["ema21"] < r5["ema50"]:
+            score += 25
+            reasons.append("5m strong downtrend")
+        elif r5["ema9"] < r5["ema21"]:
+            score += 15
+            reasons.append("5m bearish bias")
+    else:
+        if r5["ema9"] < r5["ema21"]:
+            score += 20
+            reasons.append("5m bearish trend")
+        elif r1["ema9"] < r1["ema21"]:
+            score += 10
+            reasons.append("1m bearish recovery")
 
     if r1["ema9"] < r1["ema21"] < r1["ema50"]:
         score += 20
@@ -410,7 +447,7 @@ def short_score(df1: pd.DataFrame, df5: pd.DataFrame):
     if r1["volume"] > r1["vol_ma"] * 1.5:
         score += 15
         reasons.append("strong volume")
-    elif r1["volume"] > r1["vol_ma"] * 1.15:
+    elif r1["volume"] > r1["vol_ma"] * 1.10:
         score += 8
         reasons.append("volume confirm")
 
@@ -422,7 +459,7 @@ def short_score(df1: pd.DataFrame, df5: pd.DataFrame):
         score += 10
         reasons.append("below EMA9")
 
-    if r1["close"] < r1["ll10"] * 0.999:
+    if r1["close"] < r1["ll10"] * cfg["BREAKOUT_BUFFER_SHORT"]:
         score += 5
         reasons.append("micro breakdown")
 
@@ -447,27 +484,29 @@ def confidence_grade(score: int) -> str:
 # =========================
 # ENTRY LOGIC
 # =========================
-def breakout_long(df1: pd.DataFrame) -> bool:
+def breakout_long(df1: pd.DataFrame, asset_key: str) -> bool:
     r = df1.iloc[-1]
     p = df1.iloc[-2]
+    cfg = ASSET_CONFIG[asset_key]
 
-    clean_break = r["close"] > r["hh10"] * 1.001
+    clean_break = r["close"] > r["hh10"] * cfg["BREAKOUT_BUFFER_LONG"]
     strong_close = r["close"] > p["close"]
-    volume_ok = r["volume"] > r["vol_ma"]
+    volume_ok = r["volume"] > r["vol_ma"] * (1.0 if asset_key == "GOLD" else 1.05)
     holding_ema = r["close"] > r["ema9"]
-    not_stretched = (r["close"] - r["ema9"]) / max(r["ema9"], 1.0) < 0.01
+    not_stretched = (r["close"] - r["ema9"]) / max(r["ema9"], 1.0) < (0.012 if asset_key == "GOLD" else 0.010)
 
     return bool(clean_break and strong_close and volume_ok and holding_ema and not_stretched)
 
-def breakout_short(df1: pd.DataFrame) -> bool:
+def breakout_short(df1: pd.DataFrame, asset_key: str) -> bool:
     r = df1.iloc[-1]
     p = df1.iloc[-2]
+    cfg = ASSET_CONFIG[asset_key]
 
-    clean_break = r["close"] < r["ll10"] * 0.999
+    clean_break = r["close"] < r["ll10"] * cfg["BREAKOUT_BUFFER_SHORT"]
     strong_close = r["close"] < p["close"]
-    volume_ok = r["volume"] > r["vol_ma"]
+    volume_ok = r["volume"] > r["vol_ma"] * (1.0 if asset_key == "GOLD" else 1.05)
     below_ema = r["close"] < r["ema9"]
-    not_stretched = (r["ema9"] - r["close"]) / max(r["ema9"], 1.0) < 0.01
+    not_stretched = (r["ema9"] - r["close"]) / max(r["ema9"], 1.0) < (0.012 if asset_key == "GOLD" else 0.010)
 
     return bool(clean_break and strong_close and volume_ok and below_ema and not_stretched)
 
@@ -520,7 +559,7 @@ def confirm_short(df1: pd.DataFrame) -> bool:
 def a_setup_long(sig: dict) -> bool:
     return (
         sig["long_score"] >= A_SETUP_SCORE
-        and sig["trend"] == "BULLISH"
+        and sig["trend"] in ["BULLISH", "RANGE"]
         and sig["confirm_long"]
         and long_not_chasing(sig["asset_key"], sig["df1"])
     )
@@ -528,7 +567,7 @@ def a_setup_long(sig: dict) -> bool:
 def a_setup_short(sig: dict) -> bool:
     return (
         sig["short_score"] >= A_SETUP_SCORE
-        and sig["trend"] == "BEARISH"
+        and sig["trend"] in ["BEARISH", "RANGE"]
         and sig["confirm_short"]
         and short_not_chasing(sig["asset_key"], sig["df1"])
     )
@@ -543,8 +582,8 @@ def maybe_send_heartbeat(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame):
     if now - state["LAST_HEARTBEAT_TS"] < HEARTBEAT_SECONDS:
         return
 
-    ls, _ = long_score(df1, df5)
-    ss, _ = short_score(df1, df5)
+    ls, _ = long_score(df1, df5, asset_key)
+    ss, _ = short_score(df1, df5, asset_key)
     r1 = df1.iloc[-1]
     name = ASSETS[asset_key]["name"]
 
@@ -552,7 +591,7 @@ def maybe_send_heartbeat(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame):
         f"💓 {name} HEARTBEAT\n\n"
         f"Price: ${float(r1['close']):.2f}\n"
         f"RSI: {float(r1['rsi']):.1f}\n"
-        f"Trend: {market_trend(df1, df5)}\n"
+        f"Trend: {market_trend(df1, df5, asset_key)}\n"
         f"Long score: {ls}\n"
         f"Short score: {ss}\n"
         f"In trade: {'YES' if state['IN_TRADE'] else 'NO'}\n"
@@ -570,7 +609,6 @@ def get_signal(asset_key: str):
     df1 = add_indicators(df1_raw)
     df5 = add_indicators(df5_raw)
 
-    # GOLD flex
     if asset_key == "GOLD":
         if df1.empty and df5.empty:
             return None
@@ -591,8 +629,8 @@ def get_signal(asset_key: str):
     if not has_enough_volatility(asset_key, price, atr_now):
         return None
 
-    ls, lr = long_score(df1, df5)
-    ss, sr = short_score(df1, df5)
+    ls, lr = long_score(df1, df5, asset_key)
+    ss, sr = short_score(df1, df5, asset_key)
 
     data_source = src1 if src1 != "NONE" else src5
 
@@ -602,13 +640,13 @@ def get_signal(asset_key: str):
         "atr": atr_now,
         "df1": df1,
         "df5": df5,
-        "trend": market_trend(df1, df5),
+        "trend": market_trend(df1, df5, asset_key),
         "long_score": ls,
         "short_score": ss,
         "long_reasons": lr,
         "short_reasons": sr,
-        "long_breakout": breakout_long(df1),
-        "short_breakout": breakout_short(df1),
+        "long_breakout": breakout_long(df1, asset_key),
+        "short_breakout": breakout_short(df1, asset_key),
         "long_sniper": sniper_long(df1),
         "short_sniper": sniper_short(df1),
         "confirm_long": confirm_long(df1),
@@ -856,10 +894,9 @@ def run():
                     if time.time() - state["LAST_TRADE_TIME"] < COOLDOWN_SECONDS:
                         continue
 
-                    if sig["trend"] == "CHOPPY":
+                    if sig["trend"] == "CHOPPY" and not ASSET_CONFIG[asset_key]["ALLOW_CHOP"]:
                         continue
 
-                    # A SETUP
                     if a_setup_long(sig):
                         start_trade(
                             asset_key=asset_key,
@@ -882,7 +919,6 @@ def run():
                             atr_now=sig["atr"],
                         )
 
-                    # BREAKOUT
                     elif (
                         sig["long_score"] >= LONG_ALERT_SCORE
                         and sig["long_breakout"]
@@ -915,7 +951,6 @@ def run():
                             atr_now=sig["atr"],
                         )
 
-                    # SNIPER
                     elif (
                         sig["long_score"] >= LONG_ALERT_SCORE
                         and sig["long_sniper"]
