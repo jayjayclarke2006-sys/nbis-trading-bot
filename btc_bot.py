@@ -100,17 +100,15 @@ def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
             auto_adjust=False,
         )
 
-        # 🔥 GOLD FIX (THIS IS THE KEY PART)
-        if (df is None or df.empty):
-            if asset_key == "GOLD" and interval == "1m":
-                # fallback to 5m if 1m fails
-                df = yf.download(
-                    ticker,
-                    period="7d",
-                    interval="5m",
-                    progress=False,
-                    auto_adjust=False,
-                )
+        # GOLD fallback: if 1m fails, use 5m
+        if (df is None or df.empty) and asset_key == "GOLD" and interval == "1m":
+            df = yf.download(
+                ticker,
+                period="7d",
+                interval="5m",
+                progress=False,
+                auto_adjust=False,
+            )
 
         if df is None or df.empty:
             return pd.DataFrame()
@@ -439,8 +437,18 @@ def get_signal(asset_key: str):
     df1 = add_indicators(df1_raw)
     df5 = add_indicators(df5_raw)
 
-    if df1.empty or df5.empty:
-        return None
+    # GOLD FLEX FIX
+    if asset_key == "GOLD":
+        if df1.empty and df5.empty:
+            return None
+        if df1.empty:
+            df1 = df5.copy()
+        if df5.empty:
+            df5 = df1.copy()
+    else:
+        if df1.empty or df5.empty:
+            return None
+
     if len(df1) < 25 or len(df5) < 25:
         return None
 
