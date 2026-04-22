@@ -3,13 +3,13 @@ import time
 import requests
 import pandas as pd
 import yfinance as yf
-import MetaTrader5 as mt5
 
 # =========================
 # ENV
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 # =========================
 # CONFIG
@@ -23,25 +23,54 @@ SHORT_ALERT_SCORE = 60
 A_SETUP_SCORE = 70
 FULL_SIZE_SCORE = 75
 
-# ---- YOUR RUNNER SETTINGS (UNCHANGED) ----
-ATR_SL_MULT = 1.5
-ATR_TP_MULT = 4.5
-ATR_TRAIL_MULT = 2.4
-BREAK_EVEN_ATR_TRIGGER = 1.25
-PARTIAL_ATR_TRIGGER = 2.0
-TRAILING_ACTIVATION_ATR = 1.75
-TRAIL_UPDATE_MIN_ATR = 0.20
-
-MIN_VOLATILITY_PCT = 0.001
-MAX_EMA9_DISTANCE_PCT = 0.01
-
 MAX_SCALE_INS = 2
-SCALE_IN_ATR_STEP = 0.75
 SCALE_IN_COOLDOWN_SECONDS = 120
 
 ASSETS = {
-    "BTC": {"ticker": "BTC-USD", "name": "BTC"},
-    "GOLD": {"ticker": "XAUUSD=X", "name": "GOLD"},
+    "BTC": {
+        "ticker": "BTC-USD",
+        "feed_symbol": "BTC/USD",
+        "name": "BTC",
+    },
+    "GOLD": {
+        "ticker": "XAUUSD=X",
+        "feed_symbol": "XAU/USD",
+        "name": "GOLD",
+    },
+}
+
+# Separate settings so BTC can breathe and GOLD can stay tighter
+ASSET_CONFIG = {
+    "BTC": {
+        "ATR_SL_MULT": 2.2,
+        "ATR_TP_MULT": 5.0,
+        "ATR_TRAIL_MULT": 2.8,
+        "BREAK_EVEN_ATR_TRIGGER": 1.75,
+        "PARTIAL_ATR_TRIGGER": 2.75,
+        "TRAILING_ACTIVATION_ATR": 2.25,
+        "TRAIL_UPDATE_MIN_ATR": 0.35,
+        "MIN_VOLATILITY_PCT": 0.0012,
+        "MAX_EMA9_DISTANCE_PCT": 0.0065,
+        "SCALE_IN_ATR_STEP": 1.0,
+        "LONG_RSI_MAX": 69.0,
+        "SHORT_RSI_MIN": 31.0,
+        "MAX_BODY_ATR_MULT": 0.85,
+    },
+    "GOLD": {
+        "ATR_SL_MULT": 1.5,
+        "ATR_TP_MULT": 3.2,
+        "ATR_TRAIL_MULT": 1.7,
+        "BREAK_EVEN_ATR_TRIGGER": 1.1,
+        "PARTIAL_ATR_TRIGGER": 1.7,
+        "TRAILING_ACTIVATION_ATR": 1.4,
+        "TRAIL_UPDATE_MIN_ATR": 0.20,
+        "MIN_VOLATILITY_PCT": 0.0006,
+        "MAX_EMA9_DISTANCE_PCT": 0.0040,
+        "SCALE_IN_ATR_STEP": 0.6,
+        "LONG_RSI_MAX": 66.0,
+        "SHORT_RSI_MIN": 34.0,
+        "MAX_BODY_ATR_MULT": 0.80,
+    },
 }
 
 # =========================
@@ -66,6 +95,7 @@ STATE = {
         "ENTRY_TYPE": None,
         "CONFIDENCE_LABEL": None,
         "LAST_TRAIL_SENT_SL": 0.0,
+        "DATA_SOURCE": "UNKNOWN",
     }
     for key in ASSETS
 }
@@ -84,49 +114,57 @@ def send(msg: str):
         print("Telegram error:", e)
 
 # =========================
-# MT5 GOLD DATA (NEW 🔥)
+# DATA FEEDS
 # =========================
-def get_gold_mt5(interval: str):
+def td_interval(interval: str) -> str:
+    return {"1m": "1min", "5m": "5min"}[interval]
+
+def get_twelvedata_klines(asset_key: str, interval: str, outputsize: int = 500) -> pd.DataFrame:
     try:
-        if not mt5.initialize():
+        if not TWELVEDATA_API_KEY:
             return pd.DataFrame()
 
-        symbol = "XAUUSD"
-        timeframe = mt5.TIMEFRAME_M1 if interval == "1m" else mt5.TIMEFRAME_M5
+        symbol = ASSETS[asset_key]["feed_symbol"]
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": symbol,
+            "interval": td_interval(interval),
+            "outputsize": outputsize,
+            "apikey": TWELVEDATA_API_KEY,
+            "format": "JSON",
+        }
 
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, 500)
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
 
-        if rates is None or len(rates) == 0:
+        if not isinstance(data, dict) or "values" not in data:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rates)
+        values = data["values"]
+        if not isinstance(values, list) or len(values) < 30:
+            return pd.DataFrame()
 
-        df.rename(columns={
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "tick_volume": "volume"
-        }, inplace=True)
+        df = pd.DataFrame(values)
+        needed = ["open", "high", "low", "close", "volume"]
+        for col in needed:
+            if col not in df.columns:
+                return pd.DataFrame()
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        return df[["open", "high", "low", "close", "volume"]]
+        df = df[needed].copy()
+        df = df.iloc[::-1].reset_index(drop=True)
+        df.dropna(inplace=True)
 
+        if len(df) < 30:
+            return pd.DataFrame()
+
+        return df
     except Exception:
         return pd.DataFrame()
 
-# =========================
-# DATA
-# =========================
-def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
+def get_yfinance_klines(asset_key: str, interval: str) -> pd.DataFrame:
     try:
         ticker = ASSETS[asset_key]["ticker"]
-
-        # 🔥 GOLD: USE MT5 FIRST
-        if asset_key == "GOLD":
-            df = get_gold_mt5(interval)
-            if not df.empty:
-                return df
-
         period = "7d" if interval == "1m" else "60d"
 
         df = yf.download(
@@ -137,7 +175,7 @@ def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
             auto_adjust=False,
         )
 
-        # fallback if 1m fails
+        # GOLD fallback inside Yahoo: if 1m fails, try 5m
         if (df is None or df.empty) and asset_key == "GOLD" and interval == "1m":
             df = yf.download(
                 ticker,
@@ -162,7 +200,6 @@ def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
         })
 
         needed = ["open", "high", "low", "close", "volume"]
-
         for col in needed:
             if col not in df.columns:
                 return pd.DataFrame()
@@ -175,9 +212,21 @@ def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
             return pd.DataFrame()
 
         return df
-
     except Exception:
         return pd.DataFrame()
+
+def get_klines(asset_key: str, interval: str):
+    # Primary feed: Twelve Data
+    df = get_twelvedata_klines(asset_key, interval)
+    if not df.empty:
+        return df, "TWELVEDATA"
+
+    # Fallback: Yahoo
+    df = get_yfinance_klines(asset_key, interval)
+    if not df.empty:
+        return df, "YFINANCE"
+
+    return pd.DataFrame(), "NONE"
 
 # =========================
 # INDICATORS
@@ -233,12 +282,48 @@ def market_trend(df1: pd.DataFrame, df5: pd.DataFrame) -> str:
         return "BEARISH"
     return "CHOPPY"
 
-def has_enough_volatility(price: float, atr_now: float) -> bool:
-    return (atr_now / max(price, 1.0)) >= MIN_VOLATILITY_PCT
+def has_enough_volatility(asset_key: str, price: float, atr_now: float) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
+    return (atr_now / max(price, 1.0)) >= cfg["MIN_VOLATILITY_PCT"]
 
-def not_too_extended(price: float, ema9_value: float) -> bool:
+def not_too_extended(asset_key: str, price: float, ema9_value: float) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
     distance = abs(price - ema9_value) / max(price, 1.0)
-    return distance <= MAX_EMA9_DISTANCE_PCT
+    return distance <= cfg["MAX_EMA9_DISTANCE_PCT"]
+
+def candle_body(df1: pd.DataFrame) -> float:
+    r = df1.iloc[-1]
+    return abs(float(r["close"]) - float(r["open"]))
+
+def long_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
+    r = df1.iloc[-1]
+
+    if float(r["rsi"]) > cfg["LONG_RSI_MAX"]:
+        return False
+
+    if not not_too_extended(asset_key, float(r["close"]), float(r["ema9"])):
+        return False
+
+    if float(r["atr"]) > 0 and candle_body(df1) > float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]:
+        return False
+
+    return True
+
+def short_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
+    r = df1.iloc[-1]
+
+    if float(r["rsi"]) < cfg["SHORT_RSI_MIN"]:
+        return False
+
+    if not not_too_extended(asset_key, float(r["close"]), float(r["ema9"])):
+        return False
+
+    if float(r["atr"]) > 0 and candle_body(df1) > float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]:
+        return False
+
+    return True
 
 # =========================
 # SCORING
@@ -433,10 +518,20 @@ def confirm_short(df1: pd.DataFrame) -> bool:
 # A SETUP LOGIC
 # =========================
 def a_setup_long(sig: dict) -> bool:
-    return sig["long_score"] >= A_SETUP_SCORE and sig["trend"] == "BULLISH" and sig["confirm_long"]
+    return (
+        sig["long_score"] >= A_SETUP_SCORE
+        and sig["trend"] == "BULLISH"
+        and sig["confirm_long"]
+        and long_not_chasing(sig["asset_key"], sig["df1"])
+    )
 
 def a_setup_short(sig: dict) -> bool:
-    return sig["short_score"] >= A_SETUP_SCORE and sig["trend"] == "BEARISH" and sig["confirm_short"]
+    return (
+        sig["short_score"] >= A_SETUP_SCORE
+        and sig["trend"] == "BEARISH"
+        and sig["confirm_short"]
+        and short_not_chasing(sig["asset_key"], sig["df1"])
+    )
 
 # =========================
 # HEARTBEAT
@@ -460,7 +555,8 @@ def maybe_send_heartbeat(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame):
         f"Trend: {market_trend(df1, df5)}\n"
         f"Long score: {ls}\n"
         f"Short score: {ss}\n"
-        f"In trade: {'YES' if state['IN_TRADE'] else 'NO'}"
+        f"In trade: {'YES' if state['IN_TRADE'] else 'NO'}\n"
+        f"Feed: {state['DATA_SOURCE']}"
     )
     state["LAST_HEARTBEAT_TS"] = now
 
@@ -468,13 +564,13 @@ def maybe_send_heartbeat(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame):
 # SIGNAL ENGINE
 # =========================
 def get_signal(asset_key: str):
-    df1_raw = get_klines(asset_key, "1m")
-    df5_raw = get_klines(asset_key, "5m")
+    df1_raw, src1 = get_klines(asset_key, "1m")
+    df5_raw, src5 = get_klines(asset_key, "5m")
 
     df1 = add_indicators(df1_raw)
     df5 = add_indicators(df5_raw)
 
-    # GOLD FLEX FIX
+    # GOLD flex
     if asset_key == "GOLD":
         if df1.empty and df5.empty:
             return None
@@ -492,13 +588,16 @@ def get_signal(asset_key: str):
     price = float(df1.iloc[-1]["close"])
     atr_now = float(df1.iloc[-1]["atr"])
 
-    if not has_enough_volatility(price, atr_now):
+    if not has_enough_volatility(asset_key, price, atr_now):
         return None
 
     ls, lr = long_score(df1, df5)
     ss, sr = short_score(df1, df5)
 
+    data_source = src1 if src1 != "NONE" else src5
+
     return {
+        "asset_key": asset_key,
         "price": price,
         "atr": atr_now,
         "df1": df1,
@@ -514,6 +613,7 @@ def get_signal(asset_key: str):
         "short_sniper": sniper_short(df1),
         "confirm_long": confirm_long(df1),
         "confirm_short": confirm_short(df1),
+        "data_source": data_source,
     }
 
 # =========================
@@ -544,6 +644,7 @@ def reset_trade(asset_key: str):
 def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: list, price: float, atr_now: float):
     state = STATE[asset_key]
     name = ASSETS[asset_key]["name"]
+    cfg = ASSET_CONFIG[asset_key]
 
     state["ENTRY_PRICE"] = price
     state["AVG_ENTRY_PRICE"] = price
@@ -558,12 +659,12 @@ def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: li
     state["LAST_TRAIL_SENT_SL"] = 0.0
 
     if side == "LONG":
-        state["STOP_LOSS"] = price - (atr_now * ATR_SL_MULT)
-        state["TAKE_PROFIT"] = price + (atr_now * ATR_TP_MULT)
+        state["STOP_LOSS"] = price - (atr_now * cfg["ATR_SL_MULT"])
+        state["TAKE_PROFIT"] = price + (atr_now * cfg["ATR_TP_MULT"])
         emoji = "🚀"
     else:
-        state["STOP_LOSS"] = price + (atr_now * ATR_SL_MULT)
-        state["TAKE_PROFIT"] = price - (atr_now * ATR_TP_MULT)
+        state["STOP_LOSS"] = price + (atr_now * cfg["ATR_SL_MULT"])
+        state["TAKE_PROFIT"] = price - (atr_now * cfg["ATR_TP_MULT"])
         emoji = "📉"
 
     size = entry_size_label(score)
@@ -594,6 +695,7 @@ def can_scale_in(asset_key: str) -> bool:
 def maybe_scale_in(asset_key: str, sig: dict):
     state = STATE[asset_key]
     name = ASSETS[asset_key]["name"]
+    cfg = ASSET_CONFIG[asset_key]
 
     if not can_scale_in(asset_key):
         return
@@ -602,11 +704,12 @@ def maybe_scale_in(asset_key: str, sig: dict):
     atr_now = sig["atr"]
 
     if state["TRADE_SIDE"] == "LONG":
-        favorable_move = price >= state["AVG_ENTRY_PRICE"] + (atr_now * SCALE_IN_ATR_STEP)
+        favorable_move = price >= state["AVG_ENTRY_PRICE"] + (atr_now * cfg["SCALE_IN_ATR_STEP"])
         confirmation_ok = sig["confirm_long"]
         score_ok = sig["long_score"] >= LONG_ALERT_SCORE
+        not_chasing = long_not_chasing(asset_key, sig["df1"])
 
-        if favorable_move and confirmation_ok and score_ok:
+        if favorable_move and confirmation_ok and score_ok and not_chasing:
             old_avg = state["AVG_ENTRY_PRICE"]
             state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
             state["SCALE_COUNT"] += 1
@@ -624,11 +727,12 @@ def maybe_scale_in(asset_key: str, sig: dict):
             )
 
     elif state["TRADE_SIDE"] == "SHORT":
-        favorable_move = price <= state["AVG_ENTRY_PRICE"] - (atr_now * SCALE_IN_ATR_STEP)
+        favorable_move = price <= state["AVG_ENTRY_PRICE"] - (atr_now * cfg["SCALE_IN_ATR_STEP"])
         confirmation_ok = sig["confirm_short"]
         score_ok = sig["short_score"] >= SHORT_ALERT_SCORE
+        not_chasing = short_not_chasing(asset_key, sig["df1"])
 
-        if favorable_move and confirmation_ok and score_ok:
+        if favorable_move and confirmation_ok and score_ok and not_chasing:
             old_avg = state["AVG_ENTRY_PRICE"]
             state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
             state["SCALE_COUNT"] += 1
@@ -648,8 +752,9 @@ def maybe_scale_in(asset_key: str, sig: dict):
 def maybe_send_trailing_update(asset_key: str, new_sl: float, atr_now: float):
     state = STATE[asset_key]
     name = ASSETS[asset_key]["name"]
+    cfg = ASSET_CONFIG[asset_key]
 
-    min_step = atr_now * TRAIL_UPDATE_MIN_ATR
+    min_step = atr_now * cfg["TRAIL_UPDATE_MIN_ATR"]
     if state["LAST_TRAIL_SENT_SL"] == 0.0 or abs(new_sl - state["LAST_TRAIL_SENT_SL"]) >= min_step:
         state["LAST_TRAIL_SENT_SL"] = new_sl
         side = "LONG" if state["TRADE_SIDE"] == "LONG" else "SHORT"
@@ -662,6 +767,7 @@ def maybe_send_trailing_update(asset_key: str, new_sl: float, atr_now: float):
 def manage_trade(asset_key: str, sig: dict):
     state = STATE[asset_key]
     name = ASSETS[asset_key]["name"]
+    cfg = ASSET_CONFIG[asset_key]
 
     price = sig["price"]
     atr_now = sig["atr"]
@@ -673,17 +779,17 @@ def manage_trade(asset_key: str, sig: dict):
     if state["TRADE_SIDE"] == "LONG":
         state["HIGHEST_PRICE"] = max(state["HIGHEST_PRICE"], price)
 
-        if (not state["BREAK_EVEN_ACTIVE"]) and price >= entry_ref + (atr_now * BREAK_EVEN_ATR_TRIGGER):
+        if (not state["BREAK_EVEN_ACTIVE"]) and price >= entry_ref + (atr_now * cfg["BREAK_EVEN_ATR_TRIGGER"]):
             state["STOP_LOSS"] = max(state["STOP_LOSS"], entry_ref)
             state["BREAK_EVEN_ACTIVE"] = True
             send(f"⚡ {name} LONG BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not state["PARTIAL_SENT"]) and price >= entry_ref + (atr_now * PARTIAL_ATR_TRIGGER):
+        if (not state["PARTIAL_SENT"]) and price >= entry_ref + (atr_now * cfg["PARTIAL_ATR_TRIGGER"]):
             state["PARTIAL_SENT"] = True
             send(f"💰 {name} LONG PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if state["BREAK_EVEN_ACTIVE"] and price > entry_ref + (atr_now * TRAILING_ACTIVATION_ATR):
-            new_sl = state["HIGHEST_PRICE"] - (atr_now * ATR_TRAIL_MULT)
+        if state["BREAK_EVEN_ACTIVE"] and price > entry_ref + (atr_now * cfg["TRAILING_ACTIVATION_ATR"]):
+            new_sl = state["HIGHEST_PRICE"] - (atr_now * cfg["ATR_TRAIL_MULT"])
             if new_sl > state["STOP_LOSS"]:
                 state["STOP_LOSS"] = new_sl
                 maybe_send_trailing_update(asset_key, new_sl, atr_now)
@@ -701,17 +807,17 @@ def manage_trade(asset_key: str, sig: dict):
     elif state["TRADE_SIDE"] == "SHORT":
         state["LOWEST_PRICE"] = min(state["LOWEST_PRICE"], price)
 
-        if (not state["BREAK_EVEN_ACTIVE"]) and price <= entry_ref - (atr_now * BREAK_EVEN_ATR_TRIGGER):
+        if (not state["BREAK_EVEN_ACTIVE"]) and price <= entry_ref - (atr_now * cfg["BREAK_EVEN_ATR_TRIGGER"]):
             state["STOP_LOSS"] = min(state["STOP_LOSS"], entry_ref)
             state["BREAK_EVEN_ACTIVE"] = True
             send(f"⚡ {name} SHORT BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not state["PARTIAL_SENT"]) and price <= entry_ref - (atr_now * PARTIAL_ATR_TRIGGER):
+        if (not state["PARTIAL_SENT"]) and price <= entry_ref - (atr_now * cfg["PARTIAL_ATR_TRIGGER"]):
             state["PARTIAL_SENT"] = True
             send(f"💰 {name} SHORT PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if state["BREAK_EVEN_ACTIVE"] and price < entry_ref - (atr_now * TRAILING_ACTIVATION_ATR):
-            new_sl = state["LOWEST_PRICE"] + (atr_now * ATR_TRAIL_MULT)
+        if state["BREAK_EVEN_ACTIVE"] and price < entry_ref - (atr_now * cfg["TRAILING_ACTIVATION_ATR"]):
+            new_sl = state["LOWEST_PRICE"] + (atr_now * cfg["ATR_TRAIL_MULT"])
             if new_sl < state["STOP_LOSS"]:
                 state["STOP_LOSS"] = new_sl
                 maybe_send_trailing_update(asset_key, new_sl, atr_now)
@@ -730,7 +836,7 @@ def manage_trade(asset_key: str, sig: dict):
 # MAIN LOOP
 # =========================
 def run():
-    send("🔥 BTC + GOLD ELITE SCALING BOT LIVE 🔥")
+    send("🔥 BTC + GOLD PRO BOT LIVE 🔥")
 
     while True:
         try:
@@ -742,6 +848,8 @@ def run():
                 if sig is None:
                     continue
 
+                state["DATA_SOURCE"] = sig["data_source"]
+
                 maybe_send_heartbeat(asset_key, sig["df1"], sig["df5"])
 
                 if not state["IN_TRADE"]:
@@ -749,12 +857,6 @@ def run():
                         continue
 
                     if sig["trend"] == "CHOPPY":
-                        continue
-
-                    price = sig["price"]
-                    ema9_value = float(sig["df1"].iloc[-1]["ema9"])
-
-                    if not not_too_extended(price, ema9_value):
                         continue
 
                     # A SETUP
@@ -765,7 +867,7 @@ def run():
                             trigger="A SETUP",
                             score=sig["long_score"],
                             reasons=sig["long_reasons"],
-                            price=price,
+                            price=sig["price"],
                             atr_now=sig["atr"],
                         )
 
@@ -776,53 +878,73 @@ def run():
                             trigger="A SETUP",
                             score=sig["short_score"],
                             reasons=sig["short_reasons"],
-                            price=price,
+                            price=sig["price"],
                             atr_now=sig["atr"],
                         )
 
                     # BREAKOUT
-                    elif sig["long_score"] >= LONG_ALERT_SCORE and sig["long_breakout"] and sig["confirm_long"]:
+                    elif (
+                        sig["long_score"] >= LONG_ALERT_SCORE
+                        and sig["long_breakout"]
+                        and sig["confirm_long"]
+                        and long_not_chasing(asset_key, sig["df1"])
+                    ):
                         start_trade(
                             asset_key=asset_key,
                             side="LONG",
                             trigger="BREAKOUT",
                             score=sig["long_score"],
                             reasons=sig["long_reasons"],
-                            price=price,
+                            price=sig["price"],
                             atr_now=sig["atr"],
                         )
 
-                    elif sig["short_score"] >= SHORT_ALERT_SCORE and sig["short_breakout"] and sig["confirm_short"]:
+                    elif (
+                        sig["short_score"] >= SHORT_ALERT_SCORE
+                        and sig["short_breakout"]
+                        and sig["confirm_short"]
+                        and short_not_chasing(asset_key, sig["df1"])
+                    ):
                         start_trade(
                             asset_key=asset_key,
                             side="SHORT",
                             trigger="BREAKOUT",
                             score=sig["short_score"],
                             reasons=sig["short_reasons"],
-                            price=price,
+                            price=sig["price"],
                             atr_now=sig["atr"],
                         )
 
                     # SNIPER
-                    elif sig["long_score"] >= LONG_ALERT_SCORE and sig["long_sniper"] and sig["confirm_long"]:
+                    elif (
+                        sig["long_score"] >= LONG_ALERT_SCORE
+                        and sig["long_sniper"]
+                        and sig["confirm_long"]
+                        and long_not_chasing(asset_key, sig["df1"])
+                    ):
                         start_trade(
                             asset_key=asset_key,
                             side="LONG",
                             trigger="SNIPER",
                             score=sig["long_score"],
                             reasons=sig["long_reasons"],
-                            price=price,
+                            price=sig["price"],
                             atr_now=sig["atr"],
                         )
 
-                    elif sig["short_score"] >= SHORT_ALERT_SCORE and sig["short_sniper"] and sig["confirm_short"]:
+                    elif (
+                        sig["short_score"] >= SHORT_ALERT_SCORE
+                        and sig["short_sniper"]
+                        and sig["confirm_short"]
+                        and short_not_chasing(asset_key, sig["df1"])
+                    ):
                         start_trade(
                             asset_key=asset_key,
                             side="SHORT",
                             trigger="SNIPER",
                             score=sig["short_score"],
                             reasons=sig["short_reasons"],
-                            price=price,
+                            price=sig["price"],
                             atr_now=sig["atr"],
                         )
 
