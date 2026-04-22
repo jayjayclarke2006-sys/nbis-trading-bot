@@ -3,6 +3,7 @@ import time
 import requests
 import pandas as pd
 import yfinance as yf
+import MetaTrader5 as mt5
 
 # =========================
 # ENV
@@ -22,7 +23,7 @@ SHORT_ALERT_SCORE = 60
 A_SETUP_SCORE = 70
 FULL_SIZE_SCORE = 75
 
-# ---- wider runner settings ----
+# ---- YOUR RUNNER SETTINGS (UNCHANGED) ----
 ATR_SL_MULT = 1.5
 ATR_TP_MULT = 4.5
 ATR_TRAIL_MULT = 2.4
@@ -39,14 +40,8 @@ SCALE_IN_ATR_STEP = 0.75
 SCALE_IN_COOLDOWN_SECONDS = 120
 
 ASSETS = {
-    "BTC": {
-        "ticker": "BTC-USD",
-        "name": "BTC",
-    },
-    "GOLD": {
-        "ticker": "XAUUSD=X",
-        "name": "GOLD",
-    },
+    "BTC": {"ticker": "BTC-USD", "name": "BTC"},
+    "GOLD": {"ticker": "XAUUSD=X", "name": "GOLD"},
 }
 
 # =========================
@@ -89,11 +84,49 @@ def send(msg: str):
         print("Telegram error:", e)
 
 # =========================
+# MT5 GOLD DATA (NEW 🔥)
+# =========================
+def get_gold_mt5(interval: str):
+    try:
+        if not mt5.initialize():
+            return pd.DataFrame()
+
+        symbol = "XAUUSD"
+        timeframe = mt5.TIMEFRAME_M1 if interval == "1m" else mt5.TIMEFRAME_M5
+
+        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, 500)
+
+        if rates is None or len(rates) == 0:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rates)
+
+        df.rename(columns={
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "tick_volume": "volume"
+        }, inplace=True)
+
+        return df[["open", "high", "low", "close", "volume"]]
+
+    except Exception:
+        return pd.DataFrame()
+
+# =========================
 # DATA
 # =========================
 def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
     try:
         ticker = ASSETS[asset_key]["ticker"]
+
+        # 🔥 GOLD: USE MT5 FIRST
+        if asset_key == "GOLD":
+            df = get_gold_mt5(interval)
+            if not df.empty:
+                return df
+
         period = "7d" if interval == "1m" else "60d"
 
         df = yf.download(
@@ -104,7 +137,7 @@ def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
             auto_adjust=False,
         )
 
-        # GOLD fallback: if 1m fails, use 5m
+        # fallback if 1m fails
         if (df is None or df.empty) and asset_key == "GOLD" and interval == "1m":
             df = yf.download(
                 ticker,
