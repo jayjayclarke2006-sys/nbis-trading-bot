@@ -100,6 +100,18 @@ def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
             auto_adjust=False,
         )
 
+        # 🔥 GOLD FIX (THIS IS THE KEY PART)
+        if (df is None or df.empty):
+            if asset_key == "GOLD" and interval == "1m":
+                # fallback to 5m if 1m fails
+                df = yf.download(
+                    ticker,
+                    period="7d",
+                    interval="5m",
+                    progress=False,
+                    auto_adjust=False,
+                )
+
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -115,6 +127,7 @@ def get_klines(asset_key: str, interval: str) -> pd.DataFrame:
         })
 
         needed = ["open", "high", "low", "close", "volume"]
+
         for col in needed:
             if col not in df.columns:
                 return pd.DataFrame()
