@@ -22,17 +22,20 @@ SHORT_ALERT_SCORE = 60
 A_SETUP_SCORE = 70
 FULL_SIZE_SCORE = 75
 
+# ---- wider runner settings ----
 ATR_SL_MULT = 1.5
-ATR_TP_MULT = 3.0
-ATR_TRAIL_MULT = 1.5
-BREAK_EVEN_ATR_TRIGGER = 1.0
-PARTIAL_ATR_TRIGGER = 1.5
+ATR_TP_MULT = 4.5
+ATR_TRAIL_MULT = 2.4
+BREAK_EVEN_ATR_TRIGGER = 1.25
+PARTIAL_ATR_TRIGGER = 2.0
+TRAILING_ACTIVATION_ATR = 1.75
+TRAIL_UPDATE_MIN_ATR = 0.20
 
 MIN_VOLATILITY_PCT = 0.001
 MAX_EMA9_DISTANCE_PCT = 0.01
 
 MAX_SCALE_INS = 2
-SCALE_IN_ATR_STEP = 0.5
+SCALE_IN_ATR_STEP = 0.75
 SCALE_IN_COOLDOWN_SECONDS = 120
 
 ASSETS = {
@@ -67,6 +70,7 @@ STATE = {
         "SCALE_COUNT": 0,
         "ENTRY_TYPE": None,
         "CONFIDENCE_LABEL": None,
+        "LAST_TRAIL_SENT_SL": 0.0,
     }
     for key in ASSETS
 }
@@ -502,6 +506,7 @@ def reset_trade(asset_key: str):
     state["SCALE_COUNT"] = 0
     state["ENTRY_TYPE"] = None
     state["CONFIDENCE_LABEL"] = None
+    state["LAST_TRAIL_SENT_SL"] = 0.0
 
 def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: list, price: float, atr_now: float):
     state = STATE[asset_key]
@@ -517,6 +522,7 @@ def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: li
     state["LAST_SCALE_TIME"] = time.time()
     state["ENTRY_TYPE"] = trigger
     state["CONFIDENCE_LABEL"] = confidence_grade(score)
+    state["LAST_TRAIL_SENT_SL"] = 0.0
 
     if side == "LONG":
         state["STOP_LOSS"] = price - (atr_now * ATR_SL_MULT)
@@ -606,6 +612,17 @@ def maybe_scale_in(asset_key: str, sig: dict):
                 f"Confidence: {state['CONFIDENCE_LABEL']}"
             )
 
+def maybe_send_trailing_update(asset_key: str, new_sl: float, atr_now: float):
+    state = STATE[asset_key]
+    name = ASSETS[asset_key]["name"]
+
+    min_step = atr_now * TRAIL_UPDATE_MIN_ATR
+    if state["LAST_TRAIL_SENT_SL"] == 0.0 or abs(new_sl - state["LAST_TRAIL_SENT_SL"]) >= min_step:
+        state["LAST_TRAIL_SENT_SL"] = new_sl
+        side = "LONG" if state["TRADE_SIDE"] == "LONG" else "SHORT"
+        icon = "📈" if side == "LONG" else "📉"
+        send(f"{icon} {name} {side} TRAILING STOP\nNew SL: ${new_sl:.2f}")
+
 # =========================
 # TRADE MANAGEMENT
 # =========================
@@ -615,9 +632,10 @@ def manage_trade(asset_key: str, sig: dict):
 
     price = sig["price"]
     atr_now = sig["atr"]
-    entry_ref = state["AVG_ENTRY_PRICE"] if state["AVG_ENTRY_PRICE"] > 0 else state["ENTRY_PRICE"]
 
     maybe_scale_in(asset_key, sig)
+
+    entry_ref = state["AVG_ENTRY_PRICE"] if state["AVG_ENTRY_PRICE"] > 0 else state["ENTRY_PRICE"]
 
     if state["TRADE_SIDE"] == "LONG":
         state["HIGHEST_PRICE"] = max(state["HIGHEST_PRICE"], price)
@@ -631,11 +649,11 @@ def manage_trade(asset_key: str, sig: dict):
             state["PARTIAL_SENT"] = True
             send(f"💰 {name} LONG PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if state["BREAK_EVEN_ACTIVE"] and price > entry_ref + atr_now:
+        if state["BREAK_EVEN_ACTIVE"] and price > entry_ref + (atr_now * TRAILING_ACTIVATION_ATR):
             new_sl = state["HIGHEST_PRICE"] - (atr_now * ATR_TRAIL_MULT)
             if new_sl > state["STOP_LOSS"]:
                 state["STOP_LOSS"] = new_sl
-                send(f"📈 {name} LONG TRAILING STOP\nNew SL: ${state['STOP_LOSS']:.2f}")
+                maybe_send_trailing_update(asset_key, new_sl, atr_now)
 
         if price <= state["STOP_LOSS"]:
             send(f"❌ {name} LONG STOP HIT\nExit: ${price:.2f}")
@@ -659,11 +677,11 @@ def manage_trade(asset_key: str, sig: dict):
             state["PARTIAL_SENT"] = True
             send(f"💰 {name} SHORT PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
-        if state["BREAK_EVEN_ACTIVE"] and price < entry_ref - atr_now:
+        if state["BREAK_EVEN_ACTIVE"] and price < entry_ref - (atr_now * TRAILING_ACTIVATION_ATR):
             new_sl = state["LOWEST_PRICE"] + (atr_now * ATR_TRAIL_MULT)
             if new_sl < state["STOP_LOSS"]:
                 state["STOP_LOSS"] = new_sl
-                send(f"📉 {name} SHORT TRAILING STOP\nNew SL: ${state['STOP_LOSS']:.2f}")
+                maybe_send_trailing_update(asset_key, new_sl, atr_now)
 
         if price >= state["STOP_LOSS"]:
             send(f"❌ {name} SHORT STOP HIT\nExit: ${price:.2f}")
