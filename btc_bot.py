@@ -35,15 +35,12 @@ ASSETS = {
         "name": "BTC",
     },
     "GOLD": {
-        "ticker": "XAUUSD=X",
+        "ticker": "GC=F",
         "feed_symbol": "XAU/USD",
         "name": "GOLD",
     },
 }
 
-# =========================
-# SEPARATE BTC / GOLD LOGIC
-# =========================
 ASSET_CONFIG = {
     "BTC": {
         "ATR_SL_MULT": 2.2,
@@ -63,7 +60,7 @@ ASSET_CONFIG = {
         "STRICT_TREND": True,
         "BREAKOUT_BUFFER_LONG": 1.0015,
         "BREAKOUT_BUFFER_SHORT": 0.9985,
-        "VOL_CONFIRM_MULT": 1.05,
+        "VOL_CONFIRM_MULT": 1.10,
         "A_SETUP_MIN_SCORE": 70,
     },
     "GOLD": {
@@ -84,7 +81,7 @@ ASSET_CONFIG = {
         "STRICT_TREND": False,
         "BREAKOUT_BUFFER_LONG": 1.0005,
         "BREAKOUT_BUFFER_SHORT": 0.9995,
-        "VOL_CONFIRM_MULT": 1.00,
+        "VOL_CONFIRM_MULT": 1.05,
         "A_SETUP_MIN_SCORE": 65,
     },
 }
@@ -130,8 +127,11 @@ def send(msg: str):
         if not TELEGRAM_TOKEN or not CHAT_ID:
             print(msg)
             return
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=10,
+        )
     except Exception as e:
         print("Telegram error:", e)
 
@@ -141,32 +141,46 @@ def send(msg: str):
 def td_interval(interval: str) -> str:
     return {"1m": "1min", "5m": "5min"}[interval]
 
+def get_binance_btc(interval="1m", limit=500) -> pd.DataFrame:
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": "BTCUSDT", "interval": interval, "limit": limit}
+        data = requests.get(url, params=params, timeout=10).json()
+
+        if not isinstance(data, list):
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data, columns=[
+            "time", "open", "high", "low", "close", "volume",
+            "ct", "qav", "trades", "tbv", "tqv", "ignore"
+        ])
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.dropna(inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
 def get_twelvedata_klines(asset_key: str, interval: str, outputsize: int = 500) -> pd.DataFrame:
     try:
         if not TWELVEDATA_API_KEY:
             return pd.DataFrame()
 
-        symbol = ASSETS[asset_key]["feed_symbol"]
         url = "https://api.twelvedata.com/time_series"
         params = {
-            "symbol": symbol,
+            "symbol": ASSETS[asset_key]["feed_symbol"],
             "interval": td_interval(interval),
             "outputsize": outputsize,
             "apikey": TWELVEDATA_API_KEY,
             "format": "JSON",
         }
 
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-
+        data = requests.get(url, params=params, timeout=15).json()
         if not isinstance(data, dict) or "values" not in data:
             return pd.DataFrame()
 
-        values = data["values"]
-        if not isinstance(values, list) or len(values) < 30:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(values)
+        df = pd.DataFrame(data["values"])
         needed = ["open", "high", "low", "close", "volume"]
         for col in needed:
             if col not in df.columns:
@@ -176,10 +190,6 @@ def get_twelvedata_klines(asset_key: str, interval: str, outputsize: int = 500) 
         df = df[needed].copy()
         df = df.iloc[::-1].reset_index(drop=True)
         df.dropna(inplace=True)
-
-        if len(df) < 30:
-            return pd.DataFrame()
-
         return df
     except Exception:
         return pd.DataFrame()
@@ -196,15 +206,6 @@ def get_yfinance_klines(asset_key: str, interval: str) -> pd.DataFrame:
             progress=False,
             auto_adjust=False,
         )
-
-        if (df is None or df.empty) and asset_key == "GOLD" and interval == "1m":
-            df = yf.download(
-                ticker,
-                period="7d",
-                interval="5m",
-                progress=False,
-                auto_adjust=False,
-            )
 
         if df is None or df.empty:
             return pd.DataFrame()
@@ -228,22 +229,31 @@ def get_yfinance_klines(asset_key: str, interval: str) -> pd.DataFrame:
 
         df = df[needed].copy()
         df.dropna(inplace=True)
-
-        if len(df) < 30:
-            return pd.DataFrame()
-
         return df
     except Exception:
         return pd.DataFrame()
 
 def get_klines(asset_key: str, interval: str):
-    df = get_twelvedata_klines(asset_key, interval)
-    if not df.empty:
-        return df, "TWELVEDATA"
+    if asset_key == "BTC":
+        df = get_binance_btc(interval=interval, limit=500)
+        if not df.empty:
+            return df, "BINANCE"
+
+    if asset_key == "GOLD":
+        for _ in range(2):
+            df = get_twelvedata_klines(asset_key, interval)
+            if not df.empty:
+                return df, "TWELVEDATA"
+            time.sleep(1)
 
     df = get_yfinance_klines(asset_key, interval)
     if not df.empty:
         return df, "YFINANCE"
+
+    if asset_key != "BTC":
+        df = get_twelvedata_klines(asset_key, interval)
+        if not df.empty:
+            return df, "TWELVEDATA"
 
     return pd.DataFrame(), "NONE"
 
@@ -290,7 +300,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =========================
-# MARKET FILTERS
+# FILTERS
 # =========================
 def market_trend(df1: pd.DataFrame, df5: pd.DataFrame, asset_key: str) -> str:
     r1 = df1.iloc[-1]
@@ -310,17 +320,14 @@ def market_trend(df1: pd.DataFrame, df5: pd.DataFrame, asset_key: str) -> str:
 
     if cfg["ALLOW_CHOP"]:
         return "RANGE"
-
     return "CHOPPY"
 
 def has_enough_volatility(asset_key: str, price: float, atr_now: float) -> bool:
-    cfg = ASSET_CONFIG[asset_key]
-    return (atr_now / max(price, 1.0)) >= cfg["MIN_VOLATILITY_PCT"]
+    return (atr_now / max(price, 1.0)) >= ASSET_CONFIG[asset_key]["MIN_VOLATILITY_PCT"]
 
 def not_too_extended(asset_key: str, price: float, ema9_value: float) -> bool:
-    cfg = ASSET_CONFIG[asset_key]
     distance = abs(price - ema9_value) / max(price, 1.0)
-    return distance <= cfg["MAX_EMA9_DISTANCE_PCT"]
+    return distance <= ASSET_CONFIG[asset_key]["MAX_EMA9_DISTANCE_PCT"]
 
 def candle_body(df1: pd.DataFrame) -> float:
     r = df1.iloc[-1]
@@ -332,13 +339,10 @@ def long_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
 
     if float(r["rsi"]) > cfg["LONG_RSI_MAX"]:
         return False
-
     if not not_too_extended(asset_key, float(r["close"]), float(r["ema9"])):
         return False
-
     if float(r["atr"]) > 0 and candle_body(df1) > float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]:
         return False
-
     return True
 
 def short_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
@@ -347,13 +351,10 @@ def short_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
 
     if float(r["rsi"]) < cfg["SHORT_RSI_MIN"]:
         return False
-
     if not not_too_extended(asset_key, float(r["close"]), float(r["ema9"])):
         return False
-
     if float(r["atr"]) > 0 and candle_body(df1) > float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]:
         return False
-
     return True
 
 # =========================
@@ -478,7 +479,7 @@ def short_score(df1: pd.DataFrame, df5: pd.DataFrame, asset_key: str):
     return int(min(score, 100)), reasons
 
 # =========================
-# CONFIDENCE GRADING
+# CONFIDENCE
 # =========================
 def confidence_grade(score: int) -> str:
     if score >= 100:
@@ -544,30 +545,16 @@ def sniper_short(df1: pd.DataFrame) -> bool:
 
     return bool(ema_reject and rsi_reject and lower_high)
 
-# =========================
-# CONFIRMATION LOGIC
-# =========================
 def confirm_long(df1: pd.DataFrame) -> bool:
     r = df1.iloc[-1]
     p = df1.iloc[-2]
-
-    strong_close = r["close"] > p["high"]
-    ema_hold = r["close"] > r["ema9"]
-
-    return bool(strong_close and ema_hold)
+    return bool(r["close"] > p["high"] and r["close"] > r["ema9"])
 
 def confirm_short(df1: pd.DataFrame) -> bool:
     r = df1.iloc[-1]
     p = df1.iloc[-2]
+    return bool(r["close"] < p["low"] and r["close"] < r["ema9"])
 
-    strong_close = r["close"] < p["low"]
-    ema_hold = r["close"] < r["ema9"]
-
-    return bool(strong_close and ema_hold)
-
-# =========================
-# A SETUP LOGIC
-# =========================
 def a_setup_long(sig: dict) -> bool:
     min_score = ASSET_CONFIG[sig["asset_key"]]["A_SETUP_MIN_SCORE"]
     return (
@@ -587,7 +574,7 @@ def a_setup_short(sig: dict) -> bool:
     )
 
 # =========================
-# DATA FAIL ALERT
+# ALERTS / HEARTBEAT
 # =========================
 def maybe_alert_data_fail(asset_key: str, src1: str, src5: str):
     state = STATE[asset_key]
@@ -597,9 +584,6 @@ def maybe_alert_data_fail(asset_key: str, src1: str, src5: str):
             send(f"⚠️ {ASSETS[asset_key]['name']} DATA FEED FAIL\n1m: {src1}\n5m: {src5}")
             state["LAST_DATA_FAIL_ALERT_TS"] = now
 
-# =========================
-# HEARTBEAT (ALWAYS SENDS)
-# =========================
 def heartbeat(asset_key: str, sig):
     now = time.time()
     state = STATE[asset_key]
@@ -910,7 +894,7 @@ def manage_trade(asset_key: str, sig: dict):
 # MAIN LOOP
 # =========================
 def run():
-    send("🔥 BTC + GOLD PRO BOT LIVE 🔥")
+    send("🔥 BTC + GOLD FINAL BOT LIVE 🔥")
 
     while True:
         try:
