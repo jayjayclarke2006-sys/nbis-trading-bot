@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import requests
 import pandas as pd
 import yfinance as yf
@@ -34,7 +33,7 @@ ASSETS = {
         "name": "BTC",
         "yfinance_ticker": "BTC-USD",
         "binance_symbol": "BTCUSDT",
-        "td_symbol": None,
+        "td_symbol": "BTC/USD",
     },
     "GOLD": {
         "name": "GOLD",
@@ -59,7 +58,6 @@ ASSET_CONFIG = {
         "LONG_RSI_MAX": 67.5,
         "SHORT_RSI_MIN": 32.5,
         "MAX_BODY_ATR_MULT": 0.90,
-        "ALLOW_RANGE_A_SETUP": False,
         "BREAKOUT_BUFFER_LONG": 1.0012,
         "BREAKOUT_BUFFER_SHORT": 0.9988,
         "VOL_CONFIRM_MULT": 1.08,
@@ -81,7 +79,6 @@ ASSET_CONFIG = {
         "LONG_RSI_MAX": 65.5,
         "SHORT_RSI_MIN": 34.0,
         "MAX_BODY_ATR_MULT": 0.75,
-        "ALLOW_RANGE_A_SETUP": False,
         "BREAKOUT_BUFFER_LONG": 1.0005,
         "BREAKOUT_BUFFER_SHORT": 0.9995,
         "VOL_CONFIRM_MULT": 1.03,
@@ -151,31 +148,46 @@ def td_interval(interval: str) -> str:
     return {"1m": "1min", "5m": "5min", "15m": "15min"}[interval]
 
 def get_binance_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
-    try:
-        url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
+    for _ in range(3):
+        try:
+            url = "https://api.binance.com/api/v3/klines"
+            params = {"symbol": symbol, "interval": interval, "limit": limit}
+            r = requests.get(url, params=params, timeout=10)
 
-        if not isinstance(data, list) or len(data) < 30:
-            return pd.DataFrame()
+            if r.status_code != 200:
+                time.sleep(1)
+                continue
 
-        df = pd.DataFrame(
-            data,
-            columns=[
-                "time", "open", "high", "low", "close", "volume",
-                "ct", "qav", "trades", "tbv", "tqv", "ignore"
-            ],
-        )
+            data = r.json()
 
-        df = df[["open", "high", "low", "close", "volume"]].copy()
-        for c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            if not isinstance(data, list) or len(data) < 30:
+                time.sleep(1)
+                continue
 
-        df.dropna(inplace=True)
-        return df
-    except Exception:
-        return pd.DataFrame()
+            df = pd.DataFrame(
+                data,
+                columns=[
+                    "time", "open", "high", "low", "close", "volume",
+                    "ct", "qav", "trades", "tbv", "tqv", "ignore"
+                ],
+            )
+
+            df = df[["open", "high", "low", "close", "volume"]].copy()
+
+            for c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            df.dropna(inplace=True)
+
+            if len(df) >= 30:
+                return df
+
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"BTC BINANCE ERROR: {e}")
+            time.sleep(1)
+
+    return pd.DataFrame()
 
 def get_twelvedata_klines(td_symbol: str, interval: str, outputsize: int = 500) -> pd.DataFrame:
     try:
@@ -203,6 +215,7 @@ def get_twelvedata_klines(td_symbol: str, interval: str, outputsize: int = 500) 
 
         df = pd.DataFrame(values)
         needed = ["open", "high", "low", "close", "volume"]
+
         for c in needed:
             if c not in df.columns:
                 return pd.DataFrame()
@@ -212,6 +225,7 @@ def get_twelvedata_klines(td_symbol: str, interval: str, outputsize: int = 500) 
         df = df.iloc[::-1].reset_index(drop=True)
         df.dropna(inplace=True)
         return df
+
     except Exception:
         return pd.DataFrame()
 
@@ -234,15 +248,18 @@ def get_yfinance_klines(ticker: str, interval: str) -> pd.DataFrame:
 
         df.columns = [str(c).lower() for c in df.columns]
         needed = ["open", "high", "low", "close", "volume"]
+
         if any(c not in df.columns for c in needed):
             return pd.DataFrame()
 
         df = df[needed].copy()
+
         for c in needed:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
         df.dropna(inplace=True)
         return df
+
     except Exception:
         return pd.DataFrame()
 
@@ -254,13 +271,16 @@ def get_klines(asset_key: str, interval: str):
         if not df.empty:
             return df, "BINANCE"
 
+        df = get_twelvedata_klines(asset["td_symbol"], interval)
+        if not df.empty:
+            return df, "TWELVEDATA"
+
         df = get_yfinance_klines(asset["yfinance_ticker"], interval)
         if not df.empty:
             return df, "YFINANCE"
 
         return pd.DataFrame(), "NONE"
 
-    # GOLD
     df = get_twelvedata_klines(asset["td_symbol"], interval)
     if not df.empty:
         return df, "TWELVEDATA"
@@ -348,6 +368,7 @@ def clean_entry(asset_key: str, df1: pd.DataFrame) -> bool:
     p = df1.iloc[-2]
 
     move_size = abs(float(r["close"]) - float(p["close"]))
+
     if float(r["atr"]) > 0 and move_size > float(r["atr"]) * cfg["MAX_IMPULSE_ATR_MULT"]:
         return False
 
@@ -553,13 +574,12 @@ def heartbeat(asset_key: str, sig):
         return
 
     if sig is None:
-        msg = (
+        send(
             f"💓 {name} HEARTBEAT\n\n"
             f"Status: NO DATA\n"
             f"In trade: {'YES' if state['IN_TRADE'] else 'NO'}\n"
             f"Feed: {state['DATA_SOURCE']}"
         )
-        send(msg)
         state["LAST_HEARTBEAT_TS"] = now
         return
 
@@ -688,12 +708,10 @@ def start_trade(asset_key: str, side: str, trigger: str, score: int, price: floa
         state["TAKE_PROFIT"] = price - (atr_now * cfg["ATR_TP_MULT"])
         emoji = "📉"
 
-    size = entry_size_label(score)
-
     send(
         f"{emoji} {name} {side} ENTRY\n\n"
         f"Trigger: {trigger}\n"
-        f"Size: {size}\n"
+        f"Size: {entry_size_label(score)}\n"
         f"Confidence: {state['CONFIDENCE_LABEL']}\n"
         f"Scale: 1/{MAX_SCALE_INS}\n"
         f"Price: ${price:.2f}\n"
@@ -725,12 +743,14 @@ def maybe_scale_in(asset_key: str, sig: dict):
 
     if state["TRADE_SIDE"] == "LONG":
         favorable_move = price >= state["AVG_ENTRY_PRICE"] + (atr_now * cfg["SCALE_IN_ATR_STEP"])
+
         if favorable_move and sig["confirm_long"] and sig["long_score"] >= LONG_ALERT_SCORE and long_not_chasing(asset_key, sig["df1"]):
             old_avg = state["AVG_ENTRY_PRICE"]
             state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
             state["SCALE_COUNT"] += 1
             state["LAST_SCALE_TIME"] = time.time()
             state["HIGHEST_PRICE"] = max(state["HIGHEST_PRICE"], price)
+
             send(
                 f"➕ {name} LONG SCALE-IN\n\n"
                 f"Entry type: {state['ENTRY_TYPE']}\n"
@@ -743,12 +763,14 @@ def maybe_scale_in(asset_key: str, sig: dict):
 
     elif state["TRADE_SIDE"] == "SHORT":
         favorable_move = price <= state["AVG_ENTRY_PRICE"] - (atr_now * cfg["SCALE_IN_ATR_STEP"])
+
         if favorable_move and sig["confirm_short"] and sig["short_score"] >= SHORT_ALERT_SCORE and short_not_chasing(asset_key, sig["df1"]):
             old_avg = state["AVG_ENTRY_PRICE"]
             state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
             state["SCALE_COUNT"] += 1
             state["LAST_SCALE_TIME"] = time.time()
             state["LOWEST_PRICE"] = min(state["LOWEST_PRICE"], price)
+
             send(
                 f"➕ {name} SHORT SCALE-IN\n\n"
                 f"Entry type: {state['ENTRY_TYPE']}\n"
