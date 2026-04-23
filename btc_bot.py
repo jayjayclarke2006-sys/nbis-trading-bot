@@ -17,6 +17,8 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 CHECK_INTERVAL = 60
 HEARTBEAT_SECONDS = 1800
 COOLDOWN_SECONDS = 600
+DEBUG_MODE = True
+DATA_FAIL_ALERT_COOLDOWN = 1800
 
 LONG_ALERT_SCORE = 60
 SHORT_ALERT_SCORE = 60
@@ -40,7 +42,7 @@ ASSETS = {
 }
 
 # =========================
-# ASSET CONFIG
+# SEPARATE BTC / GOLD LOGIC
 # =========================
 ASSET_CONFIG = {
     "BTC": {
@@ -58,28 +60,32 @@ ASSET_CONFIG = {
         "SHORT_RSI_MIN": 31.0,
         "MAX_BODY_ATR_MULT": 0.85,
         "ALLOW_CHOP": False,
+        "STRICT_TREND": True,
         "BREAKOUT_BUFFER_LONG": 1.0015,
         "BREAKOUT_BUFFER_SHORT": 0.9985,
-        "STRICT_TREND": True,
+        "VOL_CONFIRM_MULT": 1.05,
+        "A_SETUP_MIN_SCORE": 70,
     },
     "GOLD": {
-        "ATR_SL_MULT": 1.4,
-        "ATR_TP_MULT": 3.2,
-        "ATR_TRAIL_MULT": 1.6,
-        "BREAK_EVEN_ATR_TRIGGER": 1.1,
-        "PARTIAL_ATR_TRIGGER": 1.6,
-        "TRAILING_ACTIVATION_ATR": 1.3,
-        "TRAIL_UPDATE_MIN_ATR": 0.18,
-        "MIN_VOLATILITY_PCT": 0.0005,
+        "ATR_SL_MULT": 1.3,
+        "ATR_TP_MULT": 2.8,
+        "ATR_TRAIL_MULT": 1.5,
+        "BREAK_EVEN_ATR_TRIGGER": 0.9,
+        "PARTIAL_ATR_TRIGGER": 1.4,
+        "TRAILING_ACTIVATION_ATR": 1.2,
+        "TRAIL_UPDATE_MIN_ATR": 0.15,
+        "MIN_VOLATILITY_PCT": 0.00025,
         "MAX_EMA9_DISTANCE_PCT": 0.0100,
-        "SCALE_IN_ATR_STEP": 0.6,
-        "LONG_RSI_MAX": 67.0,
-        "SHORT_RSI_MIN": 33.0,
-        "MAX_BODY_ATR_MULT": 0.80,
+        "SCALE_IN_ATR_STEP": 0.4,
+        "LONG_RSI_MAX": 70.0,
+        "SHORT_RSI_MIN": 30.0,
+        "MAX_BODY_ATR_MULT": 1.20,
         "ALLOW_CHOP": True,
+        "STRICT_TREND": False,
         "BREAKOUT_BUFFER_LONG": 1.0005,
         "BREAKOUT_BUFFER_SHORT": 0.9995,
-        "STRICT_TREND": False,
+        "VOL_CONFIRM_MULT": 1.00,
+        "A_SETUP_MIN_SCORE": 65,
     },
 }
 
@@ -106,6 +112,12 @@ STATE = {
         "CONFIDENCE_LABEL": None,
         "LAST_TRAIL_SENT_SL": 0.0,
         "DATA_SOURCE": "UNKNOWN",
+        "LAST_DATA_FAIL_ALERT_TS": 0.0,
+        "LAST_KNOWN_PRICE": None,
+        "LAST_KNOWN_RSI": None,
+        "LAST_KNOWN_TREND": "UNKNOWN",
+        "LAST_KNOWN_LONG_SCORE": None,
+        "LAST_KNOWN_SHORT_SCORE": None,
     }
     for key in ASSETS
 }
@@ -296,7 +308,7 @@ def market_trend(df1: pd.DataFrame, df5: pd.DataFrame, asset_key: str) -> str:
         if r5["ema9"] < r5["ema21"] and r1["ema9"] < r1["ema21"]:
             return "BEARISH"
 
-    if cfg.get("ALLOW_CHOP", False):
+    if cfg["ALLOW_CHOP"]:
         return "RANGE"
 
     return "CHOPPY"
@@ -491,7 +503,7 @@ def breakout_long(df1: pd.DataFrame, asset_key: str) -> bool:
 
     clean_break = r["close"] > r["hh10"] * cfg["BREAKOUT_BUFFER_LONG"]
     strong_close = r["close"] > p["close"]
-    volume_ok = r["volume"] > r["vol_ma"] * (1.0 if asset_key == "GOLD" else 1.05)
+    volume_ok = r["volume"] > r["vol_ma"] * cfg["VOL_CONFIRM_MULT"]
     holding_ema = r["close"] > r["ema9"]
     not_stretched = (r["close"] - r["ema9"]) / max(r["ema9"], 1.0) < (0.012 if asset_key == "GOLD" else 0.010)
 
@@ -504,7 +516,7 @@ def breakout_short(df1: pd.DataFrame, asset_key: str) -> bool:
 
     clean_break = r["close"] < r["ll10"] * cfg["BREAKOUT_BUFFER_SHORT"]
     strong_close = r["close"] < p["close"]
-    volume_ok = r["volume"] > r["vol_ma"] * (1.0 if asset_key == "GOLD" else 1.05)
+    volume_ok = r["volume"] > r["vol_ma"] * cfg["VOL_CONFIRM_MULT"]
     below_ema = r["close"] < r["ema9"]
     not_stretched = (r["ema9"] - r["close"]) / max(r["ema9"], 1.0) < (0.012 if asset_key == "GOLD" else 0.010)
 
@@ -557,46 +569,68 @@ def confirm_short(df1: pd.DataFrame) -> bool:
 # A SETUP LOGIC
 # =========================
 def a_setup_long(sig: dict) -> bool:
+    min_score = ASSET_CONFIG[sig["asset_key"]]["A_SETUP_MIN_SCORE"]
     return (
-        sig["long_score"] >= A_SETUP_SCORE
+        sig["long_score"] >= min_score
         and sig["trend"] in ["BULLISH", "RANGE"]
         and sig["confirm_long"]
         and long_not_chasing(sig["asset_key"], sig["df1"])
     )
 
 def a_setup_short(sig: dict) -> bool:
+    min_score = ASSET_CONFIG[sig["asset_key"]]["A_SETUP_MIN_SCORE"]
     return (
-        sig["short_score"] >= A_SETUP_SCORE
+        sig["short_score"] >= min_score
         and sig["trend"] in ["BEARISH", "RANGE"]
         and sig["confirm_short"]
         and short_not_chasing(sig["asset_key"], sig["df1"])
     )
 
 # =========================
-# HEARTBEAT
+# DATA FAIL ALERT
 # =========================
-def maybe_send_heartbeat(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame):
+def maybe_alert_data_fail(asset_key: str, src1: str, src5: str):
+    state = STATE[asset_key]
+    now = time.time()
+    if src1 == "NONE" and src5 == "NONE":
+        if now - state["LAST_DATA_FAIL_ALERT_TS"] >= DATA_FAIL_ALERT_COOLDOWN:
+            send(f"⚠️ {ASSETS[asset_key]['name']} DATA FEED FAIL\n1m: {src1}\n5m: {src5}")
+            state["LAST_DATA_FAIL_ALERT_TS"] = now
+
+# =========================
+# HEARTBEAT (ALWAYS SENDS)
+# =========================
+def heartbeat(asset_key: str, sig):
     now = time.time()
     state = STATE[asset_key]
+    name = ASSETS[asset_key]["name"]
 
     if now - state["LAST_HEARTBEAT_TS"] < HEARTBEAT_SECONDS:
         return
 
-    ls, _ = long_score(df1, df5, asset_key)
-    ss, _ = short_score(df1, df5, asset_key)
-    r1 = df1.iloc[-1]
-    name = ASSETS[asset_key]["name"]
+    if sig is not None:
+        r = sig["df1"].iloc[-1]
+        state["LAST_KNOWN_PRICE"] = sig["price"]
+        state["LAST_KNOWN_RSI"] = float(r["rsi"])
+        state["LAST_KNOWN_TREND"] = sig["trend"]
+        state["LAST_KNOWN_LONG_SCORE"] = sig["long_score"]
+        state["LAST_KNOWN_SHORT_SCORE"] = sig["short_score"]
+        state["DATA_SOURCE"] = sig["data_source"]
 
-    send(
-        f"💓 {name} HEARTBEAT\n\n"
-        f"Price: ${float(r1['close']):.2f}\n"
-        f"RSI: {float(r1['rsi']):.1f}\n"
-        f"Trend: {market_trend(df1, df5, asset_key)}\n"
-        f"Long score: {ls}\n"
-        f"Short score: {ss}\n"
-        f"In trade: {'YES' if state['IN_TRADE'] else 'NO'}\n"
-        f"Feed: {state['DATA_SOURCE']}"
-    )
+    if state["LAST_KNOWN_PRICE"] is None:
+        send(f"💓 {name} HEARTBEAT\n\nStatus: NO DATA")
+    else:
+        send(
+            f"💓 {name} HEARTBEAT\n\n"
+            f"Price: ${float(state['LAST_KNOWN_PRICE']):.2f}\n"
+            f"RSI: {float(state['LAST_KNOWN_RSI']):.1f}\n"
+            f"Trend: {state['LAST_KNOWN_TREND']}\n"
+            f"Long score: {state['LAST_KNOWN_LONG_SCORE']}\n"
+            f"Short score: {state['LAST_KNOWN_SHORT_SCORE']}\n"
+            f"In trade: {'YES' if state['IN_TRADE'] else 'NO'}\n"
+            f"Feed: {state['DATA_SOURCE']}"
+        )
+
     state["LAST_HEARTBEAT_TS"] = now
 
 # =========================
@@ -605,6 +639,8 @@ def maybe_send_heartbeat(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame):
 def get_signal(asset_key: str):
     df1_raw, src1 = get_klines(asset_key, "1m")
     df5_raw, src5 = get_klines(asset_key, "5m")
+
+    maybe_alert_data_fail(asset_key, src1, src5)
 
     df1 = add_indicators(df1_raw)
     df5 = add_indicators(df5_raw)
@@ -880,15 +916,26 @@ def run():
         try:
             for asset_key in ASSETS:
                 state = STATE[asset_key]
-
                 sig = get_signal(asset_key)
+
+                heartbeat(asset_key, sig)
+
+                if DEBUG_MODE:
+                    if sig is None:
+                        print(f"{asset_key} | NO SIGNAL DATA")
+                    else:
+                        print(
+                            f"{asset_key} | Trend: {sig['trend']} | "
+                            f"L:{sig['long_score']} S:{sig['short_score']} | "
+                            f"LB:{sig['long_breakout']} SB:{sig['short_breakout']} | "
+                            f"LS:{sig['long_sniper']} SS:{sig['short_sniper']} | "
+                            f"Feed:{sig['data_source']}"
+                        )
 
                 if sig is None:
                     continue
 
                 state["DATA_SOURCE"] = sig["data_source"]
-
-                maybe_send_heartbeat(asset_key, sig["df1"], sig["df5"])
 
                 if not state["IN_TRADE"]:
                     if time.time() - state["LAST_TRADE_TIME"] < COOLDOWN_SECONDS:
