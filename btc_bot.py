@@ -1,75 +1,62 @@
 import os
 import time
-import math
 import requests
 import pandas as pd
 import yfinance as yf
 
 # ============================================================
-# BTC + GOLD TELEGRAM SIGNAL BOT
-# Full old-style strategy rebuilt clean:
-# - BTC + GOLD data
-# - Telegram startup + heartbeat
-# - Breakout / pullback / sniper / hybrid scoring
-# - SL / TP / break-even / trailing / partial alerts
-# - Scale-in alerts
-# - Data fail alerts
-# - 30 minute heartbeats
+# BTC + GOLD FULL STRATEGY BOT
+# Built on stable anti-chase core:
+# - Telegram live + 30 minute heartbeat
+# - BTC Binance primary + Yahoo fallback
+# - GOLD Yahoo primary
+# - Multi-timeframe 1m / 5m / 15m
+# - Breakout / sniper / pullback / hybrid scoring
+# - Anti-top-buying filters
+# - No same-level re-entry spam
+# - SL / TP / break-even / partial / trailing
 # ============================================================
 
-# ============================================================
-# ENVIRONMENT VARIABLES
-# ============================================================
-TELEGRAM_TOKEN = (
-    os.getenv("TELEGRAM_TOKEN")
-    or os.getenv("TELEGRAM_BOT_TOKEN")
-)
+# =========================
+# ENV
+# =========================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 
-CHAT_ID = (
-    os.getenv("CHAT_ID")
-    or os.getenv("TELEGRAM_CHAT_ID")
-)
-
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-
-# ============================================================
-# GLOBAL CONFIG
-# ============================================================
+# =========================
+# CONFIG
+# =========================
 CHECK_INTERVAL = 60
 HEARTBEAT_SECONDS = 1800
-COOLDOWN_SECONDS = 600
-DATA_FAIL_ALERT_COOLDOWN = 1800
+COOLDOWN_SECONDS = 900
 DEBUG_MODE = True
 
-LONG_ALERT_SCORE = 65
-SHORT_ALERT_SCORE = 65
-A_SETUP_SCORE = 70
-FULL_SIZE_SCORE = 82
+A_SETUP_SCORE = 72
+FULL_SIZE_SCORE = 85
+SCALE_IN_SCORE = 75
 
 MAX_SCALE_INS = 2
-SCALE_IN_COOLDOWN_SECONDS = 180
+SCALE_IN_COOLDOWN_SECONDS = 300
 
-# ============================================================
+# =========================
 # ASSETS
-# ============================================================
+# =========================
 ASSETS = {
     "BTC": {
         "name": "BTC",
         "binance_symbol": "BTCUSDT",
-        "td_symbol": "BTC/USD",
         "yf_symbol": "BTC-USD",
     },
     "GOLD": {
         "name": "GOLD",
         "binance_symbol": None,
-        "td_symbol": "XAU/USD",
         "yf_symbol": "GC=F",
     },
 }
 
-# ============================================================
-# PER-ASSET STRATEGY SETTINGS
-# ============================================================
+# =========================
+# STRATEGY SETTINGS
+# =========================
 ASSET_CONFIG = {
     "BTC": {
         "ATR_SL_MULT": 3.2,
@@ -78,20 +65,27 @@ ASSET_CONFIG = {
         "BREAK_EVEN_ATR_TRIGGER": 2.2,
         "PARTIAL_ATR_TRIGGER": 3.5,
         "TRAILING_ACTIVATION_ATR": 3.0,
-        "TRAIL_UPDATE_MIN_ATR": 0.25,
+        "TRAIL_UPDATE_MIN_ATR": 0.35,
+        "SCALE_IN_ATR_STEP": 1.2,
+
         "MIN_VOLATILITY_PCT": 0.0008,
-        "MAX_EMA9_DISTANCE_PCT": 0.0070,
-        "SCALE_IN_ATR_STEP": 1.0,
-        "LONG_RSI_MAX": 70.0,
-        "SHORT_RSI_MIN": 30.0,
-        "MAX_BODY_ATR_MULT": 1.15,
-        "BREAKOUT_BUFFER_LONG": 1.0010,
-        "BREAKOUT_BUFFER_SHORT": 0.9990,
+        "MAX_EMA9_DISTANCE_PCT": 0.0048,
+        "MAX_BODY_ATR_MULT": 0.95,
+        "MAX_ONE_CANDLE_ATR_MULT": 1.10,
+
+        "LONG_RSI_MIN": 48.0,
+        "LONG_RSI_MAX": 66.0,
+        "SHORT_RSI_MIN": 34.0,
+        "SHORT_RSI_MAX": 52.0,
+
+        "BREAKOUT_BUFFER_LONG": 1.0008,
+        "BREAKOUT_BUFFER_SHORT": 0.9992,
         "VOL_CONFIRM_MULT": 1.00,
-        "PULLBACK_LONG_EMA9_MAX": 1.0020,
-        "PULLBACK_SHORT_EMA9_MIN": 0.9980,
-        "SNIPER_LONG_RSI_RECLAIM": 48.0,
-        "SNIPER_SHORT_RSI_REJECT": 52.0,
+
+        "PULLBACK_LONG_EMA9_MAX": 1.0015,
+        "PULLBACK_SHORT_EMA9_MIN": 0.9985,
+
+        "SAME_ZONE_REENTRY_PCT": 0.0025,
     },
     "GOLD": {
         "ATR_SL_MULT": 2.6,
@@ -100,26 +94,33 @@ ASSET_CONFIG = {
         "BREAK_EVEN_ATR_TRIGGER": 2.0,
         "PARTIAL_ATR_TRIGGER": 3.0,
         "TRAILING_ACTIVATION_ATR": 2.6,
-        "TRAIL_UPDATE_MIN_ATR": 0.18,
-        "MIN_VOLATILITY_PCT": 0.00015,
-        "MAX_EMA9_DISTANCE_PCT": 0.0048,
-        "SCALE_IN_ATR_STEP": 0.6,
-        "LONG_RSI_MAX": 68.0,
-        "SHORT_RSI_MIN": 32.0,
-        "MAX_BODY_ATR_MULT": 0.95,
-        "BREAKOUT_BUFFER_LONG": 1.0005,
-        "BREAKOUT_BUFFER_SHORT": 0.9995,
+        "TRAIL_UPDATE_MIN_ATR": 0.25,
+        "SCALE_IN_ATR_STEP": 0.9,
+
+        "MIN_VOLATILITY_PCT": 0.00012,
+        "MAX_EMA9_DISTANCE_PCT": 0.0035,
+        "MAX_BODY_ATR_MULT": 0.85,
+        "MAX_ONE_CANDLE_ATR_MULT": 1.00,
+
+        "LONG_RSI_MIN": 48.0,
+        "LONG_RSI_MAX": 64.0,
+        "SHORT_RSI_MIN": 36.0,
+        "SHORT_RSI_MAX": 52.0,
+
+        "BREAKOUT_BUFFER_LONG": 1.0004,
+        "BREAKOUT_BUFFER_SHORT": 0.9996,
         "VOL_CONFIRM_MULT": 1.00,
-        "PULLBACK_LONG_EMA9_MAX": 1.0015,
-        "PULLBACK_SHORT_EMA9_MIN": 0.9985,
-        "SNIPER_LONG_RSI_RECLAIM": 48.0,
-        "SNIPER_SHORT_RSI_REJECT": 52.0,
+
+        "PULLBACK_LONG_EMA9_MAX": 1.0010,
+        "PULLBACK_SHORT_EMA9_MIN": 0.9990,
+
+        "SAME_ZONE_REENTRY_PCT": 0.0018,
     },
 }
 
-# ============================================================
+# =========================
 # STATE
-# ============================================================
+# =========================
 STATE = {
     key: {
         "IN_TRADE": False,
@@ -140,59 +141,40 @@ STATE = {
         "CONFIDENCE_LABEL": None,
         "LAST_TRAIL_SENT_SL": 0.0,
         "DATA_SOURCE": "UNKNOWN",
-        "LAST_DATA_FAIL_ALERT_TS": 0.0,
+        "LAST_ENTRY_PRICE": 0.0,
+        "LAST_ENTRY_SIDE": None,
         "LAST_KNOWN_PRICE": None,
-        "LAST_KNOWN_RSI": None,
-        "LAST_KNOWN_TREND": "UNKNOWN",
-        "LAST_KNOWN_LONG_SCORE": None,
-        "LAST_KNOWN_SHORT_SCORE": None,
-        "LAST_HTF_BIAS": "UNKNOWN",
     }
     for key in ASSETS
 }
 
-# ============================================================
+# =========================
 # TELEGRAM
-# ============================================================
-def send(msg: str) -> None:
+# =========================
+def send(msg: str):
     print(msg)
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("TELEGRAM NOT SET")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    for attempt in range(5):
+    for _ in range(5):
         try:
             response = requests.post(
-                url,
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": CHAT_ID, "text": msg},
                 timeout=10,
             )
-
             if response.status_code == 200:
                 return
-
             print("TELEGRAM FAIL:", response.status_code, response.text)
-
         except Exception as e:
             print("TELEGRAM ERROR:", e)
-
         time.sleep(2)
 
-# ============================================================
-# DATA HELPERS
-# ============================================================
-def td_interval(interval: str) -> str:
-    mapping = {
-        "1m": "1min",
-        "5m": "5min",
-        "15m": "15min",
-    }
-    return mapping[interval]
-
-
+# =========================
+# DATA
+# =========================
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -200,43 +182,39 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).lower() for c in df.columns]
 
-    needed = ["open", "high", "low", "close", "volume"]
-
-    for col in ["open", "high", "low", "close"]:
-        if col not in df.columns:
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
             return pd.DataFrame()
 
     if "volume" not in df.columns:
         df["volume"] = 1.0
 
-    df = df[needed].copy()
+    df = df[["open", "high", "low", "close", "volume"]].copy()
 
-    for col in needed:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df.dropna(inplace=True)
-    df.reset_index(drop=True, inplace=True)
-
-    return df
+    return df.reset_index(drop=True)
 
 
 def get_binance_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
     for _ in range(3):
         try:
-            response = requests.get(
+            r = requests.get(
                 "https://api.binance.com/api/v3/klines",
                 params={"symbol": symbol, "interval": interval, "limit": limit},
                 timeout=10,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
 
-            if response.status_code != 200:
+            if r.status_code != 200:
                 time.sleep(1)
                 continue
 
-            data = response.json()
+            data = r.json()
 
-            if not isinstance(data, list) or len(data) < 50:
+            if not isinstance(data, list) or len(data) < 60:
                 time.sleep(1)
                 continue
 
@@ -260,66 +238,19 @@ def get_binance_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataF
 
             df = normalize_df(df)
 
-            if len(df) >= 50:
+            if len(df) >= 60:
                 return df
 
         except Exception as e:
-            if DEBUG_MODE:
-                print("BINANCE ERROR:", e)
+            print("BINANCE ERROR:", e)
             time.sleep(1)
-
-    return pd.DataFrame()
-
-
-def get_twelvedata_klines(symbol: str, interval: str, outputsize: int = 500) -> pd.DataFrame:
-    try:
-        if not TWELVEDATA_API_KEY or not symbol:
-            return pd.DataFrame()
-
-        response = requests.get(
-            "https://api.twelvedata.com/time_series",
-            params={
-                "symbol": symbol,
-                "interval": td_interval(interval),
-                "apikey": TWELVEDATA_API_KEY,
-                "outputsize": outputsize,
-                "format": "JSON",
-            },
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-
-        data = response.json()
-
-        if not isinstance(data, dict) or "values" not in data:
-            return pd.DataFrame()
-
-        values = data["values"]
-
-        if not isinstance(values, list) or len(values) < 50:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(values)
-        df = df.iloc[::-1].reset_index(drop=True)
-        df = normalize_df(df)
-
-        if len(df) >= 50:
-            return df
-
-    except Exception as e:
-        if DEBUG_MODE:
-            print("TWELVEDATA ERROR:", e)
 
     return pd.DataFrame()
 
 
 def get_yfinance_klines(symbol: str, interval: str) -> pd.DataFrame:
     try:
-        period = {
-            "1m": "7d",
-            "5m": "30d",
-            "15m": "60d",
-        }[interval]
+        period = {"1m": "7d", "5m": "30d", "15m": "60d"}[interval]
 
         df = yf.download(
             symbol,
@@ -337,29 +268,28 @@ def get_yfinance_klines(symbol: str, interval: str) -> pd.DataFrame:
 
         df = normalize_df(df)
 
-        if len(df) >= 50:
+        if len(df) >= 60:
             return df
 
     except Exception as e:
-        if DEBUG_MODE:
-            print("YFINANCE ERROR:", e)
+        print("YFINANCE ERROR:", e)
 
     return pd.DataFrame()
 
 
 def get_coingecko_btc() -> pd.DataFrame:
     try:
-        response = requests.get(
+        r = requests.get(
             "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
             params={"vs_currency": "usd", "days": "1"},
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0"},
         )
 
-        data = response.json()
+        data = r.json()
         prices = data.get("prices", [])
 
-        if len(prices) < 50:
+        if len(prices) < 60:
             return pd.DataFrame()
 
         df = pd.DataFrame(prices, columns=["time", "close"])
@@ -371,8 +301,7 @@ def get_coingecko_btc() -> pd.DataFrame:
         return normalize_df(df)
 
     except Exception as e:
-        if DEBUG_MODE:
-            print("COINGECKO ERROR:", e)
+        print("COINGECKO ERROR:", e)
 
     return pd.DataFrame()
 
@@ -385,36 +314,25 @@ def get_klines(asset_key: str, interval: str):
         if not df.empty:
             return df, "BINANCE"
 
+        df = get_yfinance_klines(asset["yf_symbol"], interval)
+        if not df.empty:
+            return df, "YFINANCE"
+
         df = get_coingecko_btc()
         if not df.empty:
             return df, "COINGECKO"
 
-        df = get_yfinance_klines(asset["yf_symbol"], interval)
-        if not df.empty:
-            return df, "YFINANCE"
-
-        df = get_twelvedata_klines(asset["td_symbol"], interval)
-        if not df.empty:
-            return df, "TWELVEDATA"
-
         return pd.DataFrame(), "NONE"
 
-    if asset_key == "GOLD":
-        df = get_twelvedata_klines(asset["td_symbol"], interval)
-        if not df.empty:
-            return df, "TWELVEDATA"
-
-        df = get_yfinance_klines(asset["yf_symbol"], interval)
-        if not df.empty:
-            return df, "YFINANCE"
-
-        return pd.DataFrame(), "NONE"
+    df = get_yfinance_klines(asset["yf_symbol"], interval)
+    if not df.empty:
+        return df, "YFINANCE"
 
     return pd.DataFrame(), "NONE"
 
-# ============================================================
+# =========================
 # INDICATORS
-# ============================================================
+# =========================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 60:
         return pd.DataFrame()
@@ -428,11 +346,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     delta = out["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
-
     rs = gain / loss.replace(0, pd.NA)
     out["rsi"] = 100 - (100 / (1 + rs))
 
-    true_range = pd.concat(
+    tr = pd.concat(
         [
             out["high"] - out["low"],
             (out["high"] - out["close"].shift()).abs(),
@@ -441,20 +358,19 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     ).max(axis=1)
 
-    out["atr"] = true_range.rolling(14).mean()
+    out["atr"] = tr.rolling(14).mean()
     out["vol_ma"] = out["volume"].rolling(20).mean()
     out["hh10"] = out["high"].rolling(10).max().shift(1)
     out["ll10"] = out["low"].rolling(10).min().shift(1)
     out["body"] = (out["close"] - out["open"]).abs()
+    out["one_candle_move"] = (out["close"] - out["close"].shift(1)).abs()
 
     out.dropna(inplace=True)
-    out.reset_index(drop=True, inplace=True)
+    return out.reset_index(drop=True)
 
-    return out
-
-# ============================================================
-# TREND / MARKET FILTERS
-# ============================================================
+# =========================
+# TREND
+# =========================
 def market_trend(df1: pd.DataFrame, df5: pd.DataFrame) -> str:
     r1 = df1.iloc[-1]
     r5 = df5.iloc[-1]
@@ -468,7 +384,7 @@ def market_trend(df1: pd.DataFrame, df5: pd.DataFrame) -> str:
     return "CHOPPY"
 
 
-def higher_timeframe_bias(df15: pd.DataFrame) -> str:
+def htf_bias(df15: pd.DataFrame) -> str:
     r = df15.iloc[-1]
 
     if r["ema9"] > r["ema21"] > r["ema50"]:
@@ -485,19 +401,21 @@ def higher_timeframe_bias(df15: pd.DataFrame) -> str:
 
     return "NEUTRAL"
 
-
+# =========================
+# ANTI-CHASE FILTERS
+# =========================
 def has_enough_volatility(asset_key: str, price: float, atr_now: float) -> bool:
-    cfg = ASSET_CONFIG[asset_key]
-    return (atr_now / max(price, 1.0)) >= cfg["MIN_VOLATILITY_PCT"]
+    return (atr_now / max(price, 1.0)) >= ASSET_CONFIG[asset_key]["MIN_VOLATILITY_PCT"]
 
 
-def not_too_extended(asset_key: str, price: float, ema9_value: float) -> bool:
+def not_too_extended(asset_key: str, df1: pd.DataFrame) -> bool:
     cfg = ASSET_CONFIG[asset_key]
-    distance = abs(price - ema9_value) / max(price, 1.0)
+    r = df1.iloc[-1]
+    distance = abs(float(r["close"]) - float(r["ema9"])) / max(float(r["close"]), 1.0)
     return distance <= cfg["MAX_EMA9_DISTANCE_PCT"]
 
 
-def clean_candle(asset_key: str, df1: pd.DataFrame) -> bool:
+def no_big_candle(asset_key: str, df1: pd.DataFrame) -> bool:
     cfg = ASSET_CONFIG[asset_key]
     r = df1.iloc[-1]
 
@@ -507,37 +425,59 @@ def clean_candle(asset_key: str, df1: pd.DataFrame) -> bool:
     if float(r["body"]) > float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]:
         return False
 
+    if float(r["one_candle_move"]) > float(r["atr"]) * cfg["MAX_ONE_CANDLE_ATR_MULT"]:
+        return False
+
     return True
+
+
+def not_same_reentry_zone(asset_key: str, side: str, price: float) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
+    state = STATE[asset_key]
+    last_price = float(state["LAST_ENTRY_PRICE"] or 0.0)
+    last_side = state["LAST_ENTRY_SIDE"]
+
+    if last_price <= 0 or last_side != side:
+        return True
+
+    distance = abs(price - last_price) / max(price, 1.0)
+    return distance >= cfg["SAME_ZONE_REENTRY_PCT"]
 
 
 def long_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
     cfg = ASSET_CONFIG[asset_key]
     r = df1.iloc[-1]
 
-    if float(r["rsi"]) > cfg["LONG_RSI_MAX"]:
+    if not (cfg["LONG_RSI_MIN"] <= float(r["rsi"]) <= cfg["LONG_RSI_MAX"]):
         return False
 
-    if not not_too_extended(asset_key, float(r["close"]), float(r["ema9"])):
+    if not not_too_extended(asset_key, df1):
         return False
 
-    return clean_candle(asset_key, df1)
+    if not no_big_candle(asset_key, df1):
+        return False
+
+    return True
 
 
 def short_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
     cfg = ASSET_CONFIG[asset_key]
     r = df1.iloc[-1]
 
-    if float(r["rsi"]) < cfg["SHORT_RSI_MIN"]:
+    if not (cfg["SHORT_RSI_MIN"] <= float(r["rsi"]) <= cfg["SHORT_RSI_MAX"]):
         return False
 
-    if not not_too_extended(asset_key, float(r["close"]), float(r["ema9"])):
+    if not not_too_extended(asset_key, df1):
         return False
 
-    return clean_candle(asset_key, df1)
+    if not no_big_candle(asset_key, df1):
+        return False
 
-# ============================================================
+    return True
+
+# =========================
 # ENTRY TYPES
-# ============================================================
+# =========================
 def breakout_long(asset_key: str, df1: pd.DataFrame) -> bool:
     cfg = ASSET_CONFIG[asset_key]
     r = df1.iloc[-1]
@@ -561,36 +501,6 @@ def breakout_short(asset_key: str, df1: pd.DataFrame) -> bool:
         and r["close"] < p["low"]
         and r["close"] < r["ema9"]
         and r["volume"] >= r["vol_ma"] * cfg["VOL_CONFIRM_MULT"]
-    )
-
-
-def sniper_long(asset_key: str, df1: pd.DataFrame) -> bool:
-    cfg = ASSET_CONFIG[asset_key]
-    r = df1.iloc[-1]
-    p = df1.iloc[-2]
-    p2 = df1.iloc[-3]
-
-    return bool(
-        p["close"] < p["ema9"]
-        and r["close"] > r["ema9"]
-        and p["rsi"] < cfg["SNIPER_LONG_RSI_RECLAIM"]
-        and r["rsi"] > 50
-        and r["low"] > p2["low"]
-    )
-
-
-def sniper_short(asset_key: str, df1: pd.DataFrame) -> bool:
-    cfg = ASSET_CONFIG[asset_key]
-    r = df1.iloc[-1]
-    p = df1.iloc[-2]
-    p2 = df1.iloc[-3]
-
-    return bool(
-        p["close"] > p["ema9"]
-        and r["close"] < r["ema9"]
-        and p["rsi"] > cfg["SNIPER_SHORT_RSI_REJECT"]
-        and r["rsi"] < 50
-        and r["high"] < p2["high"]
     )
 
 
@@ -618,6 +528,34 @@ def pullback_short(asset_key: str, df1: pd.DataFrame) -> bool:
     )
 
 
+def sniper_long(asset_key: str, df1: pd.DataFrame) -> bool:
+    r = df1.iloc[-1]
+    p = df1.iloc[-2]
+    p2 = df1.iloc[-3]
+
+    return bool(
+        p["close"] < p["ema9"]
+        and r["close"] > r["ema9"]
+        and p["rsi"] < 48
+        and r["rsi"] > 50
+        and r["low"] > p2["low"]
+    )
+
+
+def sniper_short(asset_key: str, df1: pd.DataFrame) -> bool:
+    r = df1.iloc[-1]
+    p = df1.iloc[-2]
+    p2 = df1.iloc[-3]
+
+    return bool(
+        p["close"] > p["ema9"]
+        and r["close"] < r["ema9"]
+        and p["rsi"] > 52
+        and r["rsi"] < 50
+        and r["high"] < p2["high"]
+    )
+
+
 def confirm_long(df1: pd.DataFrame) -> bool:
     r = df1.iloc[-1]
     p = df1.iloc[-2]
@@ -629,16 +567,16 @@ def confirm_short(df1: pd.DataFrame) -> bool:
     p = df1.iloc[-2]
     return bool(r["close"] < p["close"] and r["close"] < r["ema9"])
 
-# ============================================================
+# =========================
 # SCORING
-# ============================================================
+# =========================
 def score_long(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.DataFrame):
     r = df1.iloc[-1]
     score = 0
     reasons = []
 
     trend = market_trend(df1, df5)
-    htf = higher_timeframe_bias(df15)
+    htf = htf_bias(df15)
 
     if trend == "BULLISH":
         score += 25
@@ -658,12 +596,9 @@ def score_long(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.Da
         score += 15
         reasons.append("EMA aligned")
 
-    if 50 < r["rsi"] < 68:
+    if ASSET_CONFIG[asset_key]["LONG_RSI_MIN"] <= r["rsi"] <= ASSET_CONFIG[asset_key]["LONG_RSI_MAX"]:
         score += 15
         reasons.append("healthy RSI")
-    elif 48 < r["rsi"] < 72:
-        score += 8
-        reasons.append("acceptable RSI")
 
     if r["volume"] >= r["vol_ma"]:
         score += 8
@@ -681,6 +616,10 @@ def score_long(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.Da
         score += 10
         reasons.append("pullback")
 
+    if not no_big_candle(asset_key, df1):
+        score -= 20
+        reasons.append("impulse blocked")
+
     return max(0, min(int(score), 100)), reasons
 
 
@@ -690,7 +629,7 @@ def score_short(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.D
     reasons = []
 
     trend = market_trend(df1, df5)
-    htf = higher_timeframe_bias(df15)
+    htf = htf_bias(df15)
 
     if trend == "BEARISH":
         score += 25
@@ -710,12 +649,9 @@ def score_short(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.D
         score += 15
         reasons.append("EMA aligned")
 
-    if 32 < r["rsi"] < 50:
+    if ASSET_CONFIG[asset_key]["SHORT_RSI_MIN"] <= r["rsi"] <= ASSET_CONFIG[asset_key]["SHORT_RSI_MAX"]:
         score += 15
         reasons.append("healthy short RSI")
-    elif 28 < r["rsi"] < 54:
-        score += 8
-        reasons.append("acceptable short RSI")
 
     if r["volume"] >= r["vol_ma"]:
         score += 8
@@ -733,6 +669,10 @@ def score_short(asset_key: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.D
         score += 10
         reasons.append("pullback")
 
+    if not no_big_candle(asset_key, df1):
+        score -= 20
+        reasons.append("impulse blocked")
+
     return max(0, min(int(score), 100)), reasons
 
 
@@ -749,30 +689,13 @@ def confidence_grade(score: int) -> str:
         return "B"
     return "C"
 
-# ============================================================
+# =========================
 # SIGNAL ENGINE
-# ============================================================
-def maybe_alert_data_fail(asset_key: str, src1: str, src5: str, src15: str) -> None:
-    state = STATE[asset_key]
-    now = time.time()
-
-    if src1 == "NONE" and src5 == "NONE" and src15 == "NONE":
-        if now - state["LAST_DATA_FAIL_ALERT_TS"] >= DATA_FAIL_ALERT_COOLDOWN:
-            send(
-                f"â ï¸ {ASSETS[asset_key]['name']} DATA FEED FAIL\n"
-                f"1m: {src1}\n"
-                f"5m: {src5}\n"
-                f"15m: {src15}"
-            )
-            state["LAST_DATA_FAIL_ALERT_TS"] = now
-
-
+# =========================
 def get_signal(asset_key: str):
     df1_raw, src1 = get_klines(asset_key, "1m")
     df5_raw, src5 = get_klines(asset_key, "5m")
     df15_raw, src15 = get_klines(asset_key, "15m")
-
-    maybe_alert_data_fail(asset_key, src1, src5, src15)
 
     df1 = add_indicators(df1_raw)
     df5 = add_indicators(df5_raw)
@@ -801,26 +724,26 @@ def get_signal(asset_key: str):
         "df5": df5,
         "df15": df15,
         "trend": market_trend(df1, df5),
-        "htf": higher_timeframe_bias(df15),
+        "htf": htf_bias(df15),
         "long_score": ls,
         "short_score": ss,
         "long_reasons": lr,
         "short_reasons": sr,
         "long_breakout": breakout_long(asset_key, df1),
         "short_breakout": breakout_short(asset_key, df1),
-        "long_sniper": sniper_long(asset_key, df1),
-        "short_sniper": sniper_short(asset_key, df1),
         "long_pullback": pullback_long(asset_key, df1),
         "short_pullback": pullback_short(asset_key, df1),
+        "long_sniper": sniper_long(asset_key, df1),
+        "short_sniper": sniper_short(asset_key, df1),
         "confirm_long": confirm_long(df1),
         "confirm_short": confirm_short(df1),
         "feed": feed,
     }, feed
 
-# ============================================================
+# =========================
 # HEARTBEAT
-# ============================================================
-def heartbeat(asset_key: str, sig, feed: str) -> None:
+# =========================
+def heartbeat(asset_key: str, sig, feed: str):
     state = STATE[asset_key]
     now = time.time()
     name = ASSETS[asset_key]["name"]
@@ -837,14 +760,6 @@ def heartbeat(asset_key: str, sig, feed: str) -> None:
         )
     else:
         r = sig["df1"].iloc[-1]
-        state["DATA_SOURCE"] = sig["feed"]
-        state["LAST_KNOWN_PRICE"] = sig["price"]
-        state["LAST_KNOWN_RSI"] = float(r["rsi"])
-        state["LAST_KNOWN_TREND"] = sig["trend"]
-        state["LAST_KNOWN_LONG_SCORE"] = sig["long_score"]
-        state["LAST_KNOWN_SHORT_SCORE"] = sig["short_score"]
-        state["LAST_HTF_BIAS"] = sig["htf"]
-
         send(
             f"ð {name} HEARTBEAT\n\n"
             f"Price: ${sig['price']:.2f}\n"
@@ -858,14 +773,14 @@ def heartbeat(asset_key: str, sig, feed: str) -> None:
 
     state["LAST_HEARTBEAT_TS"] = now
 
-# ============================================================
-# TRADE HELPERS
-# ============================================================
+# =========================
+# TRADE MANAGEMENT
+# =========================
 def entry_size_label(score: int) -> str:
     return "FULL" if score >= FULL_SIZE_SCORE else "SNIPER"
 
 
-def reset_trade(asset_key: str) -> None:
+def reset_trade(asset_key: str):
     state = STATE[asset_key]
     state["IN_TRADE"] = False
     state["TRADE_SIDE"] = None
@@ -885,24 +800,26 @@ def reset_trade(asset_key: str) -> None:
     state["LAST_TRAIL_SENT_SL"] = 0.0
 
 
-def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: list, price: float, atr_now: float) -> None:
+def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: list, price: float, atr_now: float):
     state = STATE[asset_key]
-    name = ASSETS[asset_key]["name"]
     cfg = ASSET_CONFIG[asset_key]
+    name = ASSETS[asset_key]["name"]
 
+    state["IN_TRADE"] = True
+    state["TRADE_SIDE"] = side
     state["ENTRY_PRICE"] = price
     state["AVG_ENTRY_PRICE"] = price
     state["HIGHEST_PRICE"] = price
     state["LOWEST_PRICE"] = price
-    state["TRADE_SIDE"] = side
-    state["IN_TRADE"] = True
     state["SCALE_COUNT"] = 1
     state["LAST_SCALE_TIME"] = time.time()
     state["ENTRY_TYPE"] = trigger
     state["CONFIDENCE_LABEL"] = confidence_grade(score)
-    state["LAST_TRAIL_SENT_SL"] = 0.0
     state["PARTIAL_SENT"] = False
     state["BREAK_EVEN_ACTIVE"] = False
+    state["LAST_TRAIL_SENT_SL"] = 0.0
+    state["LAST_ENTRY_PRICE"] = price
+    state["LAST_ENTRY_SIDE"] = side
 
     if side == "LONG":
         state["STOP_LOSS"] = price - atr_now * cfg["ATR_SL_MULT"]
@@ -926,10 +843,8 @@ def start_trade(asset_key: str, side: str, trigger: str, score: int, reasons: li
         f"TP: ${state['TAKE_PROFIT']:.2f}"
     )
 
-# ============================================================
-# SCALE-IN / TRAIL / MANAGEMENT
-# ============================================================
-def maybe_scale_in(asset_key: str, sig: dict) -> None:
+
+def maybe_scale_in(asset_key: str, sig: dict):
     state = STATE[asset_key]
     cfg = ASSET_CONFIG[asset_key]
     name = ASSETS[asset_key]["name"]
@@ -950,15 +865,17 @@ def maybe_scale_in(asset_key: str, sig: dict) -> None:
         ok = (
             price >= state["AVG_ENTRY_PRICE"] + atr_now * cfg["SCALE_IN_ATR_STEP"]
             and sig["confirm_long"]
-            and sig["long_score"] >= LONG_ALERT_SCORE
+            and sig["long_score"] >= SCALE_IN_SCORE
             and long_not_chasing(asset_key, sig["df1"])
+            and not_same_reentry_zone(asset_key, "LONG", price)
         )
     else:
         ok = (
             price <= state["AVG_ENTRY_PRICE"] - atr_now * cfg["SCALE_IN_ATR_STEP"]
             and sig["confirm_short"]
-            and sig["short_score"] >= SHORT_ALERT_SCORE
+            and sig["short_score"] >= SCALE_IN_SCORE
             and short_not_chasing(asset_key, sig["df1"])
+            and not_same_reentry_zone(asset_key, "SHORT", price)
         )
 
     if not ok:
@@ -971,16 +888,14 @@ def maybe_scale_in(asset_key: str, sig: dict) -> None:
 
     send(
         f"â {name} {state['TRADE_SIDE']} SCALE-IN\n\n"
-        f"Entry type: {state['ENTRY_TYPE']}\n"
         f"New add price: ${price:.2f}\n"
         f"Old avg: ${old_avg:.2f}\n"
         f"New avg: ${state['AVG_ENTRY_PRICE']:.2f}\n"
-        f"Scale: {state['SCALE_COUNT']}/{MAX_SCALE_INS}\n"
-        f"Confidence: {state['CONFIDENCE_LABEL']}"
+        f"Scale: {state['SCALE_COUNT']}/{MAX_SCALE_INS}"
     )
 
 
-def maybe_send_trailing_update(asset_key: str, new_sl: float, atr_now: float) -> None:
+def maybe_send_trailing_update(asset_key: str, new_sl: float, atr_now: float):
     state = STATE[asset_key]
     name = ASSETS[asset_key]["name"]
     min_step = atr_now * ASSET_CONFIG[asset_key]["TRAIL_UPDATE_MIN_ATR"]
@@ -990,10 +905,10 @@ def maybe_send_trailing_update(asset_key: str, new_sl: float, atr_now: float) ->
         send(f"ð {name} {state['TRADE_SIDE']} TRAILING STOP\nNew SL: ${new_sl:.2f}")
 
 
-def manage_trade(asset_key: str, sig: dict) -> None:
+def manage_trade(asset_key: str, sig: dict):
     state = STATE[asset_key]
-    name = ASSETS[asset_key]["name"]
     cfg = ASSET_CONFIG[asset_key]
+    name = ASSETS[asset_key]["name"]
 
     price = sig["price"]
     atr_now = sig["atr"]
@@ -1005,12 +920,12 @@ def manage_trade(asset_key: str, sig: dict) -> None:
     if state["TRADE_SIDE"] == "LONG":
         state["HIGHEST_PRICE"] = max(state["HIGHEST_PRICE"], price)
 
-        if (not state["BREAK_EVEN_ACTIVE"]) and price >= entry_ref + atr_now * cfg["BREAK_EVEN_ATR_TRIGGER"]:
+        if not state["BREAK_EVEN_ACTIVE"] and price >= entry_ref + atr_now * cfg["BREAK_EVEN_ATR_TRIGGER"]:
             state["STOP_LOSS"] = max(state["STOP_LOSS"], entry_ref)
             state["BREAK_EVEN_ACTIVE"] = True
             send(f"â¡ {name} LONG BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not state["PARTIAL_SENT"]) and price >= entry_ref + atr_now * cfg["PARTIAL_ATR_TRIGGER"]:
+        if not state["PARTIAL_SENT"] and price >= entry_ref + atr_now * cfg["PARTIAL_ATR_TRIGGER"]:
             state["PARTIAL_SENT"] = True
             send(f"ð° {name} LONG PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
@@ -1033,12 +948,12 @@ def manage_trade(asset_key: str, sig: dict) -> None:
     elif state["TRADE_SIDE"] == "SHORT":
         state["LOWEST_PRICE"] = min(state["LOWEST_PRICE"], price)
 
-        if (not state["BREAK_EVEN_ACTIVE"]) and price <= entry_ref - atr_now * cfg["BREAK_EVEN_ATR_TRIGGER"]:
+        if not state["BREAK_EVEN_ACTIVE"] and price <= entry_ref - atr_now * cfg["BREAK_EVEN_ATR_TRIGGER"]:
             state["STOP_LOSS"] = min(state["STOP_LOSS"], entry_ref)
             state["BREAK_EVEN_ACTIVE"] = True
             send(f"â¡ {name} SHORT BREAK-EVEN\nNew SL: ${state['STOP_LOSS']:.2f}")
 
-        if (not state["PARTIAL_SENT"]) and price <= entry_ref - atr_now * cfg["PARTIAL_ATR_TRIGGER"]:
+        if not state["PARTIAL_SENT"] and price <= entry_ref - atr_now * cfg["PARTIAL_ATR_TRIGGER"]:
             state["PARTIAL_SENT"] = True
             send(f"ð° {name} SHORT PARTIAL PROFIT ZONE\nPrice: ${price:.2f}")
 
@@ -1058,31 +973,32 @@ def manage_trade(asset_key: str, sig: dict) -> None:
             reset_trade(asset_key)
             return
 
-# ============================================================
+# =========================
 # ENTRY DECISION
-# ============================================================
+# =========================
 def choose_triggers(sig: dict):
     long_trigger = None
     short_trigger = None
 
-    if sig["long_breakout"]:
-        long_trigger = "BREAKOUT"
+    # Pullback first to avoid buying extended breakouts late
+    if sig["long_pullback"]:
+        long_trigger = "PULLBACK"
     elif sig["long_sniper"]:
         long_trigger = "SNIPER"
-    elif sig["long_pullback"]:
-        long_trigger = "PULLBACK"
+    elif sig["long_breakout"]:
+        long_trigger = "BREAKOUT"
 
-    if sig["short_breakout"]:
-        short_trigger = "BREAKDOWN"
+    if sig["short_pullback"]:
+        short_trigger = "PULLBACK"
     elif sig["short_sniper"]:
         short_trigger = "SNIPER"
-    elif sig["short_pullback"]:
-        short_trigger = "PULLBACK"
+    elif sig["short_breakout"]:
+        short_trigger = "BREAKDOWN"
 
     return long_trigger, short_trigger
 
 
-def try_enter_trade(asset_key: str, sig: dict) -> None:
+def try_enter_trade(asset_key: str, sig: dict):
     state = STATE[asset_key]
 
     if state["IN_TRADE"]:
@@ -1102,6 +1018,7 @@ def try_enter_trade(asset_key: str, sig: dict) -> None:
         and sig["htf"] in ["BULL", "STRONG_BULL"]
         and sig["confirm_long"]
         and long_not_chasing(asset_key, sig["df1"])
+        and not_same_reentry_zone(asset_key, "LONG", sig["price"])
     ):
         start_trade(
             asset_key,
@@ -1120,6 +1037,7 @@ def try_enter_trade(asset_key: str, sig: dict) -> None:
         and sig["htf"] in ["BEAR", "STRONG_BEAR"]
         and sig["confirm_short"]
         and short_not_chasing(asset_key, sig["df1"])
+        and not_same_reentry_zone(asset_key, "SHORT", sig["price"])
     ):
         start_trade(
             asset_key,
@@ -1132,10 +1050,10 @@ def try_enter_trade(asset_key: str, sig: dict) -> None:
         )
         return
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
-def run() -> None:
+# =========================
+# MAIN
+# =========================
+def run():
     time.sleep(8)
     send("â BOT STARTING...")
     time.sleep(2)
@@ -1145,7 +1063,6 @@ def run() -> None:
         try:
             for asset_key in ASSETS:
                 sig, feed = get_signal(asset_key)
-
                 heartbeat(asset_key, sig, feed)
 
                 if DEBUG_MODE:
