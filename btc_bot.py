@@ -1,6 +1,3 @@
-# =========================
-# IMPORTS
-# =========================
 import os
 import time
 import requests
@@ -10,93 +7,62 @@ import yfinance as yf
 # =========================
 # ENV
 # =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 # =========================
 # CONFIG
 # =========================
 CHECK_INTERVAL = 60
-HEARTBEAT_SECONDS = 1800
-COOLDOWN_SECONDS = 600
-DEBUG_MODE = True
-
-MIN_SCORE = 70
-FULL_SCORE = 85
+HEARTBEAT = 1800
+COOLDOWN = 600
 
 # =========================
 # ASSETS
 # =========================
 ASSETS = {
-    "BTC": {
-        "name": "BTC",
-        "binance": "BTCUSDT",
-        "yf": "BTC-USD",
-    },
-    "GOLD": {
-        "name": "GOLD",
-        "yf": "GC=F",
-        "td": "XAU/USD",
-    },
-}
-
-# =========================
-# CONFIG PER ASSET
-# =========================
-CFG = {
-    "BTC": {"SL": 2.6, "TP": 5.2},
-    "GOLD": {"SL": 1.6, "TP": 3.2},
+    "BTC": {"binance": "BTCUSDT", "yf": "BTC-USD"},
+    "GOLD": {"yf": "GC=F"}
 }
 
 # =========================
 # STATE
 # =========================
 STATE = {
-    k: {
-        "IN_TRADE": False,
-        "SIDE": None,
-        "ENTRY": 0,
-        "SL": 0,
-        "TP": 0,
-        "LAST_HEARTBEAT": 0,
-        "LAST_TRADE": 0,
-    } for k in ASSETS
+    a: {"trade": False, "last": 0, "hb": 0}
+    for a in ASSETS
 }
 
 # =========================
-# TELEGRAM (BULLETPROOF)
+# TELEGRAM
 # =========================
 def send(msg):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print(msg)
+    print(msg)
+    if not TOKEN or not CHAT_ID:
         return
-
     for _ in range(5):
         try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
                 json={"chat_id": CHAT_ID, "text": msg},
                 timeout=10,
             )
-            if r.status_code == 200:
-                return
+            return
         except:
-            pass
-        time.sleep(2)
+            time.sleep(2)
 
 # =========================
-# DATA FEEDS
+# DATA
 # =========================
 def get_binance(symbol):
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": "1m", "limit": 500},
+            params={"symbol": symbol, "interval": "1m", "limit": 200},
             timeout=10,
         )
-        data = r.json()
-        df = pd.DataFrame(data)[[1,2,3,4,5]]
+        d = r.json()
+        df = pd.DataFrame(d)[[1,2,3,4,5]]
         df.columns = ["open","high","low","close","volume"]
         return df.astype(float)
     except:
@@ -104,7 +70,7 @@ def get_binance(symbol):
 
 def get_yf(symbol):
     try:
-        df = yf.download(symbol, period="7d", interval="1m", progress=False)
+        df = yf.download(symbol, period="5d", interval="1m", progress=False)
         df.columns = [c.lower() for c in df.columns]
         return df[["open","high","low","close","volume"]]
     except:
@@ -112,148 +78,108 @@ def get_yf(symbol):
 
 def get_data(asset):
     if asset == "BTC":
-        df = get_binance(ASSETS["BTC"]["binance"])
+        df = get_binance("BTCUSDT")
         if not df.empty:
-            return df, "BINANCE"
+            return df
 
-    df = get_yf(ASSETS[asset]["yf"])
-    if not df.empty:
-        return df, "YFINANCE"
-
-    return pd.DataFrame(), "NONE"
+    return get_yf(ASSETS[asset]["yf"])
 
 # =========================
 # INDICATORS
 # =========================
-def add_indicators(df):
-    if df.empty or len(df) < 50:
-        return pd.DataFrame()
+def indicators(df):
+    if len(df) < 50:
+        return None
 
     df["ema9"] = df["close"].ewm(span=9).mean()
     df["ema21"] = df["close"].ewm(span=21).mean()
-    df["ema50"] = df["close"].ewm(span=50).mean()
+
     df["rsi"] = df["close"].pct_change().rolling(14).mean() * 100
     df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
+
     df["hh"] = df["high"].rolling(10).max().shift(1)
     df["ll"] = df["low"].rolling(10).min().shift(1)
+
     df.dropna(inplace=True)
     return df
 
 # =========================
-# TREND
+# SIGNAL LOGIC
 # =========================
-def trend(df):
-    r = df.iloc[-1]
-    if r["ema9"] > r["ema21"]:
-        return "BULL"
-    if r["ema9"] < r["ema21"]:
-        return "BEAR"
-    return "CHOP"
+def signal(asset):
+    df = get_data(asset)
+    df = indicators(df)
 
-# =========================
-# SIGNAL
-# =========================
-def get_signal(asset):
-    df, feed = get_data(asset)
-    df = add_indicators(df)
-
-    if df.empty:
-        return None, feed
+    if df is None:
+        return None
 
     r = df.iloc[-1]
-    t = trend(df)
 
-    long = (
-        t == "BULL"
-        and r["close"] > r["hh"]
-        and r["rsi"] < 70
-    )
+    trend = "BULL" if r["ema9"] > r["ema21"] else "BEAR"
 
-    short = (
-        t == "BEAR"
-        and r["close"] < r["ll"]
-        and r["rsi"] > 30
-    )
+    breakout_long = r["close"] > r["hh"]
+    breakout_short = r["close"] < r["ll"]
 
-    return {
-        "price": r["close"],
-        "atr": r["atr"],
-        "trend": t,
-        "long": long,
-        "short": short,
-    }, feed
+    sniper_long = r["close"] > r["ema9"] and r["rsi"] > 50
+    sniper_short = r["close"] < r["ema9"] and r["rsi"] < 50
 
-# =========================
-# HEARTBEAT
-# =========================
-def heartbeat(asset, sig, feed):
-    s = STATE[asset]
+    if trend == "BULL" and (breakout_long or sniper_long):
+        return {"side": "LONG", "price": r["close"], "atr": r["atr"]}
 
-    if time.time() - s["LAST_HEARTBEAT"] < HEARTBEAT_SECONDS:
-        return
+    if trend == "BEAR" and (breakout_short or sniper_short):
+        return {"side": "SHORT", "price": r["close"], "atr": r["atr"]}
 
-    if sig:
-        send(f"💓 {asset} | {sig['trend']} | {sig['price']:.2f}")
-    else:
-        send(f"💓 {asset} | NO DATA")
-
-    s["LAST_HEARTBEAT"] = time.time()
+    return None
 
 # =========================
 # TRADE
 # =========================
-def start_trade(asset, side, sig):
-    s = STATE[asset]
-    cfg = CFG[asset]
-
+def trade(asset, sig):
     price = sig["price"]
     atr = sig["atr"]
 
-    if side == "LONG":
-        sl = price - atr * cfg["SL"]
-        tp = price + atr * cfg["TP"]
+    if sig["side"] == "LONG":
+        sl = price - atr * 2.5
+        tp = price + atr * 5
     else:
-        sl = price + atr * cfg["SL"]
-        tp = price - atr * cfg["TP"]
+        sl = price + atr * 2.5
+        tp = price - atr * 5
 
-    s.update({
-        "IN_TRADE": True,
-        "SIDE": side,
-        "ENTRY": price,
-        "SL": sl,
-        "TP": tp,
-        "LAST_TRADE": time.time(),
-    })
+    send(f"{asset} {sig['side']}\nEntry:{price:.2f}\nSL:{sl:.2f}\nTP:{tp:.2f}")
 
-    send(f"{asset} {side}\nEntry:{price:.2f}\nSL:{sl:.2f}\nTP:{tp:.2f}")
+# =========================
+# HEARTBEAT
+# =========================
+def heartbeat(asset):
+    s = STATE[asset]
+    if time.time() - s["hb"] < HEARTBEAT:
+        return
+    send(f"💓 {asset} ALIVE")
+    s["hb"] = time.time()
 
 # =========================
 # MAIN
 # =========================
 def run():
-    time.sleep(5)
+    time.sleep(8)
     send("🔥 BTC + GOLD BOT LIVE 🔥")
 
     while True:
         try:
-            for asset in ASSETS:
-                sig, feed = get_signal(asset)
+            for a in ASSETS:
+                heartbeat(a)
 
-                heartbeat(asset, sig, feed)
-
-                if sig is None:
+                if STATE[a]["trade"]:
                     continue
 
-                if STATE[asset]["IN_TRADE"]:
+                if time.time() - STATE[a]["last"] < COOLDOWN:
                     continue
 
-                if time.time() - STATE[asset]["LAST_TRADE"] < COOLDOWN_SECONDS:
-                    continue
+                sig = signal(a)
 
-                if sig["long"]:
-                    start_trade(asset, "LONG", sig)
-                elif sig["short"]:
-                    start_trade(asset, "SHORT", sig)
+                if sig:
+                    trade(a, sig)
+                    STATE[a]["last"] = time.time()
 
             time.sleep(CHECK_INTERVAL)
 
