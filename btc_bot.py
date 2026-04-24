@@ -1,3 +1,6 @@
+# =========================
+# IMPORTS
+# =========================
 import os
 import time
 import requests
@@ -9,6 +12,7 @@ import yfinance as yf
 # =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 # =========================
 # CONFIG
@@ -18,33 +22,31 @@ HEARTBEAT_SECONDS = 1800
 COOLDOWN_SECONDS = 600
 DEBUG_MODE = True
 
-MIN_SCORE = 75
+MIN_SCORE = 70
 FULL_SCORE = 85
 
 # =========================
 # ASSETS
 # =========================
 ASSETS = {
-    "BTC": {"binance": "BTCUSDT", "yf": "BTC-USD"},
-    "GOLD": {"yf": "GC=F"},
+    "BTC": {
+        "name": "BTC",
+        "binance": "BTCUSDT",
+        "yf": "BTC-USD",
+    },
+    "GOLD": {
+        "name": "GOLD",
+        "yf": "GC=F",
+        "td": "XAU/USD",
+    },
 }
 
 # =========================
-# CONFIG
+# CONFIG PER ASSET
 # =========================
 CFG = {
-    "BTC": {
-        "SL": 2.8, "TP": 5.5,
-        "RSI_L": 68, "RSI_S": 32,
-        "BREAK_L": 1.001, "BREAK_S": 0.999,
-        "PULL_L": 1.0015, "PULL_S": 0.9985,
-    },
-    "GOLD": {
-        "SL": 1.8, "TP": 3.8,
-        "RSI_L": 65, "RSI_S": 35,
-        "BREAK_L": 1.0005, "BREAK_S": 0.9995,
-        "PULL_L": 1.0012, "PULL_S": 0.9988,
-    },
+    "BTC": {"SL": 2.6, "TP": 5.2},
+    "GOLD": {"SL": 1.6, "TP": 3.2},
 }
 
 # =========================
@@ -63,14 +65,14 @@ STATE = {
 }
 
 # =========================
-# TELEGRAM (FIXED)
+# TELEGRAM (BULLETPROOF)
 # =========================
 def send(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ TELEGRAM:", msg)
+        print(msg)
         return
 
-    for _ in range(3):
+    for _ in range(5):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -79,31 +81,30 @@ def send(msg):
             )
             if r.status_code == 200:
                 return
-            else:
-                print("Telegram fail:", r.text)
-        except Exception as e:
-            print("Telegram error:", e)
+        except:
+            pass
         time.sleep(2)
 
 # =========================
-# DATA
+# DATA FEEDS
 # =========================
 def get_binance(symbol):
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": "1m", "limit": 200},
+            params={"symbol": symbol, "interval": "1m", "limit": 500},
             timeout=10,
         )
-        df = pd.DataFrame(r.json())[[1,2,3,4,5]]
+        data = r.json()
+        df = pd.DataFrame(data)[[1,2,3,4,5]]
         df.columns = ["open","high","low","close","volume"]
         return df.astype(float)
     except:
         return pd.DataFrame()
 
-def get_yf(ticker):
+def get_yf(symbol):
     try:
-        df = yf.download(ticker, period="7d", interval="1m", progress=False)
+        df = yf.download(symbol, period="7d", interval="1m", progress=False)
         df.columns = [c.lower() for c in df.columns]
         return df[["open","high","low","close","volume"]]
     except:
@@ -130,12 +131,24 @@ def add_indicators(df):
 
     df["ema9"] = df["close"].ewm(span=9).mean()
     df["ema21"] = df["close"].ewm(span=21).mean()
+    df["ema50"] = df["close"].ewm(span=50).mean()
     df["rsi"] = df["close"].pct_change().rolling(14).mean() * 100
     df["atr"] = (df["high"] - df["low"]).rolling(14).mean()
     df["hh"] = df["high"].rolling(10).max().shift(1)
     df["ll"] = df["low"].rolling(10).min().shift(1)
     df.dropna(inplace=True)
     return df
+
+# =========================
+# TREND
+# =========================
+def trend(df):
+    r = df.iloc[-1]
+    if r["ema9"] > r["ema21"]:
+        return "BULL"
+    if r["ema9"] < r["ema21"]:
+        return "BEAR"
+    return "CHOP"
 
 # =========================
 # SIGNAL
@@ -148,44 +161,26 @@ def get_signal(asset):
         return None, feed
 
     r = df.iloc[-1]
+    t = trend(df)
 
-    trend = "BULLISH" if r["ema9"] > r["ema21"] else "BEARISH"
+    long = (
+        t == "BULL"
+        and r["close"] > r["hh"]
+        and r["rsi"] < 70
+    )
 
-    long_score = 0
-    short_score = 0
-
-    if trend == "BULLISH":
-        long_score += 30
-    if trend == "BEARISH":
-        short_score += 30
-
-    if r["close"] > r["ema9"]:
-        long_score += 20
-    else:
-        short_score += 20
-
-    if 50 < r["rsi"] < CFG[asset]["RSI_L"]:
-        long_score += 20
-
-    if CFG[asset]["RSI_S"] < r["rsi"] < 50:
-        short_score += 20
-
-    breakout_long = r["close"] > r["hh"] * CFG[asset]["BREAK_L"]
-    breakout_short = r["close"] < r["ll"] * CFG[asset]["BREAK_S"]
-
-    pullback_long = r["close"] <= r["ema9"] * CFG[asset]["PULL_L"]
-    pullback_short = r["close"] >= r["ema9"] * CFG[asset]["PULL_S"]
+    short = (
+        t == "BEAR"
+        and r["close"] < r["ll"]
+        and r["rsi"] > 30
+    )
 
     return {
         "price": r["close"],
         "atr": r["atr"],
-        "trend": trend,
-        "long_score": long_score,
-        "short_score": short_score,
-        "long_break": breakout_long,
-        "short_break": breakout_short,
-        "long_pull": pullback_long,
-        "short_pull": pullback_short,
+        "trend": t,
+        "long": long,
+        "short": short,
     }, feed
 
 # =========================
@@ -197,15 +192,10 @@ def heartbeat(asset, sig, feed):
     if time.time() - s["LAST_HEARTBEAT"] < HEARTBEAT_SECONDS:
         return
 
-    if sig is None:
-        send(f"💓 {asset} HEARTBEAT\nNO DATA\nFeed:{feed}")
+    if sig:
+        send(f"💓 {asset} | {sig['trend']} | {sig['price']:.2f}")
     else:
-        send(
-            f"💓 {asset} HEARTBEAT\n"
-            f"Price:{sig['price']:.2f}\n"
-            f"Trend:{sig['trend']}\n"
-            f"Feed:{feed}"
-        )
+        send(f"💓 {asset} | NO DATA")
 
     s["LAST_HEARTBEAT"] = time.time()
 
@@ -219,8 +209,12 @@ def start_trade(asset, side, sig):
     price = sig["price"]
     atr = sig["atr"]
 
-    sl = price - atr * cfg["SL"] if side == "LONG" else price + atr * cfg["SL"]
-    tp = price + atr * cfg["TP"] if side == "LONG" else price - atr * cfg["TP"]
+    if side == "LONG":
+        sl = price - atr * cfg["SL"]
+        tp = price + atr * cfg["TP"]
+    else:
+        sl = price + atr * cfg["SL"]
+        tp = price - atr * cfg["TP"]
 
     s.update({
         "IN_TRADE": True,
@@ -231,33 +225,7 @@ def start_trade(asset, side, sig):
         "LAST_TRADE": time.time(),
     })
 
-    send(
-        f"{'🚀' if side=='LONG' else '📉'} {asset} {side}\n"
-        f"Entry:{price:.2f}\nSL:{sl:.2f}\nTP:{tp:.2f}"
-    )
-
-# =========================
-# MANAGE
-# =========================
-def manage(asset, sig):
-    s = STATE[asset]
-    p = sig["price"]
-
-    if s["SIDE"] == "LONG":
-        if p <= s["SL"]:
-            send(f"❌ {asset} STOP")
-            s["IN_TRADE"] = False
-        elif p >= s["TP"]:
-            send(f"🎯 {asset} TP")
-            s["IN_TRADE"] = False
-
-    if s["SIDE"] == "SHORT":
-        if p >= s["SL"]:
-            send(f"❌ {asset} STOP")
-            s["IN_TRADE"] = False
-        elif p <= s["TP"]:
-            send(f"🎯 {asset} TP")
-            s["IN_TRADE"] = False
+    send(f"{asset} {side}\nEntry:{price:.2f}\nSL:{sl:.2f}\nTP:{tp:.2f}")
 
 # =========================
 # MAIN
@@ -269,24 +237,22 @@ def run():
     while True:
         try:
             for asset in ASSETS:
-
                 sig, feed = get_signal(asset)
+
                 heartbeat(asset, sig, feed)
 
                 if sig is None:
                     continue
 
                 if STATE[asset]["IN_TRADE"]:
-                    manage(asset, sig)
                     continue
 
                 if time.time() - STATE[asset]["LAST_TRADE"] < COOLDOWN_SECONDS:
                     continue
 
-                if sig["long_score"] >= MIN_SCORE and (sig["long_break"] or sig["long_pull"]):
+                if sig["long"]:
                     start_trade(asset, "LONG", sig)
-
-                elif sig["short_score"] >= MIN_SCORE and (sig["short_break"] or sig["short_pull"]):
+                elif sig["short"]:
                     start_trade(asset, "SHORT", sig)
 
             time.sleep(CHECK_INTERVAL)
