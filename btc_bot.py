@@ -10,8 +10,9 @@ from datetime import datetime
 # Stable data base + full SMC strategy layered back on top
 #
 # BTC:
-#   - Binance ONLY for live BTC candles
-#   - No Yahoo fallback for BTC, because Yahoo BTC kept failing
+#   - Binance primary
+#   - Coinbase fallback
+#   - Yahoo fallback
 #
 # GOLD:
 #   - Yahoo Finance GC=F
@@ -59,7 +60,7 @@ ASSETS = {
     "BTC": {
         "name": "BTC",
         "binance": "BTCUSDT",
-        "yf": None,
+        "yf": "BTC-USD",
     },
     "GOLD": {
         "name": "GOLD",
@@ -249,6 +250,43 @@ def get_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def get_coinbase(symbol: str, interval: str) -> pd.DataFrame:
+    try:
+        granularity = {"1m": 60, "5m": 300, "15m": 900}[interval]
+
+        r = requests.get(
+            f"https://api.exchange.coinbase.com/products/{symbol}/candles",
+            params={"granularity": granularity},
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+
+        data = r.json()
+
+        if not isinstance(data, list) or len(data) < 100:
+            print("COINBASE EMPTY OR BAD:", data if isinstance(data, dict) else "bad length")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            data,
+            columns=[
+                "time",
+                "low",
+                "high",
+                "open",
+                "close",
+                "volume",
+            ],
+        )
+
+        df = df.sort_values("time").reset_index(drop=True)
+        return normalize(df)
+
+    except Exception as e:
+        print("COINBASE ERROR:", e)
+        return pd.DataFrame()
+
+
 def get_yf(symbol: str, interval: str) -> pd.DataFrame:
     try:
         period = {
@@ -282,11 +320,19 @@ def get_klines(asset: str, interval: str):
     cfg = ASSETS[asset]
 
     if asset == "BTC":
-        # IMPORTANT: BTC uses Binance only.
         df = get_binance(cfg["binance"], interval)
         if not df.empty:
             return df, "BINANCE"
-        return pd.DataFrame(), "BINANCE_FAIL"
+
+        df = get_coinbase("BTC-USD", interval)
+        if not df.empty:
+            return df, "COINBASE"
+
+        df = get_yf(cfg["yf"], interval)
+        if not df.empty:
+            return df, "YFINANCE"
+
+        return pd.DataFrame(), "NO_DATA"
 
     # GOLD
     df = get_yf(cfg["yf"], interval)
@@ -776,12 +822,12 @@ def maybe_alert_data_fail(asset: str, feed: str):
     state = STATE[asset]
     now = time.time()
 
-    if feed in ["NONE", "BINANCE_FAIL"]:
+    if feed in ["NONE", "NO_DATA"]:
         if now - state["LAST_DATA_FAIL"] > HEARTBEAT_SECONDS:
             send(
                 f"â ï¸ {asset} DATA ISSUE\n"
                 f"Feed: {feed}\n"
-                f"BTC should use Binance only."
+                f"All available feeds failed."
             )
             state["LAST_DATA_FAIL"] = now
 
@@ -795,7 +841,7 @@ def get_signal(asset: str):
     df5 = add_indicators(df5_raw)
     df15 = add_indicators(df15_raw)
 
-    sources = [s for s in [src1, src5, src15] if s not in ["NONE", "BINANCE_FAIL"]]
+    sources = [s for s in [src1, src5, src15] if s not in ["NONE", "NO_DATA"]]
     feed = "/".join(sorted(set(sources))) if sources else src1
 
     maybe_alert_data_fail(asset, feed)
