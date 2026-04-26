@@ -6,27 +6,41 @@ import yfinance as yf
 from datetime import datetime
 
 # ============================================================
-# BTC + GOLD ULTIMATE SMC BOT
-# ============================================================
-# NO sniper entries.
-# Multi-timeframe SMC:
-# - 15m/5m bias
-# - 1m confirmation entry
-# - liquidity sweeps
-# - BOS / retest
-# - FVG bounce/rejection
-# - order block bounce/rejection
-# - healthy pullbacks only
-# - candle confirmation
-# - anti-chase
-# - same-zone re-entry protection
-# - session filter
-# - ATR SL / TP1 / TP2 / BE / trail
+# BTC + GOLD FULL STRATEGY BOT
+# Stable data base + full SMC strategy layered back on top
+#
+# BTC:
+#   - Binance ONLY for live BTC candles
+#   - No Yahoo fallback for BTC, because Yahoo BTC kept failing
+#
+# GOLD:
+#   - Yahoo Finance GC=F
+#
+# Strategy:
+#   - NO sniper entries
+#   - Multi-timeframe bias: 15m + 5m
+#   - 1m entry confirmation
+#   - Liquidity sweep
+#   - BOS / breakout retest
+#   - FVG bounce / rejection
+#   - Order block bounce / rejection
+#   - Healthy pullbacks only
+#   - Anti-chase filter
+#   - Same-zone re-entry block
+#   - Realistic ATR SL / TP1 / TP2
+#   - Break-even and trailing runner
+#   - Startup + heartbeat + Telegram alerts
 # ============================================================
 
+# =========================
+# ENV
+# =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 
+# =========================
+# CONFIG
+# =========================
 CHECK_INTERVAL = 60
 HEARTBEAT_SECONDS = 1800
 COOLDOWN_SECONDS = 1800
@@ -35,36 +49,78 @@ DEBUG_MODE = True
 MIN_SCORE = 82
 FULL_SCORE = 92
 
-USE_SESSION_FILTER = True
+USE_SESSION_FILTER = False
 LONDON_SESSION_START = 7
 LONDON_SESSION_END = 11
 NY_SESSION_START = 13
 NY_SESSION_END = 17
 
 ASSETS = {
-    "BTC": {"name": "BTC", "binance": "BTCUSDT", "yf": "BTC-USD"},
-    "GOLD": {"name": "GOLD", "binance": None, "yf": "GC=F"},
+    "BTC": {
+        "name": "BTC",
+        "binance": "BTCUSDT",
+        "yf": None,
+    },
+    "GOLD": {
+        "name": "GOLD",
+        "binance": None,
+        "yf": "GC=F",
+    },
 }
 
 CFG = {
     "BTC": {
-        "SL_ATR": 4.0, "TP1_ATR": 4.0, "TP2_ATR": 8.0,
-        "BE_ATR": 3.0, "TRAIL_START_ATR": 4.5, "TRAIL_ATR": 3.2,
-        "MIN_VOL": 0.0007, "MAX_CHASE": 0.0040, "MAX_CANDLE_ATR": 1.15,
-        "MIN_PULL_ATR": 0.8, "MAX_PULL_ATR": 3.2,
-        "BOS_LOOKBACK": 20, "SWEEP_LOOKBACK": 20, "FVG_LOOKBACK": 50, "OB_LOOKBACK": 50,
-        "RSI_LONG_MIN": 42, "RSI_LONG_MAX": 65,
-        "RSI_SHORT_MIN": 35, "RSI_SHORT_MAX": 58,
+        "SL_ATR": 4.0,
+        "TP1_ATR": 4.0,
+        "TP2_ATR": 8.0,
+        "BE_ATR": 3.0,
+        "TRAIL_START_ATR": 4.5,
+        "TRAIL_ATR": 3.2,
+
+        "MIN_VOL": 0.0007,
+        "MAX_CHASE": 0.0040,
+        "MAX_CANDLE_ATR": 1.15,
+
+        "MIN_PULL_ATR": 0.8,
+        "MAX_PULL_ATR": 3.2,
+
+        "BOS_LOOKBACK": 20,
+        "SWEEP_LOOKBACK": 20,
+        "FVG_LOOKBACK": 50,
+        "OB_LOOKBACK": 50,
+
+        "RSI_LONG_MIN": 42,
+        "RSI_LONG_MAX": 65,
+        "RSI_SHORT_MIN": 35,
+        "RSI_SHORT_MAX": 58,
+
         "SAME_ZONE": 0.0030,
     },
     "GOLD": {
-        "SL_ATR": 3.2, "TP1_ATR": 3.4, "TP2_ATR": 7.0,
-        "BE_ATR": 2.6, "TRAIL_START_ATR": 4.0, "TRAIL_ATR": 2.8,
-        "MIN_VOL": 0.00012, "MAX_CHASE": 0.0028, "MAX_CANDLE_ATR": 1.05,
-        "MIN_PULL_ATR": 0.8, "MAX_PULL_ATR": 2.8,
-        "BOS_LOOKBACK": 20, "SWEEP_LOOKBACK": 20, "FVG_LOOKBACK": 50, "OB_LOOKBACK": 50,
-        "RSI_LONG_MIN": 42, "RSI_LONG_MAX": 64,
-        "RSI_SHORT_MIN": 36, "RSI_SHORT_MAX": 58,
+        "SL_ATR": 3.2,
+        "TP1_ATR": 3.4,
+        "TP2_ATR": 7.0,
+        "BE_ATR": 2.6,
+        "TRAIL_START_ATR": 4.0,
+        "TRAIL_ATR": 2.8,
+
+        "MIN_VOL": 0.00012,
+        "MAX_CHASE": 0.0028,
+        "MAX_CANDLE_ATR": 1.05,
+
+        "MIN_PULL_ATR": 0.8,
+        "MAX_PULL_ATR": 2.8,
+
+        "BOS_LOOKBACK": 20,
+        "SWEEP_LOOKBACK": 20,
+        "FVG_LOOKBACK": 50,
+        "OB_LOOKBACK": 50,
+
+        "RSI_LONG_MIN": 42,
+        "RSI_LONG_MAX": 64,
+        "RSI_SHORT_MIN": 36,
+        "RSI_SHORT_MAX": 58,
+
         "SAME_ZONE": 0.0020,
     },
 }
@@ -86,12 +142,17 @@ STATE = {
         "LAST_ENTRY_PRICE": 0.0,
         "LAST_ENTRY_SIDE": None,
         "LAST_TRAIL_SL": 0.0,
+        "LAST_DATA_FAIL": 0.0,
     }
     for asset in ASSETS
 }
 
+# ============================================================
+# TELEGRAM
+# ============================================================
 def send(msg: str):
     print(msg)
+
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("TELEGRAM NOT SET")
         return
@@ -110,27 +171,43 @@ def send(msg: str):
             print("TELEGRAM ERROR:", e)
         time.sleep(2)
 
+# ============================================================
+# SESSION FILTER
+# ============================================================
 def in_trading_session() -> bool:
     if not USE_SESSION_FILTER:
         return True
-    hour = datetime.now().hour
-    return (LONDON_SESSION_START <= hour < LONDON_SESSION_END) or (NY_SESSION_START <= hour < NY_SESSION_END)
 
+    hour = datetime.now().hour
+    london = LONDON_SESSION_START <= hour < LONDON_SESSION_END
+    new_york = NY_SESSION_START <= hour < NY_SESSION_END
+    return london or new_york
+
+# ============================================================
+# DATA
+# ============================================================
 def normalize(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+
     df = df.copy()
     df.columns = [str(c).lower() for c in df.columns]
+
     for col in ["open", "high", "low", "close"]:
         if col not in df.columns:
             return pd.DataFrame()
+
     if "volume" not in df.columns:
         df["volume"] = 1.0
+
     df = df[["open", "high", "low", "close", "volume"]].copy()
+
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df.dropna(inplace=True)
     return df.reset_index(drop=True)
+
 
 def get_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
     try:
@@ -140,52 +217,93 @@ def get_binance(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
             timeout=10,
             headers={"User-Agent": "Mozilla/5.0"},
         )
+
         data = r.json()
+
         if not isinstance(data, list) or len(data) < 120:
+            print("BINANCE EMPTY OR BAD:", data if isinstance(data, dict) else "bad length")
             return pd.DataFrame()
+
         df = pd.DataFrame(
             data,
             columns=[
-                "time", "open", "high", "low", "close", "volume",
-                "close_time", "quote_asset_volume", "trades",
-                "taker_buy_base", "taker_buy_quote", "ignore"
+                "time",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_asset_volume",
+                "trades",
+                "taker_buy_base",
+                "taker_buy_quote",
+                "ignore",
             ],
         )
+
         return normalize(df)
+
     except Exception as e:
         print("BINANCE ERROR:", e)
         return pd.DataFrame()
 
+
 def get_yf(symbol: str, interval: str) -> pd.DataFrame:
     try:
-        period = {"1m": "7d", "5m": "30d", "15m": "60d"}[interval]
-        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        period = {
+            "1m": "7d",
+            "5m": "30d",
+            "15m": "60d",
+        }[interval]
+
+        df = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+        )
+
         if df is None or df.empty:
             return pd.DataFrame()
+
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+
         return normalize(df)
+
     except Exception as e:
         print("YFINANCE ERROR:", e)
         return pd.DataFrame()
 
+
 def get_klines(asset: str, interval: str):
     cfg = ASSETS[asset]
+
     if asset == "BTC":
+        # IMPORTANT: BTC uses Binance only.
         df = get_binance(cfg["binance"], interval)
         if not df.empty:
             return df, "BINANCE"
+        return pd.DataFrame(), "BINANCE_FAIL"
+
+    # GOLD
     df = get_yf(cfg["yf"], interval)
     if not df.empty:
         return df, "YFINANCE"
+
     return pd.DataFrame(), "NONE"
 
-
+# ============================================================
+# INDICATORS
+# ============================================================
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 120:
         return pd.DataFrame()
 
     out = df.copy()
+
     out["ema9"] = out["close"].ewm(span=9, adjust=False).mean()
     out["ema21"] = out["close"].ewm(span=21, adjust=False).mean()
     out["ema50"] = out["close"].ewm(span=50, adjust=False).mean()
@@ -197,14 +315,18 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = gain / loss.replace(0, pd.NA)
     out["rsi"] = 100 - (100 / (1 + rs))
 
-    tr = pd.concat([
-        out["high"] - out["low"],
-        (out["high"] - out["close"].shift()).abs(),
-        (out["low"] - out["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [
+            out["high"] - out["low"],
+            (out["high"] - out["close"].shift()).abs(),
+            (out["low"] - out["close"].shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
     out["atr"] = tr.rolling(14).mean()
     out["vol_ma"] = out["volume"].rolling(20).mean()
+
     out["body"] = (out["close"] - out["open"]).abs()
     out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
     out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
@@ -214,11 +336,16 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out.dropna(inplace=True)
     return out.reset_index(drop=True)
 
+# ============================================================
+# STRUCTURE HELPERS
+# ============================================================
 def swing_high(df: pd.DataFrame, lookback: int) -> float:
     return float(df["high"].iloc[-lookback - 1:-1].max())
 
+
 def swing_low(df: pd.DataFrame, lookback: int) -> float:
     return float(df["low"].iloc[-lookback - 1:-1].min())
+
 
 def market_bias(df5: pd.DataFrame, df15: pd.DataFrame) -> str:
     r5 = df5.iloc[-1]
@@ -230,12 +357,14 @@ def market_bias(df5: pd.DataFrame, df15: pd.DataFrame) -> str:
         and r5["ema9"] > r5["ema21"]
         and r5["close"] > r5["ema50"]
     )
+
     strong_bear = (
         r15["ema9"] < r15["ema21"] < r15["ema50"]
         and r15["close"] < r15["ema50"]
         and r5["ema9"] < r5["ema21"]
         and r5["close"] < r5["ema50"]
     )
+
     weak_bull = r15["ema9"] > r15["ema21"] and r5["close"] > r5["ema21"]
     weak_bear = r15["ema9"] < r15["ema21"] and r5["close"] < r5["ema21"]
 
@@ -249,175 +378,310 @@ def market_bias(df5: pd.DataFrame, df15: pd.DataFrame) -> str:
         return "BEAR"
     return "CHOPPY"
 
+
 def liquidity_sweep_low(df: pd.DataFrame, cfg: dict) -> bool:
     r = df.iloc[-1]
     prev_low = swing_low(df, cfg["SWEEP_LOOKBACK"])
-    return bool(r["low"] < prev_low and r["close"] > prev_low and r["lower_wick"] > r["body"] * 0.8)
+
+    swept = r["low"] < prev_low
+    closed_back_above = r["close"] > prev_low
+    rejection = r["lower_wick"] > r["body"] * 0.8
+
+    return bool(swept and closed_back_above and rejection)
+
 
 def liquidity_sweep_high(df: pd.DataFrame, cfg: dict) -> bool:
     r = df.iloc[-1]
     prev_high = swing_high(df, cfg["SWEEP_LOOKBACK"])
-    return bool(r["high"] > prev_high and r["close"] < prev_high and r["upper_wick"] > r["body"] * 0.8)
+
+    swept = r["high"] > prev_high
+    closed_back_below = r["close"] < prev_high
+    rejection = r["upper_wick"] > r["body"] * 0.8
+
+    return bool(swept and closed_back_below and rejection)
+
 
 def bos_long(df: pd.DataFrame, cfg: dict) -> bool:
     r = df.iloc[-1]
-    return bool(r["close"] > swing_high(df, cfg["BOS_LOOKBACK"]) and r["close"] > r["ema9"])
+    high = swing_high(df, cfg["BOS_LOOKBACK"])
+    return bool(r["close"] > high and r["close"] > r["ema9"])
+
 
 def bos_short(df: pd.DataFrame, cfg: dict) -> bool:
     r = df.iloc[-1]
-    return bool(r["close"] < swing_low(df, cfg["BOS_LOOKBACK"]) and r["close"] < r["ema9"])
+    low = swing_low(df, cfg["BOS_LOOKBACK"])
+    return bool(r["close"] < low and r["close"] < r["ema9"])
+
 
 def breakout_retest_long(df: pd.DataFrame, cfg: dict) -> bool:
     r = df.iloc[-1]
     p = df.iloc[-2]
     level = swing_high(df.iloc[:-1], cfg["BOS_LOOKBACK"])
-    return bool(p["close"] > level and r["low"] <= level and r["close"] > level and r["close"] > r["open"])
+
+    broke_previous = p["close"] > level
+    retested = r["low"] <= level and r["close"] > level
+    bullish_candle = r["close"] > r["open"]
+
+    return bool(broke_previous and retested and bullish_candle)
+
 
 def breakout_retest_short(df: pd.DataFrame, cfg: dict) -> bool:
     r = df.iloc[-1]
     p = df.iloc[-2]
     level = swing_low(df.iloc[:-1], cfg["BOS_LOOKBACK"])
-    return bool(p["close"] < level and r["high"] >= level and r["close"] < level and r["close"] < r["open"])
 
+    broke_previous = p["close"] < level
+    retested = r["high"] >= level and r["close"] < level
+    bearish_candle = r["close"] < r["open"]
+
+    return bool(broke_previous and retested and bearish_candle)
+
+# ============================================================
+# FVG
+# ============================================================
 def find_bullish_fvg(df: pd.DataFrame, lookback: int):
     start = max(2, len(df) - lookback)
+
     for i in range(len(df) - 2, start, -1):
         left = df.iloc[i - 2]
         right = df.iloc[i]
+
         if right["low"] > left["high"]:
-            return {"low": float(left["high"]), "high": float(right["low"])}
+            return {
+                "low": float(left["high"]),
+                "high": float(right["low"]),
+                "index": i,
+            }
+
     return None
+
 
 def find_bearish_fvg(df: pd.DataFrame, lookback: int):
     start = max(2, len(df) - lookback)
+
     for i in range(len(df) - 2, start, -1):
         left = df.iloc[i - 2]
         right = df.iloc[i]
+
         if right["high"] < left["low"]:
-            return {"low": float(right["high"]), "high": float(left["low"])}
+            return {
+                "low": float(right["high"]),
+                "high": float(left["low"]),
+                "index": i,
+            }
+
     return None
+
 
 def fvg_bounce_long(df: pd.DataFrame, cfg: dict) -> bool:
     zone = find_bullish_fvg(df, cfg["FVG_LOOKBACK"])
     if not zone:
         return False
+
     r = df.iloc[-1]
+
     touched = r["low"] <= zone["high"] and r["close"] >= zone["low"]
     rejection = r["close"] > r["open"] and r["lower_wick"] >= r["body"] * 0.5
-    return bool(touched and rejection and r["close"] > r["ema9"])
+    reclaim = r["close"] > r["ema9"]
+
+    return bool(touched and rejection and reclaim)
+
 
 def fvg_reject_short(df: pd.DataFrame, cfg: dict) -> bool:
     zone = find_bearish_fvg(df, cfg["FVG_LOOKBACK"])
     if not zone:
         return False
+
     r = df.iloc[-1]
+
     touched = r["high"] >= zone["low"] and r["close"] <= zone["high"]
     rejection = r["close"] < r["open"] and r["upper_wick"] >= r["body"] * 0.5
-    return bool(touched and rejection and r["close"] < r["ema9"])
+    reject = r["close"] < r["ema9"]
 
+    return bool(touched and rejection and reject)
 
+# ============================================================
+# ORDER BLOCKS
+# ============================================================
 def find_bullish_ob(df: pd.DataFrame, cfg: dict):
     start = max(3, len(df) - cfg["OB_LOOKBACK"])
+
     for i in range(len(df) - 3, start, -1):
         candle = df.iloc[i]
         n1 = df.iloc[i + 1]
         n2 = df.iloc[i + 2]
+
         bearish_candle = candle["close"] < candle["open"]
-        displacement_up = n1["close"] > n1["open"] and n2["close"] > n2["open"] and n2["close"] > candle["high"]
+        displacement_up = (
+            n1["close"] > n1["open"]
+            and n2["close"] > n2["open"]
+            and n2["close"] > candle["high"]
+        )
+
         if bearish_candle and displacement_up:
-            return {"low": float(candle["low"]), "high": float(candle["high"])}
+            return {
+                "low": float(candle["low"]),
+                "high": float(candle["high"]),
+                "index": i,
+            }
+
     return None
+
 
 def find_bearish_ob(df: pd.DataFrame, cfg: dict):
     start = max(3, len(df) - cfg["OB_LOOKBACK"])
+
     for i in range(len(df) - 3, start, -1):
         candle = df.iloc[i]
         n1 = df.iloc[i + 1]
         n2 = df.iloc[i + 2]
+
         bullish_candle = candle["close"] > candle["open"]
-        displacement_down = n1["close"] < n1["open"] and n2["close"] < n2["open"] and n2["close"] < candle["low"]
+        displacement_down = (
+            n1["close"] < n1["open"]
+            and n2["close"] < n2["open"]
+            and n2["close"] < candle["low"]
+        )
+
         if bullish_candle and displacement_down:
-            return {"low": float(candle["low"]), "high": float(candle["high"])}
+            return {
+                "low": float(candle["low"]),
+                "high": float(candle["high"]),
+                "index": i,
+            }
+
     return None
+
 
 def ob_bounce_long(df: pd.DataFrame, cfg: dict) -> bool:
     zone = find_bullish_ob(df, cfg)
     if not zone:
         return False
+
     r = df.iloc[-1]
+
     touched = r["low"] <= zone["high"] and r["close"] >= zone["low"]
     rejection = r["close"] > r["open"] and r["lower_wick"] >= r["body"] * 0.6
-    return bool(touched and rejection and r["close"] > r["ema9"])
+    reclaim = r["close"] > r["ema9"]
+
+    return bool(touched and rejection and reclaim)
+
 
 def ob_reject_short(df: pd.DataFrame, cfg: dict) -> bool:
     zone = find_bearish_ob(df, cfg)
     if not zone:
         return False
+
     r = df.iloc[-1]
+
     touched = r["high"] >= zone["low"] and r["close"] <= zone["high"]
     rejection = r["close"] < r["open"] and r["upper_wick"] >= r["body"] * 0.6
-    return bool(touched and rejection and r["close"] < r["ema9"])
+    reject = r["close"] < r["ema9"]
 
+    return bool(touched and rejection and reject)
+
+# ============================================================
+# CANDLE CONFIRMATION / PULLBACK
+# ============================================================
 def bullish_confirmation_candle(df: pd.DataFrame) -> bool:
     r = df.iloc[-1]
     p = df.iloc[-2]
+
     engulf = r["close"] > r["open"] and r["close"] > p["open"] and r["open"] < p["close"]
     pin = r["lower_wick"] > r["body"] * 1.5 and r["close"] > r["open"]
-    return bool((engulf or pin) and r["close"] > r["ema9"])
+    reclaim_ema = r["close"] > r["ema9"]
+
+    return bool((engulf or pin) and reclaim_ema)
+
 
 def bearish_confirmation_candle(df: pd.DataFrame) -> bool:
     r = df.iloc[-1]
     p = df.iloc[-2]
+
     engulf = r["close"] < r["open"] and r["close"] < p["open"] and r["open"] > p["close"]
     pin = r["upper_wick"] > r["body"] * 1.5 and r["close"] < r["open"]
-    return bool((engulf or pin) and r["close"] < r["ema9"])
+    reject_ema = r["close"] < r["ema9"]
+
+    return bool((engulf or pin) and reject_ema)
+
 
 def healthy_pullback_long(asset: str, df1: pd.DataFrame, df5: pd.DataFrame) -> bool:
     cfg = CFG[asset]
     r = df1.iloc[-1]
+
     pull_depth = swing_high(df1, 6) - r["low"]
+
     if r["atr"] <= 0:
         return False
+
     depth_atr = pull_depth / r["atr"]
     good_depth = cfg["MIN_PULL_ATR"] <= depth_atr <= cfg["MAX_PULL_ATR"]
     near_value = r["low"] <= r["ema21"] or r["low"] <= df5.iloc[-1]["ema9"]
     confirmed = r["close"] > r["ema9"] and r["close"] > r["open"]
+
     return bool(good_depth and near_value and confirmed)
+
 
 def healthy_pullback_short(asset: str, df1: pd.DataFrame, df5: pd.DataFrame) -> bool:
     cfg = CFG[asset]
     r = df1.iloc[-1]
+
     pull_depth = r["high"] - swing_low(df1, 6)
+
     if r["atr"] <= 0:
         return False
+
     depth_atr = pull_depth / r["atr"]
     good_depth = cfg["MIN_PULL_ATR"] <= depth_atr <= cfg["MAX_PULL_ATR"]
     near_value = r["high"] >= r["ema21"] or r["high"] >= df5.iloc[-1]["ema9"]
     confirmed = r["close"] < r["ema9"] and r["close"] < r["open"]
+
     return bool(good_depth and near_value and confirmed)
 
+# ============================================================
+# RISK FILTERS
+# ============================================================
 def not_chasing(asset: str, df: pd.DataFrame, side: str) -> bool:
     cfg = CFG[asset]
     r = df.iloc[-1]
+
     if r["atr"] <= 0:
         return False
+
     ema_distance = abs(r["close"] - r["ema9"]) / max(r["close"], 1.0)
     if ema_distance > cfg["MAX_CHASE"]:
         return False
+
     if r["move"] > r["atr"] * cfg["MAX_CANDLE_ATR"]:
         return False
+
     if side == "LONG":
-        return cfg["RSI_LONG_MIN"] <= r["rsi"] <= cfg["RSI_LONG_MAX"]
-    return cfg["RSI_SHORT_MIN"] <= r["rsi"] <= cfg["RSI_SHORT_MAX"]
+        if not (cfg["RSI_LONG_MIN"] <= r["rsi"] <= cfg["RSI_LONG_MAX"]):
+            return False
+
+    if side == "SHORT":
+        if not (cfg["RSI_SHORT_MIN"] <= r["rsi"] <= cfg["RSI_SHORT_MAX"]):
+            return False
+
+    return True
+
 
 def same_zone_block(asset: str, side: str, price: float) -> bool:
     state = STATE[asset]
+    cfg = CFG[asset]
+
     last = state["LAST_ENTRY_PRICE"]
-    if last <= 0 or state["LAST_ENTRY_SIDE"] != side:
+    last_side = state["LAST_ENTRY_SIDE"]
+
+    if last <= 0 or last_side != side:
         return False
-    return abs(price - last) / max(price, 1.0) < CFG[asset]["SAME_ZONE"]
 
+    distance = abs(price - last) / max(price, 1.0)
+    return distance < cfg["SAME_ZONE"]
 
+# ============================================================
+# SCORING
+# ============================================================
 def score_long(asset: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.DataFrame):
     cfg = CFG[asset]
     b = market_bias(df5, df15)
@@ -454,6 +718,7 @@ def score_long(asset: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.DataFr
         reasons.append("chase blocked")
 
     return max(0, min(int(score), 100)), reasons, b
+
 
 def score_short(asset: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.DataFrame):
     cfg = CFG[asset]
@@ -492,6 +757,7 @@ def score_short(asset: str, df1: pd.DataFrame, df5: pd.DataFrame, df15: pd.DataF
 
     return max(0, min(int(score), 100)), reasons, b
 
+
 def confidence(score: int) -> str:
     if score >= 96:
         return "S"
@@ -503,6 +769,23 @@ def confidence(score: int) -> str:
         return "B+"
     return "B"
 
+# ============================================================
+# SIGNAL
+# ============================================================
+def maybe_alert_data_fail(asset: str, feed: str):
+    state = STATE[asset]
+    now = time.time()
+
+    if feed in ["NONE", "BINANCE_FAIL"]:
+        if now - state["LAST_DATA_FAIL"] > HEARTBEAT_SECONDS:
+            send(
+                f"â ï¸ {asset} DATA ISSUE\n"
+                f"Feed: {feed}\n"
+                f"BTC should use Binance only."
+            )
+            state["LAST_DATA_FAIL"] = now
+
+
 def get_signal(asset: str):
     df1_raw, src1 = get_klines(asset, "1m")
     df5_raw, src5 = get_klines(asset, "5m")
@@ -512,8 +795,10 @@ def get_signal(asset: str):
     df5 = add_indicators(df5_raw)
     df15 = add_indicators(df15_raw)
 
-    sources = [s for s in [src1, src5, src15] if s != "NONE"]
-    feed = "/".join(sorted(set(sources))) if sources else "NONE"
+    sources = [s for s in [src1, src5, src15] if s not in ["NONE", "BINANCE_FAIL"]]
+    feed = "/".join(sorted(set(sources))) if sources else src1
+
+    maybe_alert_data_fail(asset, feed)
 
     if df1.empty or df5.empty or df15.empty:
         return None, feed
@@ -524,6 +809,7 @@ def get_signal(asset: str):
 
     if atr <= 0:
         return None, feed
+
     if (atr / max(price, 1.0)) < CFG[asset]["MIN_VOL"]:
         return None, feed
 
@@ -545,8 +831,12 @@ def get_signal(asset: str):
         "feed": feed,
     }, feed
 
+# ============================================================
+# HEARTBEAT
+# ============================================================
 def heartbeat(asset: str, sig, feed: str):
     state = STATE[asset]
+
     if time.time() - state["LAST_HEARTBEAT"] < HEARTBEAT_SECONDS:
         return
 
@@ -571,10 +861,13 @@ def heartbeat(asset: str, sig, feed: str):
 
     state["LAST_HEARTBEAT"] = time.time()
 
-
+# ============================================================
+# TRADE MANAGEMENT
+# ============================================================
 def start_trade(asset: str, side: str, sig: dict):
     state = STATE[asset]
     cfg = CFG[asset]
+
     price = sig["price"]
     atr = sig["atr"]
 
@@ -606,7 +899,7 @@ def start_trade(asset: str, side: str, sig: dict):
 
     send(
         f"{icon} {asset} {side} ENTRY\n\n"
-        f"Style: ULTIMATE SMC\n"
+        f"Style: FULL SMC STRATEGY\n"
         f"Size: {'FULL' if score >= FULL_SCORE else 'STANDARD'}\n"
         f"Confidence: {confidence(score)}\n"
         f"Price: ${price:.2f}\n"
@@ -617,8 +910,10 @@ def start_trade(asset: str, side: str, sig: dict):
         f"TP2: ${state['TP2']:.2f}"
     )
 
+
 def reset_trade(asset: str):
     state = STATE[asset]
+
     state["IN_TRADE"] = False
     state["SIDE"] = None
     state["ENTRY"] = 0.0
@@ -632,9 +927,11 @@ def reset_trade(asset: str):
     state["LAST_TRADE"] = time.time()
     state["LAST_TRAIL_SL"] = 0.0
 
+
 def manage_trade(asset: str, sig: dict):
     state = STATE[asset]
     cfg = CFG[asset]
+
     price = sig["price"]
     atr = sig["atr"]
     entry = state["ENTRY"]
@@ -697,12 +994,18 @@ def manage_trade(asset: str, sig: dict):
             reset_trade(asset)
             return
 
+# ============================================================
+# ENTRY DECISION
+# ============================================================
 def try_enter(asset: str, sig: dict):
     state = STATE[asset]
+
     if state["IN_TRADE"]:
         return
+
     if time.time() - state["LAST_TRADE"] < COOLDOWN_SECONDS:
         return
+
     if not in_trading_session():
         return
 
@@ -730,11 +1033,14 @@ def try_enter(asset: str, sig: dict):
         start_trade(asset, "SHORT", sig)
         return
 
+# ============================================================
+# MAIN LOOP
+# ============================================================
 def run():
     time.sleep(8)
     send("â BOT STARTING...")
     time.sleep(2)
-    send(f"ð¥ BTC + GOLD ULTIMATE SMC BOT LIVE ð¥\nTime: {time.strftime('%H:%M:%S')}")
+    send(f"ð¥ BTC + GOLD FULL STRATEGY BOT LIVE ð¥\nTime: {time.strftime('%H:%M:%S')}")
 
     while True:
         try:
@@ -746,7 +1052,13 @@ def run():
                     if sig is None:
                         print(asset, "NO DATA / WAITING", feed)
                     else:
-                        print(asset, sig["bias"], "L:", sig["long_score"], "S:", sig["short_score"], "FEED:", feed)
+                        print(
+                            asset,
+                            sig["bias"],
+                            "L:", sig["long_score"],
+                            "S:", sig["short_score"],
+                            "FEED:", feed,
+                        )
 
                 if sig is None:
                     continue
@@ -762,6 +1074,7 @@ def run():
         except Exception as e:
             send(f"ð¨ BOT ERROR:\n{e}")
             time.sleep(10)
+
 
 if __name__ == "__main__":
     run()
