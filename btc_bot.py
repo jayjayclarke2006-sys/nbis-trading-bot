@@ -49,10 +49,10 @@ COOLDOWN_SECONDS = 600
 DATA_FAIL_ALERT_COOLDOWN = 1800
 DEBUG_MODE = True
 
-LONG_ALERT_SCORE = 65
-SHORT_ALERT_SCORE = 65
-A_SETUP_SCORE = 72
-FULL_SIZE_SCORE = 82
+LONG_ALERT_SCORE = 72
+SHORT_ALERT_SCORE = 72
+A_SETUP_SCORE = 86
+FULL_SIZE_SCORE = 92
 
 MAX_SCALE_INS = 2
 SCALE_IN_COOLDOWN_SECONDS = 120
@@ -76,46 +76,52 @@ ASSETS = {
 
 ASSET_CONFIG = {
     "BTC": {
-        "ATR_SL_MULT": 2.4,
-        "ATR_TP_MULT": 5.2,
-        "ATR_TRAIL_MULT": 2.7,
-        "BREAK_EVEN_ATR_TRIGGER": 1.6,
-        "PARTIAL_ATR_TRIGGER": 2.2,
-        "TRAILING_ACTIVATION_ATR": 2.0,
-        "TRAIL_UPDATE_MIN_ATR": 0.25,
+        "ATR_SL_MULT": 3.0,
+        "ATR_TP_MULT": 6.0,
+        "ATR_TRAIL_MULT": 3.1,
+        "BREAK_EVEN_ATR_TRIGGER": 2.2,
+        "PARTIAL_ATR_TRIGGER": 2.8,
+        "TRAILING_ACTIVATION_ATR": 3.0,
+        "TRAIL_UPDATE_MIN_ATR": 0.35,
         "MIN_VOLATILITY_PCT": 0.00015,
-        "MAX_EMA9_DISTANCE_PCT": 0.0075,
-        "SCALE_IN_ATR_STEP": 0.8,
-        "LONG_RSI_MAX": 72.0,
-        "SHORT_RSI_MIN": 28.0,
-        "MAX_BODY_ATR_MULT": 1.20,
-        "BREAKOUT_BUFFER_LONG": 1.0007,
-        "BREAKOUT_BUFFER_SHORT": 0.9993,
-        "VOL_CONFIRM_MULT": 1.00,
-        "PULLBACK_LONG_EMA9_MAX": 1.0025,
-        "PULLBACK_SHORT_EMA9_MIN": 0.9975,
-        "MAX_IMPULSE_ATR_MULT": 1.40,
+        "MAX_EMA9_DISTANCE_PCT": 0.0045,
+        "SCALE_IN_ATR_STEP": 1.2,
+        "LONG_RSI_MAX": 66.0,
+        "SHORT_RSI_MIN": 34.0,
+        "MAX_BODY_ATR_MULT": 0.85,
+        "BREAKOUT_BUFFER_LONG": 1.0010,
+        "BREAKOUT_BUFFER_SHORT": 0.9990,
+        "VOL_CONFIRM_MULT": 1.03,
+        "PULLBACK_LONG_EMA9_MAX": 1.0010,
+        "PULLBACK_SHORT_EMA9_MIN": 0.9990,
+        "MAX_IMPULSE_ATR_MULT": 0.95,
+        "MIN_RETEST_ATR": 0.35,
+        "NO_SHORT_RSI_BELOW": 35.0,
+        "NO_LONG_RSI_ABOVE": 65.0,
     },
     "GOLD": {
-        "ATR_SL_MULT": 1.8,
-        "ATR_TP_MULT": 3.8,
-        "ATR_TRAIL_MULT": 2.0,
-        "BREAK_EVEN_ATR_TRIGGER": 1.2,
-        "PARTIAL_ATR_TRIGGER": 1.8,
-        "TRAILING_ACTIVATION_ATR": 1.5,
-        "TRAIL_UPDATE_MIN_ATR": 0.15,
+        "ATR_SL_MULT": 2.4,
+        "ATR_TP_MULT": 4.8,
+        "ATR_TRAIL_MULT": 2.4,
+        "BREAK_EVEN_ATR_TRIGGER": 1.8,
+        "PARTIAL_ATR_TRIGGER": 2.4,
+        "TRAILING_ACTIVATION_ATR": 2.4,
+        "TRAIL_UPDATE_MIN_ATR": 0.25,
         "MIN_VOLATILITY_PCT": 0.00008,
-        "MAX_EMA9_DISTANCE_PCT": 0.0045,
-        "SCALE_IN_ATR_STEP": 0.5,
-        "LONG_RSI_MAX": 68.0,
-        "SHORT_RSI_MIN": 32.0,
-        "MAX_BODY_ATR_MULT": 1.0,
-        "BREAKOUT_BUFFER_LONG": 1.0004,
-        "BREAKOUT_BUFFER_SHORT": 0.9996,
-        "VOL_CONFIRM_MULT": 1.00,
-        "PULLBACK_LONG_EMA9_MAX": 1.0015,
-        "PULLBACK_SHORT_EMA9_MIN": 0.9985,
-        "MAX_IMPULSE_ATR_MULT": 1.05,
+        "MAX_EMA9_DISTANCE_PCT": 0.0032,
+        "SCALE_IN_ATR_STEP": 0.8,
+        "LONG_RSI_MAX": 64.0,
+        "SHORT_RSI_MIN": 36.0,
+        "MAX_BODY_ATR_MULT": 0.80,
+        "BREAKOUT_BUFFER_LONG": 1.0006,
+        "BREAKOUT_BUFFER_SHORT": 0.9994,
+        "VOL_CONFIRM_MULT": 1.02,
+        "PULLBACK_LONG_EMA9_MAX": 1.0008,
+        "PULLBACK_SHORT_EMA9_MIN": 0.9992,
+        "MAX_IMPULSE_ATR_MULT": 0.85,
+        "MIN_RETEST_ATR": 0.30,
+        "NO_SHORT_RSI_BELOW": 37.0,
+        "NO_LONG_RSI_ABOVE": 63.0,
     },
 }
 
@@ -454,6 +460,36 @@ def clean_entry(asset_key: str, df1: pd.DataFrame) -> bool:
     return True
 
 
+
+def pro_entry_guard(asset_key: str, sig: dict, side: str) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
+    df1 = sig["df1"]
+    r = df1.iloc[-1]
+    p = df1.iloc[-2]
+
+    if side == "LONG":
+        if sig["trend"] != "BULLISH" or sig["htf_bias"] not in ["BULL", "STRONG_BULL"]:
+            return False
+        if float(r["rsi"]) >= cfg["NO_LONG_RSI_ABOVE"]:
+            return False
+
+    if side == "SHORT":
+        if sig["trend"] != "BEARISH" or sig["htf_bias"] not in ["BEAR", "STRONG_BEAR"]:
+            return False
+        if float(r["rsi"]) <= cfg["NO_SHORT_RSI_BELOW"]:
+            return False
+
+    if float(r["atr"]) > 0:
+        if float(r["body"]) > float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]:
+            return False
+        if abs(float(r["close"]) - float(p["close"])) > float(r["atr"]) * cfg["MAX_IMPULSE_ATR_MULT"]:
+            return False
+
+    if not not_too_extended(asset_key, float(r["close"]), float(r["ema9"])):
+        return False
+
+    return True
+
 def long_not_chasing(asset_key: str, df1: pd.DataFrame) -> bool:
     cfg = ASSET_CONFIG[asset_key]
     r = df1.iloc[-1]
@@ -503,47 +539,45 @@ def breakout_short(df1: pd.DataFrame, asset_key: str) -> bool:
 
 
 def pullback_long(df1: pd.DataFrame, asset_key: str) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
     r = df1.iloc[-1]
-    return float(r["close"]) <= float(r["ema9"]) * ASSET_CONFIG[asset_key]["PULLBACK_LONG_EMA9_MAX"]
+    p = df1.iloc[-2]
+
+    if float(r["atr"]) <= 0:
+        return False
+
+    touched_value = float(r["low"]) <= float(r["ema9"]) or float(r["low"]) <= float(r["ema21"])
+    reclaimed = float(r["close"]) > float(r["ema9"]) and float(r["close"]) > float(r["open"])
+    not_impulse = float(r["body"]) <= float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]
+    actually_pulled_back = abs(float(p["close"]) - float(r["low"])) >= float(r["atr"]) * cfg["MIN_RETEST_ATR"]
+
+    return bool(touched_value and reclaimed and not_impulse and actually_pulled_back)
 
 
 def pullback_short(df1: pd.DataFrame, asset_key: str) -> bool:
+    cfg = ASSET_CONFIG[asset_key]
     r = df1.iloc[-1]
-    return float(r["close"]) >= float(r["ema9"]) * ASSET_CONFIG[asset_key]["PULLBACK_SHORT_EMA9_MIN"]
+    p = df1.iloc[-2]
+
+    if float(r["atr"]) <= 0:
+        return False
+
+    touched_value = float(r["high"]) >= float(r["ema9"]) or float(r["high"]) >= float(r["ema21"])
+    rejected = float(r["close"]) < float(r["ema9"]) and float(r["close"]) < float(r["open"])
+    not_impulse = float(r["body"]) <= float(r["atr"]) * cfg["MAX_BODY_ATR_MULT"]
+    actually_pulled_back = abs(float(r["high"]) - float(p["close"])) >= float(r["atr"]) * cfg["MIN_RETEST_ATR"]
+
+    return bool(touched_value and rejected and not_impulse and actually_pulled_back)
 
 
 def sniper_long(df1: pd.DataFrame) -> bool:
-    if len(df1) < 4:
-        return False
-
-    r = df1.iloc[-1]
-    p = df1.iloc[-2]
-    p2 = df1.iloc[-3]
-
-    return bool(
-        p["close"] < p["ema9"]
-        and r["close"] > r["ema9"]
-        and p["rsi"] < 46
-        and r["rsi"] > 50
-        and r["low"] > p2["low"]
-    )
+    # PRO MODE: sniper entries disabled to stop late/choppy entries.
+    return False
 
 
 def sniper_short(df1: pd.DataFrame) -> bool:
-    if len(df1) < 4:
-        return False
-
-    r = df1.iloc[-1]
-    p = df1.iloc[-2]
-    p2 = df1.iloc[-3]
-
-    return bool(
-        p["close"] > p["ema9"]
-        and r["close"] < r["ema9"]
-        and p["rsi"] > 54
-        and r["rsi"] < 50
-        and r["high"] < p2["high"]
-    )
+    # PRO MODE: sniper entries disabled to stop late/choppy entries.
+    return False
 
 
 def confirm_long(df1: pd.DataFrame) -> bool:
@@ -849,7 +883,7 @@ def maybe_scale_in(asset_key: str, sig: dict):
 
     if state["TRADE_SIDE"] == "LONG":
         favorable_move = price >= state["AVG_ENTRY_PRICE"] + (atr_now * cfg["SCALE_IN_ATR_STEP"])
-        if favorable_move and sig["confirm_long"] and sig["long_score"] >= LONG_ALERT_SCORE and long_not_chasing(asset_key, sig["df1"]):
+        if favorable_move and sig["confirm_long"] and sig["long_score"] >= LONG_ALERT_SCORE and long_not_chasing(asset_key, sig["df1"]) and pro_entry_guard(asset_key, sig, "LONG"):
             old_avg = state["AVG_ENTRY_PRICE"]
             state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
             state["SCALE_COUNT"] += 1
@@ -867,7 +901,7 @@ def maybe_scale_in(asset_key: str, sig: dict):
 
     elif state["TRADE_SIDE"] == "SHORT":
         favorable_move = price <= state["AVG_ENTRY_PRICE"] - (atr_now * cfg["SCALE_IN_ATR_STEP"])
-        if favorable_move and sig["confirm_short"] and sig["short_score"] >= SHORT_ALERT_SCORE and short_not_chasing(asset_key, sig["df1"]):
+        if favorable_move and sig["confirm_short"] and sig["short_score"] >= SHORT_ALERT_SCORE and short_not_chasing(asset_key, sig["df1"]) and pro_entry_guard(asset_key, sig, "SHORT"):
             old_avg = state["AVG_ENTRY_PRICE"]
             state["AVG_ENTRY_PRICE"] = (state["AVG_ENTRY_PRICE"] * state["SCALE_COUNT"] + price) / (state["SCALE_COUNT"] + 1)
             state["SCALE_COUNT"] += 1
@@ -971,7 +1005,7 @@ def manage_trade(asset_key: str, sig: dict):
 # ============================================================
 def run():
     time.sleep(5)
-    send(f"{E_FIRE} BTC + GOLD BOT LIVE {E_FIRE}\nTime: {time.strftime('%H:%M:%S')}")
+    send(f"{E_FIRE} BTC + GOLD PRO BOT LIVE {E_FIRE}\nTime: {time.strftime('%H:%M:%S')}\nMode: PRO FILTERS ON")
 
     while True:
         try:
@@ -1007,18 +1041,14 @@ def run():
 
                     if (
                         sig["long_score"] >= A_SETUP_SCORE
-                        and sig["trend"] == "BULLISH"
-                        and sig["htf_bias"] in ["BULL", "STRONG_BULL"]
                         and sig["confirm_long"]
                         and long_not_chasing(asset_key, sig["df1"])
-                        and (sig["long_pullback"] or sig["long_breakout"] or sig["long_sniper"])
+                        and pro_entry_guard(asset_key, sig, "LONG")
+                        and (sig["long_pullback"] or sig["long_breakout"])
                     ):
                         trigger = "A SETUP"
                         if sig["long_breakout"]:
                             trigger = "BREAKOUT"
-                        elif sig["long_sniper"]:
-                            trigger = "SNIPER"
-
                         start_trade(
                             asset_key=asset_key,
                             side="LONG",
@@ -1030,18 +1060,14 @@ def run():
 
                     elif (
                         sig["short_score"] >= A_SETUP_SCORE
-                        and sig["trend"] == "BEARISH"
-                        and sig["htf_bias"] in ["BEAR", "STRONG_BEAR"]
                         and sig["confirm_short"]
                         and short_not_chasing(asset_key, sig["df1"])
-                        and (sig["short_pullback"] or sig["short_breakout"] or sig["short_sniper"])
+                        and pro_entry_guard(asset_key, sig, "SHORT")
+                        and (sig["short_pullback"] or sig["short_breakout"])
                     ):
                         trigger = "A SETUP"
                         if sig["short_breakout"]:
                             trigger = "BREAKOUT"
-                        elif sig["short_sniper"]:
-                            trigger = "SNIPER"
-
                         start_trade(
                             asset_key=asset_key,
                             side="SHORT",
