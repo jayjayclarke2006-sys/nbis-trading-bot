@@ -10,31 +10,7 @@ from zoneinfo import ZoneInfo
 # ============================================================
 # NBIS BTC + GOLD LIVE TELEGRAM BOT
 # PRO LIQUIDITY SWEEP VERSION
-# ============================================================
-#
-# Live logic:
-# 1. Build Asia high / low.
-# 2. Mark London 09:30 candle high / low.
-# 3. Wait for liquidity sweep:
-#    - sweep Asia high then reject = short bias
-#    - sweep Asia low then reclaim = long bias
-# 4. Entry only after confirmation break:
-#    - short: close below London 09:30 low
-#    - long: close above London 09:30 high
-# 5. Stops:
-#    - short SL above sweep high + ATR buffer
-#    - long SL below sweep low + ATR buffer
-# 6. TP:
-#    - fixed RR target
-# 7. Telegram:
-#    - startup
-#    - heartbeats
-#    - entries
-#    - break-even
-#    - trailing stop
-#    - TP / SL hit
-#
-# This is live alert logic, not auto execution.
+# FIXED: AUTO BACKFILLS ASIA + LONDON LEVELS FROM PREVIOUS CANDLES
 # ============================================================
 
 # ============================================================
@@ -51,6 +27,8 @@ E_CROSS = "\u274C"
 E_ZAP = "\u26A1"
 E_MONEY = "\U0001F4B0"
 E_UP = "\U0001F4C8"
+E_CHART = "\U0001F4CA"
+E_PIN = "\U0001F4CD"
 
 # ============================================================
 # ENV
@@ -63,7 +41,7 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 # CONFIG
 # ============================================================
 CHECK_INTERVAL = 60
-HEARTBEAT_SECONDS = 300
+HEARTBEAT_SECONDS = 3100
 DATA_FAIL_ALERT_COOLDOWN = 1800
 
 TIMEZONE = "Europe/London"
@@ -74,6 +52,10 @@ ASIA_END = "06:00"
 LONDON_MARK_TIME = "09:30"
 TRADE_START = "09:30"
 TRADE_END = "16:00"
+
+# Extra institutional windows
+NY_OPEN_TIME = "13:30"
+NY_CONTINUATION_TIME = "14:30"
 
 ONE_TRADE_PER_DAY = True
 
@@ -144,6 +126,10 @@ STATE = {
         "LAST_DATA_FAIL": 0.0,
         "DATA_SOURCE": "UNKNOWN",
         "LAST_PRICE": None,
+
+        "BACKFILLED_TODAY": False,
+        "BACKFILL_ALERT_SENT": False,
+        "LONDON_MARK_ALERT_SENT": False,
     }
     for asset in ASSETS
 }
@@ -427,6 +413,107 @@ def reset_day(asset_key: str, dt: datetime):
     s["SWEEP_HIGH_EXTREME"] = None
     s["SWEEP_LOW_EXTREME"] = None
     s["TRADED_TODAY"] = False
+    s["BACKFILLED_TODAY"] = False
+    s["BACKFILL_ALERT_SENT"] = False
+    s["LONDON_MARK_ALERT_SENT"] = False
+
+def backfill_sessions(asset_key: str, df1: pd.DataFrame, dt: datetime):
+    """
+    FIXED: Rebuilds today's Asia range and London 09:30 mark from previous 1m candles.
+    This means the bot works even if you start it after Asia / after London / mid NY.
+    """
+    s = STATE[asset_key]
+
+    if s["BACKFILLED_TODAY"]:
+        return
+
+    if df1.empty or len(df1) < 120:
+        return
+
+    df = df1.copy()
+
+    # Assumes the latest row is now and candles are 1-minute. This matches the live feeds used here.
+    df["dt"] = pd.date_range(end=dt, periods=len(df), freq="min")
+
+    today = dt.date()
+
+    asia_high = None
+    asia_low = None
+    london_high = None
+    london_low = None
+
+    # Also detect already-swept levels from the historical part of today.
+    swept_high = False
+    swept_low = False
+    sweep_high_extreme = None
+    sweep_low_extreme = None
+
+    for _, row in df.iterrows():
+        candle_dt = row["dt"].to_pydatetime() if hasattr(row["dt"], "to_pydatetime") else row["dt"]
+
+        if candle_dt.date() != today:
+            continue
+
+        m = minute_of_day(candle_dt)
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+
+        # Build Asia range from 00:00-06:00.
+        if to_minutes(ASIA_START) <= m <= to_minutes(ASIA_END):
+            asia_high = h if asia_high is None else max(asia_high, h)
+            asia_low = l if asia_low is None else min(asia_low, l)
+
+        # Mark London 09:30 candle.
+        if m == to_minutes(LONDON_MARK_TIME):
+            london_high = h
+            london_low = l
+
+        # Once Asia levels are known, scan if they were already swept after Asia ended.
+        if asia_high is not None and asia_low is not None and m > to_minutes(ASIA_END):
+            if h > asia_high and c < asia_high:
+                swept_high = True
+                sweep_high_extreme = h if sweep_high_extreme is None else max(sweep_high_extreme, h)
+
+            if l < asia_low and c > asia_low:
+                swept_low = True
+                sweep_low_extreme = l if sweep_low_extreme is None else min(sweep_low_extreme, l)
+
+    changed = False
+
+    if s["ASIA_HIGH"] is None and asia_high is not None:
+        s["ASIA_HIGH"] = asia_high
+        s["ASIA_LOW"] = asia_low
+        changed = True
+
+    if s["LONDON_HIGH"] is None and london_high is not None:
+        s["LONDON_HIGH"] = london_high
+        s["LONDON_LOW"] = london_low
+        changed = True
+
+    if swept_high and not s["SWEPT_HIGH"]:
+        s["SWEPT_HIGH"] = True
+        s["SWEEP_HIGH_EXTREME"] = sweep_high_extreme
+        changed = True
+
+    if swept_low and not s["SWEPT_LOW"]:
+        s["SWEPT_LOW"] = True
+        s["SWEEP_LOW_EXTREME"] = sweep_low_extreme
+        changed = True
+
+    s["BACKFILLED_TODAY"] = True
+
+    if changed and not s["BACKFILL_ALERT_SENT"]:
+        send(
+            f"{E_CHART} {asset_key} MARKET BACKFILLED\n\n"
+            f"Asia High: {fmt_level(s['ASIA_HIGH'])}\n"
+            f"Asia Low: {fmt_level(s['ASIA_LOW'])}\n"
+            f"London High: {fmt_level(s['LONDON_HIGH'])}\n"
+            f"London Low: {fmt_level(s['LONDON_LOW'])}\n"
+            f"Swept High: {'YES' if s['SWEPT_HIGH'] else 'NO'}\n"
+            f"Swept Low: {'YES' if s['SWEPT_LOW'] else 'NO'}"
+        )
+        s["BACKFILL_ALERT_SENT"] = True
 
 def build_asia_range(asset_key: str, df1: pd.DataFrame, dt: datetime):
     if not in_window(dt, ASIA_START, ASIA_END):
@@ -451,13 +538,15 @@ def mark_london_reference(asset_key: str, df1: pd.DataFrame, dt: datetime):
     s["LONDON_HIGH"] = float(r["high"])
     s["LONDON_LOW"] = float(r["low"])
 
-    send(
-        f"{E_CHECK} {asset_key} LONDON MARK SET\n\n"
-        f"High: ${s['LONDON_HIGH']:.2f}\n"
-        f"Low: ${s['LONDON_LOW']:.2f}\n"
-        f"Asia High: ${s['ASIA_HIGH']:.2f}\n"
-        f"Asia Low: ${s['ASIA_LOW']:.2f}"
-    )
+    if not s["LONDON_MARK_ALERT_SENT"]:
+        send(
+            f"{E_CHECK} {asset_key} LONDON MARK SET\n\n"
+            f"High: ${s['LONDON_HIGH']:.2f}\n"
+            f"Low: ${s['LONDON_LOW']:.2f}\n"
+            f"Asia High: {fmt_level(s['ASIA_HIGH'])}\n"
+            f"Asia Low: {fmt_level(s['ASIA_LOW'])}"
+        )
+        s["LONDON_MARK_ALERT_SENT"] = True
 
 def detect_sweep(asset_key: str, df1: pd.DataFrame):
     s = STATE[asset_key]
@@ -533,6 +622,10 @@ def get_live_signal(asset_key: str):
     dt = now_london()
     reset_day(asset_key, dt)
 
+    # KEY FIX: scan previous market first, so bot works even if started late.
+    backfill_sessions(asset_key, df1, dt)
+
+    # Then keep building live levels normally.
     build_asia_range(asset_key, df1, dt)
     mark_london_reference(asset_key, df1, dt)
 
@@ -572,8 +665,9 @@ def get_live_signal(asset_key: str):
 
     close = float(r["close"])
     open_ = float(r["open"])
+    current_min = minute_of_day(dt)
 
-    # Long: Asia low swept, then bullish close above London mark high.
+    # Original long: Asia low swept, then bullish close above London mark high.
     if (
         s["SWEPT_LOW"]
         and close > s["LONDON_HIGH"]
@@ -584,7 +678,7 @@ def get_live_signal(asset_key: str):
         signal["reason"] = "ASIA_LOW_SWEEP_RECLAIM_BREAK_LONDON_HIGH"
         return signal
 
-    # Short: Asia high swept, then bearish close below London mark low.
+    # Original short: Asia high swept, then bearish close below London mark low.
     if (
         s["SWEPT_HIGH"]
         and close < s["LONDON_LOW"]
@@ -594,6 +688,48 @@ def get_live_signal(asset_key: str):
         signal["side"] = "SHORT"
         signal["reason"] = "ASIA_HIGH_SWEEP_REJECT_BREAK_LONDON_LOW"
         return signal
+
+    # NY open model: after 13:30, if sweep has happened, allow confirmation back through Asia level.
+    if current_min >= to_minutes(NY_OPEN_TIME):
+        if (
+            s["SWEPT_HIGH"]
+            and close < s["ASIA_HIGH"]
+            and close < open_
+            and short_filter(asset_key, r)
+        ):
+            signal["side"] = "SHORT"
+            signal["reason"] = "NY_OPEN_ASIA_HIGH_SWEEP_REJECTION"
+            return signal
+
+        if (
+            s["SWEPT_LOW"]
+            and close > s["ASIA_LOW"]
+            and close > open_
+            and long_filter(asset_key, r)
+        ):
+            signal["side"] = "LONG"
+            signal["reason"] = "NY_OPEN_ASIA_LOW_SWEEP_RECLAIM"
+            return signal
+
+    # 14:30 continuation model: use London mark breakout/breakdown after NY has opened.
+    if current_min >= to_minutes(NY_CONTINUATION_TIME):
+        if (
+            close > s["LONDON_HIGH"]
+            and close > open_
+            and long_filter(asset_key, r)
+        ):
+            signal["side"] = "LONG"
+            signal["reason"] = "NY_1430_LONDON_HIGH_CONTINUATION"
+            return signal
+
+        if (
+            close < s["LONDON_LOW"]
+            and close < open_
+            and short_filter(asset_key, r)
+        ):
+            signal["side"] = "SHORT"
+            signal["reason"] = "NY_1430_LONDON_LOW_CONTINUATION"
+            return signal
 
     signal["reason"] = "NO_CONFIRMATION"
     return signal
@@ -678,7 +814,7 @@ def start_trade(asset_key: str, sig):
 
     send(
         f"{icon} {asset_key} {side} ENTRY\n\n"
-        f"Model: ASIA LIQUIDITY SWEEP\n"
+        f"Model: ASIA / LONDON / NY LIQUIDITY SWEEP\n"
         f"Reason: {sig['reason']}\n"
         f"Entry: ${price:.2f}\n"
         f"SL: ${sl:.2f}\n"
@@ -773,7 +909,8 @@ def run():
     send(
         f"{E_FIRE} BTC + GOLD LIQUIDITY SWEEP BOT LIVE {E_FIRE}\n"
         f"Time: {now_london().strftime('%H:%M:%S')}\n"
-        f"Model: Asia sweep + London 09:30 confirmation"
+        f"Model: Asia sweep + London 09:30 + NY 13:30/14:30\n"
+        f"Backfill: ON"
     )
 
     while True:
