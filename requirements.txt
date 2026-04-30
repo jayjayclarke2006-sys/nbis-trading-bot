@@ -1,5 +1,5 @@
-alpaca-trade-api
-yfinance
+MetaTrader5
 pandas
+python-dotenv
 requests
-flask
+pytz
