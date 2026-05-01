@@ -1,251 +1,234 @@
 import os
 import time
-from datetime import datetime, time as dtime
-import pytz
 import requests
 import pandas as pd
-import MetaTrader5 as mt5
-from dotenv import load_dotenv
-
-load_dotenv()
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # =========================
-# ENV VARIABLES
+# CONFIG
 # =========================
-SYMBOL = os.getenv("SYMBOL", "XAUUSD")
-LOT = float(os.getenv("LOT", "0.10"))
-TZ = pytz.timezone(os.getenv("BOT_TIMEZONE", "Europe/London"))
+TIMEZONE = "Europe/London"
+CHECK_INTERVAL = 60
 
-MT5_LOGIN = int(os.getenv("MT5_LOGIN"))
-MT5_PASSWORD = os.getenv("MT5_PASSWORD")
-MT5_SERVER = os.getenv("MT5_SERVER")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-RR = 2.0
-MAGIC = 30001
+ASSETS = ["BTCUSDT"]
 
 # =========================
-# SESSIONS
+# STATE
 # =========================
-SESSIONS = [
-    {"name": "London 09:30", "mark_time": dtime(9, 30), "close_time": dtime(14, 30)},
-    {"name": "New York 16:00", "mark_time": dtime(16, 0), "close_time": None},
-    {"name": "Asia +1h", "mark_time": dtime(1, 0), "close_time": None},
-]
-
-state = {
-    s["name"]: {
-        "marked_date": None,
-        "high": None,
-        "low": None,
-        "traded": False,
+STATE = {
+    a: {
+        "range_high": None,
+        "range_low": None,
+        "range_set": False,
+        "break_side": None,
+        "retest_done": False,
+        "last_update": None,
     }
-    for s in SESSIONS
+    for a in ASSETS
 }
 
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN:
+def send(msg):
+    print(msg)
+    if not TELEGRAM_TOKEN or not CHAT_ID:
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
-
-
-# =========================
-# MT5 CONNECTION
-# =========================
-def connect_mt5():
-    if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
-        raise RuntimeError(mt5.last_error())
-
-    if not mt5.symbol_select(SYMBOL, True):
-        raise RuntimeError(f"Symbol not found: {SYMBOL}")
-
-    send_telegram(f"✅ Connected to MT5 ({SYMBOL})")
-
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+        )
+    except:
+        pass
 
 # =========================
 # DATA
 # =========================
-def get_rates(tf, count=10):
-    rates = mt5.copy_rates_from_pos(SYMBOL, tf, 0, count)
-    if rates is None:
-        return None
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(TZ)
-    return df
-
-
-# =========================
-# MARK 30M RANGE
-# =========================
-def mark_range(session_name):
-    df = get_rates(mt5.TIMEFRAME_M30, 3)
-    if df is None or len(df) < 2:
-        return
-
-    candle = df.iloc[-2]
-
-    state[session_name]["high"] = float(candle["high"])
-    state[session_name]["low"] = float(candle["low"])
-    state[session_name]["traded"] = False
-    state[session_name]["marked_date"] = datetime.now(TZ).date()
-
-    send_telegram(
-        f"📌 {session_name}\nHigh: {candle['high']}\nLow: {candle['low']}"
-    )
-
-
-# =========================
-# CHECK BREAKOUT
-# =========================
-def check_breakout(session_name):
-    if state[session_name]["traded"]:
-        return
-
-    high = state[session_name]["high"]
-    low = state[session_name]["low"]
-
-    if high is None:
-        return
-
-    df = get_rates(mt5.TIMEFRAME_M5, 3)
-    if df is None or len(df) < 2:
-        return
-
-    candle = df.iloc[-2]
-    close = float(candle["close"])
-
-    buffer = 0.2  # gold noise filter
-
-    if close > high + buffer:
-        place_trade("BUY", session_name)
-
-    elif close < low - buffer:
-        place_trade("SELL", session_name)
-
-
-# =========================
-# PLACE TRADE
-# =========================
-def place_trade(direction, session_name):
-    tick = mt5.symbol_info_tick(SYMBOL)
-
-    spread = tick.ask - tick.bid
-    if spread > 0.5:
-        send_telegram(f"⚠️ Spread too high: {spread}")
-        return
-
-    high = state[session_name]["high"]
-    low = state[session_name]["low"]
-
-    if direction == "BUY":
-        price = tick.ask
-        sl = low
-        risk = price - sl
-        tp = price + risk * RR
-        order_type = mt5.ORDER_TYPE_BUY
-    else:
-        price = tick.bid
-        sl = high
-        risk = sl - price
-        tp = price - risk * RR
-        order_type = mt5.ORDER_TYPE_SELL
-
-    if risk <= 0:
-        return
-
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": SYMBOL,
-        "volume": LOT,
-        "type": order_type,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
-        "deviation": 20,
-        "magic": MAGIC,
-        "comment": session_name,
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    result = mt5.order_send(request)
-
-    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-        state[session_name]["traded"] = True
-
-        send_telegram(
-            f"🚀 {direction} {session_name}\nEntry: {price}\nSL: {sl}\nTP: {tp}"
+def get_binance(symbol, interval="15m", limit=200):
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10
         )
-    else:
-        send_telegram(f"❌ Trade failed {result}")
 
+        data = r.json()
+
+        if not isinstance(data, list):
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data, columns=[
+            "t","o","h","l","c","v","ct","q","n","tb","tq","ig"
+        ])
+
+        df.columns = ["time","open","high","low","close","volume","x","x2","x3","x4","x5","x6"]
+
+        df = df[["open","high","low","close"]].astype(float)
+
+        return df
+
+    except:
+        return pd.DataFrame()
 
 # =========================
-# CLOSE POSITION
+# TIME HELPERS
 # =========================
-def close_all():
-    positions = mt5.positions_get(symbol=SYMBOL)
-    if positions is None:
+def now():
+    return datetime.now(ZoneInfo(TIMEZONE))
+
+# =========================
+# RANGE LOGIC
+# =========================
+def update_range(asset):
+    df30 = get_binance(asset, "30m")
+
+    if df30.empty:
         return
 
-    for p in positions:
-        tick = mt5.symbol_info_tick(SYMBOL)
+    t = now()
+    s = STATE[asset]
 
-        if p.type == mt5.POSITION_TYPE_BUY:
-            order_type = mt5.ORDER_TYPE_SELL
-            price = tick.bid
-        else:
-            order_type = mt5.ORDER_TYPE_BUY
-            price = tick.ask
+    # =========================
+    # 08:00 CANDLE (SET AT 08:30)
+    # =========================
+    if t.hour == 8 and t.minute == 30 and s["last_update"] != "08":
 
-        mt5.order_send({
-            "action": mt5.TRADE_ACTION_DEAL,
-            "position": p.ticket,
-            "symbol": SYMBOL,
-            "volume": p.volume,
-            "type": order_type,
-            "price": price,
-            "deviation": 20,
-            "magic": MAGIC,
-        })
+        candle = df30.iloc[-1]  # 08:00–08:30 candle
 
-    send_telegram("🔒 Positions closed")
+        s["range_high"] = candle["high"]
+        s["range_low"] = candle["low"]
+        s["range_set"] = True
+        s["break_side"] = None
+        s["retest_done"] = False
+        s["last_update"] = "08"
 
+        send(
+            f"🔥 {asset} 08:00 RANGE SET\n\n"
+            f"High: {candle['high']}\n"
+            f"Low: {candle['low']}"
+        )
+
+    # =========================
+    # 16:00 CANDLE (SET AT 16:30)
+    # =========================
+    if t.hour == 16 and t.minute == 30 and s["last_update"] != "16":
+
+        candle = df30.iloc[-1]  # 16:00–16:30 candle
+
+        s["range_high"] = candle["high"]
+        s["range_low"] = candle["low"]
+        s["range_set"] = True
+        s["break_side"] = None
+        s["retest_done"] = False
+        s["last_update"] = "16"
+
+        send(
+            f"🔥 {asset} 16:00 RANGE SET\n\n"
+            f"High: {candle['high']}\n"
+            f"Low: {candle['low']}"
+        )
+
+# =========================
+# TRADE LOGIC
+# =========================
+def check_trade(asset):
+    s = STATE[asset]
+
+    if not s["range_set"]:
+        return
+
+    df15 = get_binance(asset, "15m")
+
+    if df15.empty:
+        return
+
+    r = df15.iloc[-1]
+
+    close = r["close"]
+    high = r["high"]
+    low = r["low"]
+    open_ = r["open"]
+
+    # =========================
+    # STEP 1: BREAK
+    # =========================
+    if s["break_side"] is None:
+
+        if close > s["range_high"]:
+            s["break_side"] = "LONG"
+
+        elif close < s["range_low"]:
+            s["break_side"] = "SHORT"
+
+    # =========================
+    # STEP 2: RETEST
+    # =========================
+    if s["break_side"] == "LONG" and not s["retest_done"]:
+        if low <= s["range_high"]:
+            s["retest_done"] = True
+
+    if s["break_side"] == "SHORT" and not s["retest_done"]:
+        if high >= s["range_low"]:
+            s["retest_done"] = True
+
+    # =========================
+    # STEP 3: ENTRY
+    # =========================
+    if s["break_side"] == "LONG" and s["retest_done"]:
+
+        if close > open_:
+            entry = close
+            sl = low
+            tp = entry + (entry - sl) * 2
+
+            send(
+                f"🚀 LONG ENTRY\n\n"
+                f"Entry: {entry}\n"
+                f"SL: {sl}\n"
+                f"TP: {tp}"
+            )
+
+            s["range_set"] = False
+
+    if s["break_side"] == "SHORT" and s["retest_done"]:
+
+        if close < open_:
+            entry = close
+            sl = high
+            tp = entry - (sl - entry) * 2
+
+            send(
+                f"📉 SHORT ENTRY\n\n"
+                f"Entry: {entry}\n"
+                f"SL: {sl}\n"
+                f"TP: {tp}"
+            )
+
+            s["range_set"] = False
 
 # =========================
 # MAIN LOOP
 # =========================
-def main():
-    connect_mt5()
+def run():
+
+    send("🔥 BOT LIVE - 08:00 / 16:00 MODEL 🔥")
 
     while True:
-        now = datetime.now(TZ)
+        try:
+            for asset in ASSETS:
+                update_range(asset)
+                check_trade(asset)
 
-        for s in SESSIONS:
-            name = s["name"]
+            time.sleep(CHECK_INTERVAL)
 
-            if now.hour == s["mark_time"].hour and now.minute == s["mark_time"].minute:
-                if state[name]["marked_date"] != now.date():
-                    mark_range(name)
-
-            if state[name]["marked_date"] == now.date():
-                check_breakout(name)
-
-            if s["close_time"]:
-                if now.hour == s["close_time"].hour and now.minute == s["close_time"].minute:
-                    close_all()
-
-        time.sleep(10)
-
+        except Exception as e:
+            send(f"⚠️ ERROR:\n{e}")
+            time.sleep(10)
 
 if __name__ == "__main__":
-    main()
-
-
-       
+    run()
