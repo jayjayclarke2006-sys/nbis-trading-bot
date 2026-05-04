@@ -1,7 +1,7 @@
-import os
-import time
-import requests
 import pandas as pd
+import yfinance as yf
+import requests
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -9,101 +9,29 @@ from zoneinfo import ZoneInfo
 # CONFIG
 # =========================
 TIMEZONE = "Europe/London"
+SYMBOL = "BTC-USD"
+
+RR = 2.0
 CHECK_INTERVAL = 60
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+MODE = "BACKTEST"  # CHANGE TO "LIVE" WHEN READY
 
-ASSETS = ["BTCUSDT"]
-
-RR_TARGET = 2.0
-HTF_EMA_LEN = 50
-ATR_LEN = 14
-
-MIN_BODY_ATR = 0.35
-MAX_BODY_ATR = 1.8
-RETEST_BUFFER_ATR = 0.15
-
-# =========================
-# STATE
-# =========================
-STATE = {
-    a: {
-        "range_high": None,
-        "range_low": None,
-        "range_set": False,
-        "break_side": None,
-        "retest_done": False,
-        "last_update": None,
-        "traded": False,
-    }
-    for a in ASSETS
-}
+# TELEGRAM
+TOKEN = "YOUR_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
 
 # =========================
 # TELEGRAM
 # =========================
 def send(msg):
     print(msg)
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return
     try:
         requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg},
-            timeout=10,
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg}
         )
-    except Exception as e:
-        print("TELEGRAM ERROR:", e)
-
-# =========================
-# DATA
-# =========================
-def get_binance(symbol, interval="15m", limit=300):
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=10,
-        )
-        data = r.json()
-        if not isinstance(data, list):
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
-            "ct","q","n","tb","tq","ig"
-        ])
-
-        df = df[["open", "high", "low", "close", "volume"]].astype(float)
-        return df.reset_index(drop=True)
-
-    except Exception as e:
-        print("DATA ERROR:", e)
-        return pd.DataFrame()
-
-# =========================
-# INDICATORS
-# =========================
-def add_indicators(df):
-    if df.empty or len(df) < 60:
-        return pd.DataFrame()
-
-    out = df.copy()
-    out["ema50"] = out["close"].ewm(span=HTF_EMA_LEN, adjust=False).mean()
-
-    tr = pd.concat([
-        out["high"] - out["low"],
-        (out["high"] - out["close"].shift()).abs(),
-        (out["low"] - out["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-
-    out["atr"] = tr.rolling(ATR_LEN).mean()
-    out["body"] = (out["close"] - out["open"]).abs()
-    out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
-    out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
-    out.dropna(inplace=True)
-    return out.reset_index(drop=True)
+    except:
+        pass
 
 # =========================
 # TIME
@@ -112,231 +40,201 @@ def now():
     return datetime.now(ZoneInfo(TIMEZONE))
 
 # =========================
-# FILTERS
+# DATA
 # =========================
-def htf_bias(asset):
-    df = add_indicators(get_binance(asset, "1h", 300))
-    if df.empty:
-        return "NONE"
-
-    r = df.iloc[-1]
-    p = df.iloc[-2]
-
-    if r["close"] > r["ema50"] and r["ema50"] > p["ema50"]:
-        return "BULL"
-
-    if r["close"] < r["ema50"] and r["ema50"] < p["ema50"]:
-        return "BEAR"
-
-    return "CHOP"
-
-def strong_rejection(open_, high, low, close, side):
-    body = abs(close - open_)
-    if body <= 0:
-        return False
-
-    upper_wick = high - max(open_, close)
-    lower_wick = min(open_, close) - low
-
-    if side == "LONG":
-        return close > open_ and lower_wick >= body * 0.8
-
-    if side == "SHORT":
-        return close < open_ and upper_wick >= body * 0.8
-
-    return False
-
-def candle_quality(r):
-    atr = r["atr"]
-    body = r["body"]
-
-    if atr <= 0:
-        return False
-
-    body_atr = body / atr
-
-    if body_atr < MIN_BODY_ATR:
-        return False
-
-    if body_atr > MAX_BODY_ATR:
-        return False
-
-    return True
-
-def not_choppy(df):
-    recent = df.tail(12)
-    avg_range = (recent["high"] - recent["low"]).mean()
-    atr = df.iloc[-1]["atr"]
-
-    if atr <= 0:
-        return False
-
-    return avg_range >= atr * 0.75
+def get_data():
+    df = yf.download(SYMBOL, period="30d", interval="15m", progress=False)
+    df = df.rename(columns={
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close"
+    })
+    df = df.dropna()
+    return df
 
 # =========================
-# RANGE LOGIC
+# BACKTEST ENGINE
 # =========================
-def update_range(asset):
-    df30 = get_binance(asset, "30m", 100)
-    if df30.empty:
+def backtest():
+    df = get_data()
+
+    trades = []
+
+    range_high = None
+    range_low = None
+    break_side = None
+
+    for i in range(2, len(df)):
+        candle = df.iloc[i]
+        prev = df.iloc[i-1]
+
+        t = df.index[i]
+        hour = t.tz_localize(None).hour
+        minute = t.tz_localize(None).minute
+
+        # SET RANGE (8:30 + 16:30)
+        if (hour == 8 and minute == 30) or (hour == 16 and minute == 30):
+            range_high = candle["high"]
+            range_low = candle["low"]
+            break_side = None
+
+        if range_high is None:
+            continue
+
+        close = candle["close"]
+        open_ = candle["open"]
+
+        # BREAK
+        if break_side is None:
+            if close > range_high:
+                break_side = "LONG"
+                continue
+            elif close < range_low:
+                break_side = "SHORT"
+                continue
+
+        # RETEST + REJECTION
+        if break_side == "LONG":
+            if candle["low"] <= range_high and close > open_:
+
+                entry = close
+                sl = range_low
+                tp = entry + (entry - sl) * RR
+
+                result = simulate_trade(df, i, entry, sl, tp)
+
+                trades.append(result)
+                break_side = None
+
+        if break_side == "SHORT":
+            if candle["high"] >= range_low and close < open_:
+
+                entry = close
+                sl = range_high
+                tp = entry - (sl - entry) * RR
+
+                result = simulate_trade(df, i, entry, sl, tp)
+
+                trades.append(result)
+                break_side = None
+
+    analyze(trades)
+
+# =========================
+# TRADE SIMULATION
+# =========================
+def simulate_trade(df, start_index, entry, sl, tp):
+    for j in range(start_index+1, len(df)):
+        candle = df.iloc[j]
+
+        if candle["low"] <= sl:
+            return -1  # loss
+
+        if candle["high"] >= tp:
+            return 2   # win (RR=2)
+
+    return 0
+
+# =========================
+# ANALYSIS
+# =========================
+def analyze(trades):
+    wins = trades.count(2)
+    losses = trades.count(-1)
+
+    total = len(trades)
+
+    if total == 0:
+        print("NO TRADES")
         return
 
-    t = now()
-    s = STATE[asset]
+    winrate = (wins / total) * 100
+    profit = sum(trades)
 
-    # 08:00 candle closes at 08:30
-    if t.hour == 8 and t.minute == 30 and s["last_update"] != "08":
-        candle = df30.iloc[-1]
-
-        s["range_high"] = candle["high"]
-        s["range_low"] = candle["low"]
-        s["range_set"] = True
-        s["break_side"] = None
-        s["retest_done"] = False
-        s["traded"] = False
-        s["last_update"] = "08"
-
-        send(
-            f"🔥 {asset} 08:00 RANGE SET\n\n"
-            f"High: {candle['high']:.2f}\n"
-            f"Low: {candle['low']:.2f}"
-        )
-
-    # 16:00 candle closes at 16:30
-    if t.hour == 16 and t.minute == 30 and s["last_update"] != "16":
-        candle = df30.iloc[-1]
-
-        s["range_high"] = candle["high"]
-        s["range_low"] = candle["low"]
-        s["range_set"] = True
-        s["break_side"] = None
-        s["retest_done"] = False
-        s["traded"] = False
-        s["last_update"] = "16"
-
-        send(
-            f"🔥 {asset} 16:00 RANGE SET\n\n"
-            f"High: {candle['high']:.2f}\n"
-            f"Low: {candle['low']:.2f}"
-        )
+    print("\n===== BACKTEST RESULTS =====")
+    print(f"Trades: {total}")
+    print(f"Wins: {wins}")
+    print(f"Losses: {losses}")
+    print(f"Winrate: {winrate:.2f}%")
+    print(f"Profit (R): {profit}")
 
 # =========================
-# TRADE LOGIC
+# LIVE MODE
 # =========================
-def check_trade(asset):
-    s = STATE[asset]
+STATE = {
+    "range_high": None,
+    "range_low": None,
+    "break_side": None,
+    "in_trade": False
+}
 
-    if not s["range_set"] or s["traded"]:
-        return
-
-    df15 = add_indicators(get_binance(asset, "15m", 300))
-    if df15.empty:
-        return
-
-    bias = htf_bias(asset)
-    if bias == "CHOP" or bias == "NONE":
-        return
-
-    if not not_choppy(df15):
-        return
-
-    r = df15.iloc[-1]
-
-    close = r["close"]
-    high = r["high"]
-    low = r["low"]
-    open_ = r["open"]
-    atr = r["atr"]
-
-    # STEP 1: 15m break with HTF alignment
-    if s["break_side"] is None:
-        if close > s["range_high"] and bias == "BULL" and candle_quality(r):
-            s["break_side"] = "LONG"
-            send(f"✅ {asset} 15M BREAK ABOVE RANGE\nWaiting for retest.")
-
-        elif close < s["range_low"] and bias == "BEAR" and candle_quality(r):
-            s["break_side"] = "SHORT"
-            send(f"✅ {asset} 15M BREAK BELOW RANGE\nWaiting for retest.")
-
-        return
-
-    # STEP 2: retest with buffer
-    if s["break_side"] == "LONG" and not s["retest_done"]:
-        if low <= s["range_high"] + atr * RETEST_BUFFER_ATR:
-            s["retest_done"] = True
-            send(f"📍 {asset} LONG RETEST HIT\nWaiting for rejection.")
-
-    if s["break_side"] == "SHORT" and not s["retest_done"]:
-        if high >= s["range_low"] - atr * RETEST_BUFFER_ATR:
-            s["retest_done"] = True
-            send(f"📍 {asset} SHORT RETEST HIT\nWaiting for rejection.")
-
-    # STEP 3: rejection entry
-    if s["break_side"] == "LONG" and s["retest_done"]:
-        if bias == "BULL" and strong_rejection(open_, high, low, close, "LONG") and candle_quality(r):
-            entry = close
-            sl = min(low, s["range_low"])
-            risk = entry - sl
-
-            if risk <= 0:
-                return
-
-            tp = entry + risk * RR_TARGET
-
-            send(
-                f"🚀 {asset} LONG ENTRY\n\n"
-                f"Model: 08/16 Range Break + Retest\n"
-                f"HTF Bias: {bias}\n"
-                f"Entry: {entry:.2f}\n"
-                f"SL: {sl:.2f}\n"
-                f"TP: {tp:.2f}\n"
-                f"RR: 1:{RR_TARGET}"
-            )
-
-            s["traded"] = True
-            s["range_set"] = False
-
-    if s["break_side"] == "SHORT" and s["retest_done"]:
-        if bias == "BEAR" and strong_rejection(open_, high, low, close, "SHORT") and candle_quality(r):
-            entry = close
-            sl = max(high, s["range_high"])
-            risk = sl - entry
-
-            if risk <= 0:
-                return
-
-            tp = entry - risk * RR_TARGET
-
-            send(
-                f"📉 {asset} SHORT ENTRY\n\n"
-                f"Model: 08/16 Range Break + Retest\n"
-                f"HTF Bias: {bias}\n"
-                f"Entry: {entry:.2f}\n"
-                f"SL: {sl:.2f}\n"
-                f"TP: {tp:.2f}\n"
-                f"RR: 1:{RR_TARGET}"
-            )
-
-            s["traded"] = True
-            s["range_set"] = False
-
-# =========================
-# LOOP
-# =========================
-def run():
-    send("🔥 BOT LIVE - HIGH PROBABILITY 08:00 / 16:00 MODEL 🔥")
+def live():
+    send("BOT LIVE")
 
     while True:
-        try:
-            for asset in ASSETS:
-                update_range(asset)
-                check_trade(asset)
+        df = get_data()
 
+        candle = df.iloc[-1]
+        t = df.index[-1].tz_localize(None)
+
+        hour = t.hour
+        minute = t.minute
+
+        # SET RANGE
+        if (hour == 8 and minute == 30) or (hour == 16 and minute == 30):
+            STATE["range_high"] = candle["high"]
+            STATE["range_low"] = candle["low"]
+            STATE["break_side"] = None
+
+            send(f"Range set\nHigh: {STATE['range_high']}\nLow: {STATE['range_low']}")
+
+        if STATE["range_high"] is None:
             time.sleep(CHECK_INTERVAL)
+            continue
 
-        except Exception as e:
-            send(f"⚠️ ERROR:\n{e}")
-            time.sleep(10)
+        close = candle["close"]
+        open_ = candle["open"]
 
+        # BREAK
+        if STATE["break_side"] is None:
+            if close > STATE["range_high"]:
+                STATE["break_side"] = "LONG"
+                send("BREAK UP")
+
+            elif close < STATE["range_low"]:
+                STATE["break_side"] = "SHORT"
+                send("BREAK DOWN")
+
+        # ENTRY
+        if not STATE["in_trade"]:
+            if STATE["break_side"] == "LONG":
+                if candle["low"] <= STATE["range_high"] and close > open_:
+
+                    entry = close
+                    sl = STATE["range_low"]
+                    tp = entry + (entry - sl) * RR
+
+                    send(f"LONG\nEntry: {entry}\nSL: {sl}\nTP: {tp}")
+                    STATE["in_trade"] = True
+
+            if STATE["break_side"] == "SHORT":
+                if candle["high"] >= STATE["range_low"] and close < open_:
+
+                    entry = close
+                    sl = STATE["range_high"]
+                    tp = entry - (sl - entry) * RR
+
+                    send(f"SHORT\nEntry: {entry}\nSL: {sl}\nTP: {tp}")
+                    STATE["in_trade"] = True
+
+        time.sleep(CHECK_INTERVAL)
+
+# =========================
+# RUN
+# =========================
 if __name__ == "__main__":
-    run()
+    if MODE == "BACKTEST":
+        backtest()
+    else:
+        live()
