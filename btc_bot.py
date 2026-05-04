@@ -9,12 +9,15 @@ from zoneinfo import ZoneInfo
 # CONFIG
 # =========================
 TIMEZONE = "Europe/London"
-SYMBOL = "BTC-USD"
+
+SYMBOLS = {
+    "BTC": "BTC-USD",
+    "GOLD": "GC=F"
+}
 
 RR = 2.0
 CHECK_INTERVAL = 60
-
-MODE = "BACKTEST"  # CHANGE TO "LIVE" WHEN READY
+MODE = "BACKTEST"  # CHANGE TO LIVE
 
 # TELEGRAM
 TOKEN = "YOUR_TOKEN"
@@ -34,30 +37,26 @@ def send(msg):
         pass
 
 # =========================
-# TIME
-# =========================
-def now():
-    return datetime.now(ZoneInfo(TIMEZONE))
-
-# =========================
 # DATA
 # =========================
-def get_data():
-    df = yf.download(SYMBOL, period="30d", interval="15m", progress=False)
+def get_data(symbol):
+    df = yf.download(symbol, period="30d", interval="15m", progress=False)
+
     df = df.rename(columns={
         "Open": "open",
         "High": "high",
         "Low": "low",
         "Close": "close"
     })
+
     df = df.dropna()
     return df
 
 # =========================
-# BACKTEST ENGINE
+# BACKTEST
 # =========================
-def backtest():
-    df = get_data()
+def backtest_asset(name, symbol):
+    df = get_data(symbol)
 
     trades = []
 
@@ -67,13 +66,12 @@ def backtest():
 
     for i in range(2, len(df)):
         candle = df.iloc[i]
-        prev = df.iloc[i-1]
+        t = df.index[i].tz_localize(None)
 
-        t = df.index[i]
-        hour = t.tz_localize(None).hour
-        minute = t.tz_localize(None).minute
+        hour = t.hour
+        minute = t.minute
 
-        # SET RANGE (8:30 + 16:30)
+        # 8:30 + 16:30 candles
         if (hour == 8 and minute == 30) or (hour == 16 and minute == 30):
             range_high = candle["high"]
             range_low = candle["low"]
@@ -94,139 +92,129 @@ def backtest():
                 break_side = "SHORT"
                 continue
 
-        # RETEST + REJECTION
+        # RETEST ENTRY
         if break_side == "LONG":
             if candle["low"] <= range_high and close > open_:
-
                 entry = close
                 sl = range_low
                 tp = entry + (entry - sl) * RR
 
-                result = simulate_trade(df, i, entry, sl, tp)
-
-                trades.append(result)
+                trades.append(sim_trade(df, i, entry, sl, tp))
                 break_side = None
 
         if break_side == "SHORT":
             if candle["high"] >= range_low and close < open_:
-
                 entry = close
                 sl = range_high
                 tp = entry - (sl - entry) * RR
 
-                result = simulate_trade(df, i, entry, sl, tp)
-
-                trades.append(result)
+                trades.append(sim_trade(df, i, entry, sl, tp))
                 break_side = None
 
-    analyze(trades)
+    analyze(name, trades)
 
-# =========================
-# TRADE SIMULATION
-# =========================
-def simulate_trade(df, start_index, entry, sl, tp):
-    for j in range(start_index+1, len(df)):
+def sim_trade(df, start, entry, sl, tp):
+    for j in range(start+1, len(df)):
         candle = df.iloc[j]
 
         if candle["low"] <= sl:
-            return -1  # loss
+            return -1
 
         if candle["high"] >= tp:
-            return 2   # win (RR=2)
+            return 2
 
     return 0
 
-# =========================
-# ANALYSIS
-# =========================
-def analyze(trades):
+def analyze(name, trades):
     wins = trades.count(2)
     losses = trades.count(-1)
-
     total = len(trades)
 
     if total == 0:
-        print("NO TRADES")
+        print(f"{name}: NO TRADES")
         return
 
     winrate = (wins / total) * 100
     profit = sum(trades)
 
-    print("\n===== BACKTEST RESULTS =====")
+    print(f"\n===== {name} RESULTS =====")
     print(f"Trades: {total}")
-    print(f"Wins: {wins}")
-    print(f"Losses: {losses}")
     print(f"Winrate: {winrate:.2f}%")
     print(f"Profit (R): {profit}")
 
 # =========================
-# LIVE MODE
+# LIVE
 # =========================
 STATE = {
-    "range_high": None,
-    "range_low": None,
-    "break_side": None,
-    "in_trade": False
+    name: {
+        "range_high": None,
+        "range_low": None,
+        "break_side": None,
+        "in_trade": False
+    } for name in SYMBOLS
 }
 
 def live():
-    send("BOT LIVE")
+    send("BOT LIVE BTC + GOLD")
 
     while True:
-        df = get_data()
+        for name, symbol in SYMBOLS.items():
 
-        candle = df.iloc[-1]
-        t = df.index[-1].tz_localize(None)
+            df = get_data(symbol)
+            candle = df.iloc[-1]
 
-        hour = t.hour
-        minute = t.minute
+            t = df.index[-1].tz_localize(None)
+            hour = t.hour
+            minute = t.minute
 
-        # SET RANGE
-        if (hour == 8 and minute == 30) or (hour == 16 and minute == 30):
-            STATE["range_high"] = candle["high"]
-            STATE["range_low"] = candle["low"]
-            STATE["break_side"] = None
+            s = STATE[name]
 
-            send(f"Range set\nHigh: {STATE['range_high']}\nLow: {STATE['range_low']}")
+            # SET RANGE
+            if (hour == 8 and minute == 30) or (hour == 16 and minute == 30):
+                s["range_high"] = candle["high"]
+                s["range_low"] = candle["low"]
+                s["break_side"] = None
+                s["in_trade"] = False
 
-        if STATE["range_high"] is None:
-            time.sleep(CHECK_INTERVAL)
-            continue
+                send(f"{name} RANGE SET\nHigh: {s['range_high']}\nLow: {s['range_low']}")
 
-        close = candle["close"]
-        open_ = candle["open"]
+            if s["range_high"] is None:
+                continue
 
-        # BREAK
-        if STATE["break_side"] is None:
-            if close > STATE["range_high"]:
-                STATE["break_side"] = "LONG"
-                send("BREAK UP")
+            close = candle["close"]
+            open_ = candle["open"]
 
-            elif close < STATE["range_low"]:
-                STATE["break_side"] = "SHORT"
-                send("BREAK DOWN")
+            # BREAK
+            if s["break_side"] is None:
+                if close > s["range_high"]:
+                    s["break_side"] = "LONG"
+                    send(f"{name} BREAK UP")
 
-        # ENTRY
-        if not STATE["in_trade"]:
-            if STATE["break_side"] == "LONG":
-                if candle["low"] <= STATE["range_high"] and close > open_:
+                elif close < s["range_low"]:
+                    s["break_side"] = "SHORT"
+                    send(f"{name} BREAK DOWN")
 
-                    entry = close
-                    sl = STATE["range_low"]
-                    tp = entry + (entry - sl) * RR
+            # ENTRY
+            if not s["in_trade"]:
+                if s["break_side"] == "LONG":
+                    if candle["low"] <= s["range_high"] and close > open_:
 
-                    send(f"LONG\nEntry: {entry}\nSL: {sl}\nTP: {tp}")
-                    STATE["in_trade"] = True
+                        entry = close
+                        sl = s["range_low"]
+                        tp = entry + (entry - sl) * RR
 
-            if STATE["break_side"] == "SHORT":
-                if candle["high"] >= STATE["range_low"] and close < open_:
+                        send(f"{name} LONG\nEntry: {entry}\nSL: {sl}\nTP: {tp}")
+                        s["in_trade"] = True
 
-                    entry = close
-                    sl = STATE["range_high"]
-                    tp = entry - (sl - entry) * RR
+                if s["break_side"] == "SHORT":
+                    if candle["high"] >= s["range_low"] and close < open_:
 
-                    send(f"SHORT\nEntry: {entry}\nSL: {sl}\nTP: {tp}")
-                    STATE["in_trade"] = True
+                        entry = close
+                        sl = s["range_high"]
+                        tp = entry - (sl - entry) * RR
+
+                        send(f"{name} SHORT\nEntry: {entry}\nSL: {sl}\nTP: {tp}")
+                        s["in_trade"] = True
 
         time.sleep(CHECK_INTERVAL)
 
@@ -235,6 +223,7 @@ def live():
 # =========================
 if __name__ == "__main__":
     if MODE == "BACKTEST":
-        backtest()
+        for name, symbol in SYMBOLS.items():
+            backtest_asset(name, symbol)
     else:
         live()
