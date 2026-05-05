@@ -2,6 +2,8 @@ import ccxt
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+
 from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
@@ -11,9 +13,6 @@ from ta.volatility import AverageTrueRange
 # SETTINGS
 # =========================
 
-BTC_SYMBOL = "BTC/USDT"
-GOLD_SYMBOL = "GC=F"
-
 TIMEFRAME = "1h"
 BTC_LIMIT = 1500
 GOLD_PERIOD = "730d"
@@ -22,27 +21,93 @@ FEE = 0.0006
 INITIAL_BALANCE = 10_000
 RISK_PER_TRADE = 0.01
 
+TRAIN_SIZE = 500
+TEST_SIZE = 150
+MONTE_CARLO_RUNS = 1000
+
+EXCHANGES = [
+    ("coinbase", "BTC/USD"),
+    ("kraken", "BTC/USD"),
+    ("bybit", "BTC/USDT"),
+    ("binanceus", "BTC/USDT"),
+]
+
 
 # =========================
-# DATA
+# DATA ENGINE
 # =========================
+
+def get_exchange(name):
+    return getattr(ccxt, name)({
+        "enableRateLimit": True,
+        "timeout": 10000,
+    })
+
+
+def validate_data(df):
+    if df is None or len(df) < 300:
+        return False, "Not enough candles"
+
+    if df.isna().sum().sum() > 0:
+        return False, "NaN values detected"
+
+    if (df["Volume"] == 0).mean() > 0.20:
+        return False, "Too many zero-volume candles"
+
+    df = df.sort_values("timestamp").copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    diffs = df["timestamp"].diff().dropna()
+
+    if len(diffs) == 0:
+        return False, "Timestamp error"
+
+    expected = diffs.mode()[0]
+    gap_ratio = (diffs > expected * 1.5).mean()
+
+    if gap_ratio > 0.10:
+        return False, "Too many candle gaps"
+
+    return True, "OK"
+
 
 def fetch_btc():
-    exchange = ccxt.binance()
-    candles = exchange.fetch_ohlcv(BTC_SYMBOL, timeframe=TIMEFRAME, limit=BTC_LIMIT)
+    for name, symbol in EXCHANGES:
+        try:
+            exchange = get_exchange(name)
+            print(f"Trying BTC feed: {name}")
 
-    df = pd.DataFrame(
-        candles,
-        columns=["timestamp", "Open", "High", "Low", "Close", "Volume"]
-    )
+            candles = exchange.fetch_ohlcv(
+                symbol,
+                timeframe=TIMEFRAME,
+                limit=BTC_LIMIT
+            )
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    return df
+            df = pd.DataFrame(
+                candles,
+                columns=["timestamp", "Open", "High", "Low", "Close", "Volume"]
+            )
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+
+            valid, reason = validate_data(df)
+
+            if not valid:
+                print(f"{name} rejected: {reason}")
+                continue
+
+            print(f"Using BTC feed: {name}")
+            return df
+
+        except Exception as e:
+            print(f"{name} failed: {e}")
+
+    raise Exception("No valid BTC feed available")
 
 
 def fetch_gold():
     df = yf.download(
-        GOLD_SYMBOL,
+        "GC=F",
         period=GOLD_PERIOD,
         interval=TIMEFRAME,
         auto_adjust=True,
@@ -54,7 +119,15 @@ def fetch_gold():
     elif "Date" in df.columns:
         df = df.rename(columns={"Date": "timestamp"})
 
-    return df[["timestamp", "Open", "High", "Low", "Close", "Volume"]].dropna()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df[["timestamp", "Open", "High", "Low", "Close", "Volume"]].dropna()
+
+    valid, reason = validate_data(df)
+
+    if not valid:
+        raise Exception(f"Gold data invalid: {reason}")
+
+    return df
 
 
 # =========================
@@ -69,13 +142,7 @@ def add_indicators(df):
     df["ema_200"] = EMAIndicator(df["Close"], 200).ema_indicator()
 
     df["rsi"] = RSIIndicator(df["Close"], 14).rsi()
-
-    df["adx"] = ADXIndicator(
-        df["High"],
-        df["Low"],
-        df["Close"],
-        14
-    ).adx()
+    df["adx"] = ADXIndicator(df["High"], df["Low"], df["Close"], 14).adx()
 
     df["atr"] = AverageTrueRange(
         df["High"],
@@ -90,14 +157,16 @@ def add_indicators(df):
 
 
 # =========================
-# PATTERN LOGIC
+# STRATEGY LOGIC
 # =========================
 
 def trend(row):
     if row["Close"] > row["ema_20"] > row["ema_50"] > row["ema_200"]:
         return "BULLISH"
+
     if row["Close"] < row["ema_20"] < row["ema_50"] < row["ema_200"]:
         return "BEARISH"
+
     return "NEUTRAL"
 
 
@@ -111,7 +180,11 @@ def bullish_pin(row):
     lower = min(row["Open"], row["Close"]) - row["Low"]
     upper = row["High"] - max(row["Open"], row["Close"])
 
-    return lower > body * 2.5 and upper < body * 1.2 and row["Close"] > row["Open"]
+    return (
+        lower > body * 2.5
+        and upper < body * 1.2
+        and row["Close"] > row["Open"]
+    )
 
 
 def bearish_pin(row):
@@ -124,7 +197,11 @@ def bearish_pin(row):
     upper = row["High"] - max(row["Open"], row["Close"])
     lower = min(row["Open"], row["Close"]) - row["Low"]
 
-    return upper > body * 2.5 and lower < body * 1.2 and row["Close"] < row["Open"]
+    return (
+        upper > body * 2.5
+        and lower < body * 1.2
+        and row["Close"] < row["Open"]
+    )
 
 
 def bullish_engulf(prev, curr):
@@ -211,7 +288,6 @@ def backtest(df, params):
 
         entry = df.iloc[i + 1]["Open"]
         atr = curr["atr"]
-
         risk_amount = balance * RISK_PER_TRADE
 
         if bull_signal:
@@ -226,6 +302,7 @@ def backtest(df, params):
             direction = "SHORT"
 
         if risk_per_unit <= 0:
+            equity_curve.append(balance)
             continue
 
         position_size = risk_amount / risk_per_unit
@@ -246,7 +323,7 @@ def backtest(df, params):
                     result = "WIN"
                     break
 
-            if direction == "SHORT":
+            else:
                 if candle["High"] >= stop:
                     exit_price = stop
                     result = "LOSS"
@@ -257,7 +334,8 @@ def backtest(df, params):
                     break
 
         if exit_price is None:
-            exit_price = df.iloc[min(i + params["max_hold"], len(df) - 1)]["Close"]
+            exit_index = min(i + params["max_hold"], len(df) - 1)
+            exit_price = df.iloc[exit_index]["Close"]
             result = "TIME_EXIT"
 
         if direction == "LONG":
@@ -267,6 +345,7 @@ def backtest(df, params):
 
         fees = abs(entry * position_size) * FEE + abs(exit_price * position_size) * FEE
         pnl -= fees
+
         balance += pnl
 
         trades.append({
@@ -281,10 +360,7 @@ def backtest(df, params):
 
         equity_curve.append(balance)
 
-    trades_df = pd.DataFrame(trades)
-    equity = pd.Series(equity_curve)
-
-    return trades_df, equity
+    return pd.DataFrame(trades), pd.Series(equity_curve)
 
 
 # =========================
@@ -299,20 +375,23 @@ def performance(trades, equity):
     losses = trades[trades["pnl"] <= 0]
 
     win_rate = len(wins) / len(trades)
-    profit_factor = wins["pnl"].sum() / abs(losses["pnl"].sum()) if len(losses) else np.inf
+    profit_factor = (
+        wins["pnl"].sum() / abs(losses["pnl"].sum())
+        if len(losses) else np.inf
+    )
+
     expectancy = trades["pnl"].mean()
+    total_return = equity.iloc[-1] / INITIAL_BALANCE - 1
 
     drawdown = equity / equity.cummax() - 1
-    max_dd = drawdown.min()
-
-    total_return = equity.iloc[-1] / INITIAL_BALANCE - 1
+    max_drawdown = drawdown.min()
 
     return {
         "trades": len(trades),
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "expectancy": expectancy,
-        "max_drawdown": max_dd,
+        "max_drawdown": max_drawdown,
         "total_return": total_return,
         "final_balance": equity.iloc[-1]
     }
@@ -358,17 +437,17 @@ def optimize(train_df):
         if not stats:
             continue
 
-        if stats["trades"] < 15:
+        if stats["trades"] < 10:
             continue
 
-        if stats["profit_factor"] < 1.1:
+        if stats["profit_factor"] < 1.05:
             continue
 
         score = (
-            stats["profit_factor"] * 0.40
-            + stats["win_rate"] * 0.30
-            + stats["total_return"] * 0.20
-            + max(stats["max_drawdown"], -1) * 0.10
+            stats["profit_factor"] * 0.35
+            + stats["win_rate"] * 0.25
+            + stats["total_return"] * 0.25
+            + max(stats["max_drawdown"], -1) * 0.15
         )
 
         results.append({
@@ -385,110 +464,193 @@ def optimize(train_df):
 
 
 # =========================
-# WALK-FORWARD TEST
+# TRUE WALK-FORWARD
 # =========================
 
-def walk_forward(df, train_size=500, test_size=150):
-    all_test_trades = []
+def walk_forward(df, train_size=TRAIN_SIZE, test_size=TEST_SIZE):
     reports = []
+    all_trades = []
 
     start = 0
+    window = 1
 
     while start + train_size + test_size < len(df):
         train_df = df.iloc[start:start + train_size].reset_index(drop=True)
         test_df = df.iloc[start + train_size:start + train_size + test_size].reset_index(drop=True)
 
-        best_params = optimize(train_df)
+        print(f"Optimizing window {window}...")
 
-        if best_params is None:
+        best = optimize(train_df)
+
+        if best is None:
+            print(f"Window {window}: no valid parameters")
             start += test_size
+            window += 1
             continue
 
-        clean_params = {
-            k: best_params[k]
-            for k in [
-                "sweep_lookback",
-                "min_adx",
-                "rsi_bull",
-                "rsi_bear",
-                "volume_mult",
-                "atr_stop",
-                "rr",
-                "displacement_atr",
-                "max_hold"
-            ]
+        params = {
+            "sweep_lookback": best["sweep_lookback"],
+            "min_adx": best["min_adx"],
+            "rsi_bull": best["rsi_bull"],
+            "rsi_bear": best["rsi_bear"],
+            "volume_mult": best["volume_mult"],
+            "atr_stop": best["atr_stop"],
+            "rr": best["rr"],
+            "displacement_atr": best["displacement_atr"],
+            "max_hold": best["max_hold"]
         }
 
-        test_trades, test_equity = backtest(test_df, clean_params)
+        test_trades, test_equity = backtest(test_df, params)
         test_stats = performance(test_trades, test_equity)
 
         if test_stats:
-            reports.append({
+            report = {
+                "window": window,
                 "train_start": train_df.iloc[0]["timestamp"],
                 "train_end": train_df.iloc[-1]["timestamp"],
                 "test_start": test_df.iloc[0]["timestamp"],
                 "test_end": test_df.iloc[-1]["timestamp"],
-                **clean_params,
+                **params,
                 **test_stats
-            })
+            }
 
+            reports.append(report)
+
+            test_trades["window"] = window
             test_trades["test_start"] = test_df.iloc[0]["timestamp"]
-            all_test_trades.append(test_trades)
+            all_trades.append(test_trades)
+
+            print(
+                f"Window {window}: "
+                f"trades={test_stats['trades']} "
+                f"win_rate={test_stats['win_rate']:.2f} "
+                f"PF={test_stats['profit_factor']:.2f} "
+                f"return={test_stats['total_return']:.2%}"
+            )
+        else:
+            print(f"Window {window}: no test trades")
 
         start += test_size
+        window += 1
 
     report_df = pd.DataFrame(reports)
-
-    if all_test_trades:
-        trades_df = pd.concat(all_test_trades, ignore_index=True)
-    else:
-        trades_df = pd.DataFrame()
+    trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
 
     return report_df, trades_df
 
 
 # =========================
-# RUN
+# MONTE CARLO
+# =========================
+
+def monte_carlo(trades, runs=MONTE_CARLO_RUNS):
+    if trades.empty:
+        return None, None
+
+    pnl = trades["pnl"].values
+    results = []
+
+    for _ in range(runs):
+        sampled = np.random.choice(pnl, size=len(pnl), replace=True)
+        equity = INITIAL_BALANCE + np.cumsum(sampled)
+
+        final_balance = equity[-1]
+        total_return = final_balance / INITIAL_BALANCE - 1
+
+        peak = np.maximum.accumulate(equity)
+        drawdown = equity / peak - 1
+        max_drawdown = drawdown.min()
+
+        results.append({
+            "final_balance": final_balance,
+            "total_return": total_return,
+            "max_drawdown": max_drawdown
+        })
+
+    mc = pd.DataFrame(results)
+
+    summary = {
+        "runs": runs,
+        "median_final_balance": mc["final_balance"].median(),
+        "worst_5pct_balance": mc["final_balance"].quantile(0.05),
+        "best_5pct_balance": mc["final_balance"].quantile(0.95),
+        "median_return": mc["total_return"].median(),
+        "worst_5pct_return": mc["total_return"].quantile(0.05),
+        "median_drawdown": mc["max_drawdown"].median(),
+        "worst_5pct_drawdown": mc["max_drawdown"].quantile(0.05),
+        "risk_of_loss": (mc["final_balance"] < INITIAL_BALANCE).mean()
+    }
+
+    return mc, summary
+
+
+def plot_monte_carlo(mc, name):
+    plt.figure()
+    mc["final_balance"].hist(bins=50)
+    plt.title(f"{name} Monte Carlo Final Balance Distribution")
+    plt.xlabel("Final Balance")
+    plt.ylabel("Frequency")
+    plt.savefig(f"{name}_monte_carlo.png")
+    plt.close()
+
+
+# =========================
+# RUN MARKET
 # =========================
 
 def run_market(name, df):
-    print(f"\n===== {name} =====")
+    print(f"\n==============================")
+    print(f"RUNNING {name}")
+    print(f"==============================")
 
     df = add_indicators(df)
 
-    report, trades = walk_forward(
-        df,
-        train_size=500,
-        test_size=150
-    )
+    report, trades = walk_forward(df)
 
-    if report.empty:
-        print("No robust walk-forward results.")
+    if report.empty or trades.empty:
+        print(f"{name}: no robust walk-forward results")
         return
-
-    print("\nWalk-forward report:")
-    print(report.to_string(index=False))
-
-    print("\nAverage out-of-sample results:")
-    summary = {
-        "windows": len(report),
-        "avg_win_rate": report["win_rate"].mean(),
-        "avg_profit_factor": report["profit_factor"].replace(np.inf, np.nan).mean(),
-        "avg_return": report["total_return"].mean(),
-        "avg_drawdown": report["max_drawdown"].mean(),
-        "total_trades": report["trades"].sum()
-    }
-
-    for k, v in summary.items():
-        print(f"{k}: {v}")
 
     report.to_csv(f"{name}_walk_forward_report.csv", index=False)
     trades.to_csv(f"{name}_walk_forward_trades.csv", index=False)
 
-    print(f"\nSaved:")
+    print("\nWalk-forward summary:")
+    print(f"Windows: {len(report)}")
+    print(f"Total trades: {len(trades)}")
+    print(f"Average win rate: {report['win_rate'].mean():.2%}")
+    print(f"Average profit factor: {report['profit_factor'].replace(np.inf, np.nan).mean():.2f}")
+    print(f"Average return per window: {report['total_return'].mean():.2%}")
+    print(f"Average max drawdown: {report['max_drawdown'].mean():.2%}")
+
+    mc, mc_summary = monte_carlo(trades)
+
+    if mc is not None:
+        mc.to_csv(f"{name}_monte_carlo_results.csv", index=False)
+        plot_monte_carlo(mc, name)
+
+        print("\nMonte Carlo summary:")
+        for k, v in mc_summary.items():
+            if "return" in k or "drawdown" in k or "risk" in k:
+                print(f"{k}: {v:.2%}")
+            else:
+                print(f"{k}: {v}")
+
+        pd.DataFrame([mc_summary]).to_csv(
+            f"{name}_monte_carlo_summary.csv",
+            index=False
+        )
+
+    print("\nSaved files:")
     print(f"- {name}_walk_forward_report.csv")
     print(f"- {name}_walk_forward_trades.csv")
+    print(f"- {name}_monte_carlo_results.csv")
+    print(f"- {name}_monte_carlo_summary.csv")
+    print(f"- {name}_monte_carlo.png")
 
+
+# =========================
+# MAIN
+# =========================
 
 if __name__ == "__main__":
     btc = fetch_btc()
