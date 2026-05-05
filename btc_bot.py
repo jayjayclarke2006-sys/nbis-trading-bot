@@ -3,6 +3,10 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import requests
+import time
+import json
+import os
 
 from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
@@ -10,12 +14,50 @@ from ta.volatility import AverageTrueRange
 
 
 # =========================
+# TELEGRAM SETTINGS
+# =========================
+
+BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+CHAT_ID = "PUT_YOUR_CHAT_ID_HERE"
+
+SEND_NO_SIGNAL_MESSAGE = False
+PARAM_CACHE_FILE = "best_live_params.json"
+SENT_SIGNAL_FILE = "sent_signals.json"
+
+
+def send_telegram(message):
+    if BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE" or CHAT_ID == "PUT_YOUR_CHAT_ID_HERE":
+        print("Telegram not configured.")
+        print(message)
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown"
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+# =========================
 # SETTINGS
 # =========================
 
 TIMEFRAME = "1h"
+HIGHER_TIMEFRAME = "4h"
+
 BTC_LIMIT = 1500
+BTC_HTF_LIMIT = 500
+
 GOLD_PERIOD = "730d"
+GOLD_HTF_PERIOD = "730d"
 
 FEE = 0.0006
 INITIAL_BALANCE = 10_000
@@ -25,12 +67,33 @@ TRAIN_SIZE = 500
 TEST_SIZE = 150
 MONTE_CARLO_RUNS = 1000
 
+LIVE_SCAN_SECONDS = 300
+
 EXCHANGES = [
     ("coinbase", "BTC/USD"),
     ("kraken", "BTC/USD"),
     ("bybit", "BTC/USDT"),
     ("binanceus", "BTC/USDT"),
 ]
+
+
+# =========================
+# CACHE HELPERS
+# =========================
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
 
 
 # =========================
@@ -51,7 +114,7 @@ def validate_data(df):
     if df.isna().sum().sum() > 0:
         return False, "NaN values detected"
 
-    if (df["Volume"] == 0).mean() > 0.20:
+    if "Volume" in df.columns and (df["Volume"] == 0).mean() > 0.20:
         return False, "Too many zero-volume candles"
 
     df = df.sort_values("timestamp").copy()
@@ -71,16 +134,16 @@ def validate_data(df):
     return True, "OK"
 
 
-def fetch_btc():
+def fetch_btc(timeframe=TIMEFRAME, limit=BTC_LIMIT):
     for name, symbol in EXCHANGES:
         try:
             exchange = get_exchange(name)
-            print(f"Trying BTC feed: {name}")
+            print(f"Trying BTC feed: {name} {timeframe}")
 
             candles = exchange.fetch_ohlcv(
                 symbol,
-                timeframe=TIMEFRAME,
-                limit=BTC_LIMIT
+                timeframe=timeframe,
+                limit=limit
             )
 
             df = pd.DataFrame(
@@ -96,7 +159,7 @@ def fetch_btc():
                 print(f"{name} rejected: {reason}")
                 continue
 
-            print(f"Using BTC feed: {name}")
+            print(f"Using BTC feed: {name} {timeframe}")
             return df
 
         except Exception as e:
@@ -105,11 +168,11 @@ def fetch_btc():
     raise Exception("No valid BTC feed available")
 
 
-def fetch_gold():
+def fetch_gold(interval=TIMEFRAME, period=GOLD_PERIOD):
     df = yf.download(
         "GC=F",
-        period=GOLD_PERIOD,
-        interval=TIMEFRAME,
+        period=period,
+        interval=interval,
         auto_adjust=True,
         progress=False
     ).reset_index()
@@ -251,7 +314,7 @@ def backtest(df, params):
     equity_curve = []
     trades = []
 
-    lookback = params["sweep_lookback"]
+    lookback = int(params["sweep_lookback"])
 
     for i in range(max(220, lookback + 2), len(df) - 2):
         prev = df.iloc[i - 1]
@@ -310,7 +373,7 @@ def backtest(df, params):
         exit_price = None
         result = None
 
-        for j in range(i + 1, min(i + params["max_hold"], len(df))):
+        for j in range(i + 1, min(i + int(params["max_hold"]), len(df))):
             candle = df.iloc[j]
 
             if direction == "LONG":
@@ -334,7 +397,7 @@ def backtest(df, params):
                     break
 
         if exit_price is None:
-            exit_index = min(i + params["max_hold"], len(df) - 1)
+            exit_index = min(i + int(params["max_hold"]), len(df) - 1)
             exit_price = df.iloc[exit_index]["Close"]
             result = "TIME_EXIT"
 
@@ -595,21 +658,188 @@ def plot_monte_carlo(mc, name):
 
 
 # =========================
+# LIVE TRADE SIGNAL ENGINE
+# =========================
+
+def get_last_best_params(report):
+    if report.empty:
+        return None
+
+    row = report.sort_values("window").iloc[-1]
+
+    return {
+        "sweep_lookback": int(row["sweep_lookback"]),
+        "min_adx": float(row["min_adx"]),
+        "rsi_bull": float(row["rsi_bull"]),
+        "rsi_bear": float(row["rsi_bear"]),
+        "volume_mult": float(row["volume_mult"]),
+        "atr_stop": float(row["atr_stop"]),
+        "rr": float(row["rr"]),
+        "displacement_atr": float(row["displacement_atr"]),
+        "max_hold": int(row["max_hold"])
+    }
+
+
+def higher_timeframe_confirm(htf_df, direction):
+    htf_df = add_indicators(htf_df)
+    htf_row = htf_df.iloc[-2]
+    htf_trend = trend(htf_row)
+
+    if direction == "LONG":
+        return htf_trend == "BULLISH", htf_trend
+
+    if direction == "SHORT":
+        return htf_trend == "BEARISH", htf_trend
+
+    return False, htf_trend
+
+
+def build_live_signal(name, df, htf_df, params):
+    df = add_indicators(df)
+
+    lookback = int(params["sweep_lookback"])
+    i = len(df) - 2
+
+    if i < max(220, lookback + 2):
+        return None
+
+    prev = df.iloc[i - 1]
+    curr = df.iloc[i]
+
+    market_trend = trend(curr)
+
+    bull_pattern = bullish_pin(curr) or bullish_engulf(prev, curr)
+    bear_pattern = bearish_pin(curr) or bearish_engulf(prev, curr)
+
+    bull_signal = (
+        market_trend == "BULLISH"
+        and liquidity_sweep_low(df, i, lookback)
+        and displacement(curr, params["displacement_atr"])
+        and bull_pattern
+        and curr["rsi"] >= params["rsi_bull"]
+        and curr["adx"] >= params["min_adx"]
+        and curr["Volume"] >= curr["avg_volume"] * params["volume_mult"]
+    )
+
+    bear_signal = (
+        market_trend == "BEARISH"
+        and liquidity_sweep_high(df, i, lookback)
+        and displacement(curr, params["displacement_atr"])
+        and bear_pattern
+        and curr["rsi"] <= params["rsi_bear"]
+        and curr["adx"] >= params["min_adx"]
+        and curr["Volume"] >= curr["avg_volume"] * params["volume_mult"]
+    )
+
+    if not bull_signal and not bear_signal:
+        return None
+
+    direction = "LONG" if bull_signal else "SHORT"
+
+    htf_ok, htf_trend = higher_timeframe_confirm(htf_df, direction)
+    if not htf_ok:
+        print(f"{name}: signal rejected by HTF trend. HTF={htf_trend}")
+        return None
+
+    entry = df.iloc[i + 1]["Open"]
+    atr = curr["atr"]
+
+    if direction == "LONG":
+        stop = entry - atr * params["atr_stop"]
+        target = entry + ((entry - stop) * params["rr"])
+    else:
+        stop = entry + atr * params["atr_stop"]
+        target = entry - ((stop - entry) * params["rr"])
+
+    risk = abs(entry - stop)
+    reward = abs(target - entry)
+
+    confidence = 0
+    confidence += 25 if market_trend in ["BULLISH", "BEARISH"] else 0
+    confidence += 20 if bull_pattern or bear_pattern else 0
+    confidence += 20 if curr["adx"] >= params["min_adx"] else 0
+    confidence += 15 if curr["Volume"] >= curr["avg_volume"] * params["volume_mult"] else 0
+    confidence += 20 if htf_ok else 0
+
+    return {
+        "market": name,
+        "time": str(curr["timestamp"]),
+        "direction": direction,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target": float(target),
+        "risk": float(risk),
+        "reward": float(reward),
+        "rr": float(reward / risk) if risk > 0 else 0,
+        "ltf_trend": market_trend,
+        "htf_trend": htf_trend,
+        "rsi": float(curr["rsi"]),
+        "adx": float(curr["adx"]),
+        "confidence": int(confidence),
+        "params": params
+    }
+
+
+def format_signal(signal):
+    return f"""
+🚨 *LIVE TRADE SIGNAL*
+
+Market: *{signal['market']}*
+Direction: *{signal['direction']}*
+
+Entry: `{signal['entry']:.2f}`
+Stop Loss: `{signal['stop']:.2f}`
+Take Profit: `{signal['target']:.2f}`
+
+R:R: `{signal['rr']:.2f}`
+Confidence: *{signal['confidence']}/100*
+
+LTF Trend: `{signal['ltf_trend']}`
+HTF Trend: `{signal['htf_trend']}`
+
+RSI: `{signal['rsi']:.2f}`
+ADX: `{signal['adx']:.2f}`
+
+Time: `{signal['time']}`
+"""
+
+
+def maybe_send_signal(signal):
+    sent = load_json(SENT_SIGNAL_FILE, {})
+
+    key = f"{signal['market']}_{signal['direction']}_{signal['time']}"
+
+    if sent.get(key):
+        print(f"Duplicate signal blocked: {key}")
+        return
+
+    send_telegram(format_signal(signal))
+    sent[key] = True
+    save_json(SENT_SIGNAL_FILE, sent)
+
+
+# =========================
 # RUN MARKET
 # =========================
 
-def run_market(name, df):
+def run_market(name, df, htf_df):
     print(f"\n==============================")
     print(f"RUNNING {name}")
     print(f"==============================")
 
-    df = add_indicators(df)
+    df_ind = add_indicators(df)
 
-    report, trades = walk_forward(df)
+    report, trades = walk_forward(df_ind)
 
     if report.empty or trades.empty:
         print(f"{name}: no robust walk-forward results")
-        return
+        return None
+
+    best_params = get_last_best_params(report)
+
+    cache = load_json(PARAM_CACHE_FILE, {})
+    cache[name] = best_params
+    save_json(PARAM_CACHE_FILE, cache)
 
     report.to_csv(f"{name}_walk_forward_report.csv", index=False)
     trades.to_csv(f"{name}_walk_forward_trades.csv", index=False)
@@ -640,6 +870,17 @@ def run_market(name, df):
             index=False
         )
 
+    signal = build_live_signal(name, df, htf_df, best_params)
+
+    if signal:
+        maybe_send_signal(signal)
+        print(format_signal(signal))
+    else:
+        print(f"{name}: no live trade signal.")
+
+        if SEND_NO_SIGNAL_MESSAGE:
+            send_telegram(f"{name}: no live trade signal.")
+
     print("\nSaved files:")
     print(f"- {name}_walk_forward_report.csv")
     print(f"- {name}_walk_forward_trades.csv")
@@ -647,14 +888,28 @@ def run_market(name, df):
     print(f"- {name}_monte_carlo_summary.csv")
     print(f"- {name}_monte_carlo.png")
 
+    return best_params
+
 
 # =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
-    btc = fetch_btc()
-    gold = fetch_gold()
+    while True:
+        try:
+            btc = fetch_btc(TIMEFRAME, BTC_LIMIT)
+            btc_htf = fetch_btc(HIGHER_TIMEFRAME, BTC_HTF_LIMIT)
 
-    run_market("BTC", btc)
-    run_market("GOLD", gold)
+            gold = fetch_gold(TIMEFRAME, GOLD_PERIOD)
+            gold_htf = fetch_gold(HIGHER_TIMEFRAME, GOLD_HTF_PERIOD)
+
+            run_market("BTC", btc, btc_htf)
+            run_market("GOLD", gold, gold_htf)
+
+        except Exception as e:
+            error_msg = f"Bot error: `{e}`"
+            print(error_msg)
+            send_telegram(error_msg)
+
+        time.sleep(LIVE_SCAN_SECONDS)
