@@ -1,4 +1,7 @@
+ccxt
+yfinance
 pandas
-python-dotenv
+numpy
+matplotlib
+ta
 requests
-pytz
