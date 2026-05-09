@@ -12,44 +12,8 @@ from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-
-# =========================
-# TELEGRAM SETTINGS
-# =========================
-
 BOT_TOKEN = "YOUR_BOT_TOKEN"
 CHAT_ID = "YOUR_CHAT_ID"
-
-SEND_NO_SIGNAL_MESSAGE = False
-PARAM_CACHE_FILE = "best_live_params.json"
-SENT_SIGNAL_FILE = "sent_signals.json"
-
-
-def send_telegram(message):
-    try:
-        if BOT_TOKEN == "YOUR_BOT_TOKEN":
-            print("Telegram not configured")
-            return
-
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-        requests.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown"
-            },
-            timeout=10
-        )
-
-    except Exception as e:
-        print("Telegram error:", e)
-
-
-# =========================
-# SETTINGS
-# =========================
 
 TIMEFRAME = "1h"
 HIGHER_TIMEFRAME = "4h"
@@ -70,6 +34,8 @@ MONTE_CARLO_RUNS = 500
 
 LIVE_SCAN_SECONDS = 300
 
+SENT_SIGNAL_FILE = "sent_signals.json"
+
 EXCHANGES = [
     ("coinbase", "BTC/USD"),
     ("kraken", "BTC/USD"),
@@ -78,9 +44,27 @@ EXCHANGES = [
 ]
 
 
-# =========================
-# CACHE HELPERS
-# =========================
+def send_telegram(message):
+    try:
+        if BOT_TOKEN == "YOUR_BOT_TOKEN":
+            print("Telegram not configured")
+            print(message)
+            return
+
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+        requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message,
+            },
+            timeout=10
+        )
+
+    except Exception as e:
+        print("Telegram error:", e)
+
 
 def load_json(path, default):
     if not os.path.exists(path):
@@ -98,10 +82,6 @@ def save_json(path, data):
         json.dump(data, f, indent=2, default=str)
 
 
-# =========================
-# DATA ENGINE
-# =========================
-
 def get_exchange(name):
     return getattr(ccxt, name)({
         "enableRateLimit": True,
@@ -110,14 +90,12 @@ def get_exchange(name):
 
 
 def validate_data(df):
+
     if df is None or len(df) < 300:
         return False, "Not enough candles"
 
     if df.isna().sum().sum() > 0:
         return False, "NaN values"
-
-    if (df["Volume"] == 0).mean() > 0.2:
-        return False, "Too many zero-volume candles"
 
     return True, "OK"
 
@@ -129,11 +107,8 @@ def fetch_btc(timeframe=TIMEFRAME, limit=BTC_LIMIT):
         try:
             exchange = get_exchange(name)
 
-            print(f"Trying BTC feed: {name} {timeframe}")
-
             exchange_timeframe = timeframe
 
-            # Coinbase does NOT support 4h
             if name == "coinbase" and timeframe == "4h":
                 exchange_timeframe = "1h"
 
@@ -161,15 +136,10 @@ def fetch_btc(timeframe=TIMEFRAME, limit=BTC_LIMIT):
                 utc=True
             )
 
-            valid, reason = validate_data(df)
+            valid, _ = validate_data(df)
 
-            if not valid:
-                print(f"{name} rejected: {reason}")
-                continue
-
-            print(f"Using BTC feed: {name} {timeframe}")
-
-            return df
+            if valid:
+                return df
 
         except Exception as e:
             print(f"{name} failed:", e)
@@ -195,7 +165,7 @@ def fetch_gold(interval=TIMEFRAME, period=GOLD_PERIOD):
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    df = df[
+    return df[
         [
             "timestamp",
             "Open",
@@ -206,12 +176,6 @@ def fetch_gold(interval=TIMEFRAME, period=GOLD_PERIOD):
         ]
     ].dropna()
 
-    return df
-
-
-# =========================
-# INDICATORS
-# =========================
 
 def add_indicators(df):
 
@@ -241,10 +205,6 @@ def add_indicators(df):
 
     return df.dropna().reset_index(drop=True)
 
-
-# =========================
-# STRATEGY
-# =========================
 
 def trend(row):
 
@@ -347,10 +307,6 @@ def displacement(row, atr_mult):
     )
 
 
-# =========================
-# PERFORMANCE
-# =========================
-
 def performance(trades, equity):
 
     if trades.empty or len(equity) < 2:
@@ -385,10 +341,6 @@ def performance(trades, equity):
     }
 
 
-# =========================
-# BACKTEST
-# =========================
-
 def backtest(df, params):
 
     balance = INITIAL_BALANCE
@@ -417,21 +369,17 @@ def backtest(df, params):
         bull_signal = (
             market_trend == "BULLISH"
             and liquidity_sweep_low(df, i, lookback)
-            and displacement(curr, params["displacement_atr"])
-            and bull_pattern
             and curr["rsi"] >= params["rsi_bull"]
             and curr["adx"] >= params["min_adx"]
-            and curr["Volume"] >= curr["avg_volume"] * params["volume_mult"]
+            and bull_pattern
         )
 
         bear_signal = (
             market_trend == "BEARISH"
             and liquidity_sweep_high(df, i, lookback)
-            and displacement(curr, params["displacement_atr"])
-            and bear_pattern
             and curr["rsi"] <= params["rsi_bear"]
             and curr["adx"] >= params["min_adx"]
-            and curr["Volume"] >= curr["avg_volume"] * params["volume_mult"]
+            and bear_pattern
         )
 
         if not bull_signal and not bear_signal:
@@ -461,7 +409,6 @@ def backtest(df, params):
         position_size = risk_amount / risk_per_unit
 
         exit_price = None
-        result = None
 
         for j in range(i + 1, min(i + int(params["max_hold"]), len(df))):
 
@@ -471,55 +418,40 @@ def backtest(df, params):
 
                 if candle["Low"] <= stop:
                     exit_price = stop
-                    result = "LOSS"
                     break
 
                 if candle["High"] >= target:
                     exit_price = target
-                    result = "WIN"
                     break
 
             else:
 
                 if candle["High"] >= stop:
                     exit_price = stop
-                    result = "LOSS"
                     break
 
                 if candle["Low"] <= target:
                     exit_price = target
-                    result = "WIN"
                     break
 
         if exit_price is None:
-
             exit_price = df.iloc[
                 min(i + int(params["max_hold"]), len(df) - 1)
             ]["Close"]
 
-            result = "TIME_EXIT"
-
         if direction == "LONG":
             pnl = (exit_price - entry) * position_size
-
         else:
             pnl = (entry - exit_price) * position_size
 
-        fees = (
-            abs(entry * position_size) * FEE
-            + abs(exit_price * position_size) * FEE
-        )
+        pnl -= abs(entry * position_size) * FEE
 
-        pnl -= fees
         balance += pnl
 
         trades.append({
             "time": curr["timestamp"],
             "direction": direction,
-            "entry": entry,
-            "exit": exit_price,
             "pnl": pnl,
-            "result": result,
             "balance": balance
         })
 
@@ -528,20 +460,23 @@ def backtest(df, params):
     return pd.DataFrame(trades), pd.Series(equity_curve)
 
 
-# =========================
-# PARAMETER GRID
-# =========================
-
 def parameter_grid():
 
-    for sweep_lookback in [10, 20]:
-        for min_adx in [18, 22]:
-            for rsi_bull in [50, 55]:
-                for rsi_bear in [50, 45]:
-                    for volume_mult in [1.0, 1.2]:
-                        for atr_stop in [1.2, 1.5]:
-                            for rr in [1.5, 2.0]:
-                                for displacement_atr in [1.0, 1.2]:
+    for sweep_lookback in [5, 10, 20]:
+
+        for min_adx in [10, 15, 18]:
+
+            for rsi_bull in [48, 50, 52]:
+
+                for rsi_bear in [52, 50, 48]:
+
+                    for volume_mult in [0.8, 1.0]:
+
+                        for atr_stop in [1.0, 1.2]:
+
+                            for rr in [1.2, 1.5, 2.0]:
+
+                                for displacement_atr in [0.5, 0.8]:
 
                                     yield {
                                         "sweep_lookback": sweep_lookback,
@@ -556,10 +491,6 @@ def parameter_grid():
                                     }
 
 
-# =========================
-# OPTIMIZATION
-# =========================
-
 def optimize(train_df):
 
     results = []
@@ -567,22 +498,19 @@ def optimize(train_df):
     for params in parameter_grid():
 
         trades, equity = backtest(train_df, params)
+
         stats = performance(trades, equity)
 
         if not stats:
             continue
 
-        if stats["trades"] < 10:
-            continue
-
-        if stats["profit_factor"] < 1.05:
+        if stats["trades"] < 5:
             continue
 
         score = (
             stats["profit_factor"] * 0.35
             + stats["win_rate"] * 0.25
             + stats["total_return"] * 0.25
-            + max(stats["max_drawdown"], -1) * 0.15
         )
 
         results.append({
@@ -602,17 +530,12 @@ def optimize(train_df):
     return ranked.iloc[0].to_dict()
 
 
-# =========================
-# WALK FORWARD
-# =========================
-
 def walk_forward(df):
 
     reports = []
     all_trades = []
 
     start = 0
-    window = 1
 
     while start + TRAIN_SIZE + TEST_SIZE < len(df):
 
@@ -625,13 +548,10 @@ def walk_forward(df):
             start + TRAIN_SIZE + TEST_SIZE
         ].reset_index(drop=True)
 
-        print(f"Optimizing window {window}...")
-
         best = optimize(train_df)
 
         if best is None:
             start += TEST_SIZE
-            window += 1
             continue
 
         params = {
@@ -647,20 +567,18 @@ def walk_forward(df):
         }
 
         test_trades, test_equity = backtest(test_df, params)
-        test_stats = performance(test_trades, test_equity)
 
-        if test_stats:
+        stats = performance(test_trades, test_equity)
 
+        if stats:
             reports.append({
-                "window": window,
                 **params,
-                **test_stats
+                **stats
             })
 
             all_trades.append(test_trades)
 
         start += TEST_SIZE
-        window += 1
 
     report_df = pd.DataFrame(reports)
 
@@ -673,135 +591,110 @@ def walk_forward(df):
     return report_df, trades_df
 
 
-# =========================
-# MONTE CARLO
-# =========================
-
-def monte_carlo(trades):
-
-    if trades.empty:
-        return None
-
-    pnl = trades["pnl"].values
-    results = []
-
-    for _ in range(MONTE_CARLO_RUNS):
-
-        sampled = np.random.choice(
-            pnl,
-            size=len(pnl),
-            replace=True
-        )
-
-        equity = INITIAL_BALANCE + np.cumsum(sampled)
-
-        results.append(equity[-1])
-
-    return pd.Series(results)
-
-
-# =========================
-# LIVE SIGNAL
-# =========================
-
-def higher_timeframe_confirm(htf_df, direction):
-
-    htf_df = add_indicators(htf_df)
-
-    row = htf_df.iloc[-2]
-
-    htf_trend = trend(row)
-
-    if direction == "LONG":
-        return htf_trend == "BULLISH"
-
-    if direction == "SHORT":
-        return htf_trend == "BEARISH"
-
-    return False
-
-
 def build_live_signal(name, df, htf_df, params):
 
-    df = add_indicators(df)
+    try:
 
-    lookback = int(params["sweep_lookback"])
+        df = add_indicators(df)
+        htf_df = add_indicators(htf_df)
 
-    i = len(df) - 2
+        lookback = int(params["sweep_lookback"])
 
-    prev = df.iloc[i - 1]
-    curr = df.iloc[i]
+        i = len(df) - 2
 
-    market_trend = trend(curr)
+        prev = df.iloc[i - 1]
+        curr = df.iloc[i]
 
-    bull_pattern = bool(
-        bullish_pin(curr)
-        or bullish_engulf(prev, curr)
-    )
+        htf_curr = htf_df.iloc[-2]
 
-    bear_pattern = bool(
-        bearish_pin(curr)
-        or bearish_engulf(prev, curr)
-    )
+        market_trend = trend(curr)
+        htf_trend = trend(htf_curr)
 
-    bull_signal = (
-        market_trend == "BULLISH"
-        and liquidity_sweep_low(df, i, lookback)
-        and displacement(curr, params["displacement_atr"])
-        and bull_pattern
-        and curr["rsi"] >= params["rsi_bull"]
-        and curr["adx"] >= params["min_adx"]
-    )
+        bull_pattern = bool(
+            bullish_pin(curr)
+            or bullish_engulf(prev, curr)
+            or liquidity_sweep_low(df, i, lookback)
+        )
 
-    bear_signal = (
-        market_trend == "BEARISH"
-        and liquidity_sweep_high(df, i, lookback)
-        and displacement(curr, params["displacement_atr"])
-        and bear_pattern
-        and curr["rsi"] <= params["rsi_bear"]
-        and curr["adx"] >= params["min_adx"]
-    )
+        bear_pattern = bool(
+            bearish_pin(curr)
+            or bearish_engulf(prev, curr)
+            or liquidity_sweep_high(df, i, lookback)
+        )
 
-    if not bull_signal and not bear_signal:
+        bullish_bias = (
+            market_trend == "BULLISH"
+            and htf_trend in ["BULLISH", "NEUTRAL"]
+            and curr["rsi"] >= params["rsi_bull"]
+            and curr["adx"] >= params["min_adx"]
+            and bull_pattern
+        )
+
+        bearish_bias = (
+            market_trend == "BEARISH"
+            and htf_trend in ["BEARISH", "NEUTRAL"]
+            and curr["rsi"] <= params["rsi_bear"]
+            and curr["adx"] >= params["min_adx"]
+            and bear_pattern
+        )
+
+        print(
+            f"{name} | "
+            f"LTF={market_trend} | "
+            f"HTF={htf_trend} | "
+            f"RSI={curr['rsi']:.2f} | "
+            f"ADX={curr['adx']:.2f}"
+        )
+
+        if not bullish_bias and not bearish_bias:
+            return None
+
+        direction = "LONG" if bullish_bias else "SHORT"
+
+        entry = float(df.iloc[i + 1]["Open"])
+
+        atr = float(curr["atr"])
+
+        if direction == "LONG":
+
+            stop = entry - atr * params["atr_stop"]
+
+            target = entry + ((entry - stop) * params["rr"])
+
+        else:
+
+            stop = entry + atr * params["atr_stop"]
+
+            target = entry - ((stop - entry) * params["rr"])
+
+        return {
+            "market": name,
+            "direction": direction,
+            "entry": round(entry, 2),
+            "stop": round(float(stop), 2),
+            "target": round(float(target), 2),
+            "time": str(curr["timestamp"]),
+        }
+
+    except Exception as e:
+        print(f"{name} live signal error:", e)
         return None
-
-    direction = "LONG" if bull_signal else "SHORT"
-
-    if not higher_timeframe_confirm(htf_df, direction):
-        return None
-
-    entry = df.iloc[i + 1]["Open"]
-    atr = curr["atr"]
-
-    if direction == "LONG":
-        stop = entry - atr * params["atr_stop"]
-        target = entry + ((entry - stop) * params["rr"])
-
-    else:
-        stop = entry + atr * params["atr_stop"]
-        target = entry - ((stop - entry) * params["rr"])
-
-    return {
-        "market": name,
-        "direction": direction,
-        "entry": float(entry),
-        "stop": float(stop),
-        "target": float(target),
-        "time": str(curr["timestamp"])
-    }
 
 
 def format_signal(signal):
 
     return f"""
-🚨 LIVE SIGNAL
+ð¨ LIVE TRADE SIGNAL ð¨
 
 Market: {signal['market']}
+
 Direction: {signal['direction']}
 
-Entry: {signal['entry']:.2f}
-Stop: {signal['stop']:.2f}
-Target: {signal['target']:.2f}
+Entry: {signal['entry']}
+
+Stop Loss: {signal['stop']}
+
+Take Profit: {signal['target']}
 
 Time: {signal['time']}
 """
@@ -828,10 +721,6 @@ def maybe_send_signal(signal):
     save_json(SENT_SIGNAL_FILE, sent)
 
 
-# =========================
-# RUN MARKET
-# =========================
-
 def run_market(name, df, htf_df):
 
     print(f"\nRUNNING {name}")
@@ -856,23 +745,35 @@ def run_market(name, df, htf_df):
     if signal:
         maybe_send_signal(signal)
         print(format_signal(signal))
-
     else:
         print("No live signal")
 
-    mc = monte_carlo(trades)
+    if not trades.empty:
 
-    if mc is not None:
+        pnl = trades["pnl"].values
+        mc_results = []
+
+        for _ in range(MONTE_CARLO_RUNS):
+
+            sampled = np.random.choice(
+                pnl,
+                size=len(pnl),
+                replace=True
+            )
+
+            mc_results.append(
+                INITIAL_BALANCE + np.cumsum(sampled)
+            )
+
         plt.figure()
-        mc.hist(bins=30)
+
+        for line in mc_results[:50]:
+            plt.plot(line)
+
         plt.title(f"{name} Monte Carlo")
         plt.savefig(f"{name}_mc.png")
         plt.close()
 
-
-# =========================
-# MAIN LOOP
-# =========================
 
 if __name__ == "__main__":
 
