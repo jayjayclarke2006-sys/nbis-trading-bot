@@ -1,4 +1,5 @@
 import os
+import json
 import math
 import requests
 import numpy as np
@@ -7,15 +8,17 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # ============================================================
-# NBIS ALPACA STOCK BOT - RESEARCH / WALK-FORWARD / MONTE CARLO
+# STOCK EDGE RESEARCH
+# Builds time-of-day + price-zone expectancy profile
 # ============================================================
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET")
 ALPACA_DATA_BASE = "https://data.alpaca.markets"
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")
+OUT_FILE = os.getenv("STOCK_EDGE_PROFILE_FILE", "stock_edge_profile.json")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 
 HEADERS = {
@@ -27,30 +30,32 @@ HEADERS = {
 NY_TZ = ZoneInfo("America/New_York")
 WATCHLIST = ["AAPL", "TSLA", "NVDA", "AMD", "META", "MSFT", "AMZN", "SPY", "QQQ", "NBIS", "WULF", "IREN"]
 
+ALLOW_SHORTS = False
 RR_TARGET = 1.8
 ATR_LEN = 14
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
-FEE_BPS = 2
-INITIAL_BALANCE = 10000
-RISK_PER_TRADE = 0.005
 
-TRAIN_BARS = 260
-TEST_BARS = 80
-MONTE_CARLO_RUNS = 1000
+MIN_ATR_PCT = 0.0022
+MIN_VOLUME_MULT = 0.75
+MIN_BODY_ATR = 0.12
+MAX_BODY_ATR = 2.80
+RETEST_BUFFER_ATR = 0.35
+PULLBACK_BUFFER_ATR = 0.45
+
+MARKET_OPEN = "09:30"
+OPENING_RANGE_END = "10:00"
+TRADE_START = "09:45"
+LAST_ENTRY_TIME = "15:40"
 
 
 def send(msg: str):
     print(msg)
-    if not TELEGRAM_TOKEN or not CHAT_ID:
+    if not BOT_TOKEN or not CHAT_ID:
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg},
-            timeout=10,
-        )
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception:
         pass
 
@@ -61,6 +66,20 @@ def now_ny() -> datetime:
 
 def iso_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def minute_of_day(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+
+def in_window(dt: datetime, start: str, end: str) -> bool:
+    m = minute_of_day(dt)
+    return to_minutes(start) <= m <= to_minutes(end)
 
 
 def alpaca_get(path: str, params=None):
@@ -75,9 +94,9 @@ def alpaca_get(path: str, params=None):
         return None
 
 
-def bars_to_df(symbol: str, timeframe: str = "5Min", limit: int = 2000) -> pd.DataFrame:
+def bars_to_df(symbol: str, timeframe: str, limit: int = 1200) -> pd.DataFrame:
     end = now_ny()
-    start = end - timedelta(days=45)
+    start = end - timedelta(days=30)
     params = {
         "symbols": symbol,
         "timeframe": timeframe,
@@ -109,18 +128,15 @@ def bars_to_df(symbol: str, timeframe: str = "5Min", limit: int = 2000) -> pd.Da
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < EMA_SLOW + 5:
         return pd.DataFrame()
-
     out = df.copy()
     out["ema20"] = out["close"].ewm(span=EMA_FAST, adjust=False).mean()
     out["ema50"] = out["close"].ewm(span=EMA_MID, adjust=False).mean()
     out["ema200"] = out["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-
     tr = pd.concat([
         out["high"] - out["low"],
         (out["high"] - out["close"].shift()).abs(),
         (out["low"] - out["close"].shift()).abs(),
     ], axis=1).max(axis=1)
-
     out["atr"] = tr.rolling(ATR_LEN).mean()
     out["atr_pct"] = out["atr"] / out["close"]
     out["body"] = (out["close"] - out["open"]).abs()
@@ -131,16 +147,23 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def candle_quality(row) -> bool:
+    atr = float(row["atr"]); body = float(row["body"])
+    if atr <= 0: return False
+    body_atr = body / atr
+    return MIN_BODY_ATR <= body_atr <= MAX_BODY_ATR
+
+
+def volume_ok(row) -> bool:
+    if float(row["vol_ma"]) <= 0: return True
+    return float(row["volume"]) >= float(row["vol_ma"]) * MIN_VOLUME_MULT
+
+
 def strong_rejection(row, side: str) -> bool:
-    open_ = float(row["open"])
-    high = float(row["high"])
-    low = float(row["low"])
-    close = float(row["close"])
+    open_ = float(row["open"]); high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
     body = abs(close - open_)
-    if body <= 0:
-        return False
-    upper = high - max(open_, close)
-    lower = min(open_, close) - low
+    if body <= 0: return False
+    upper = high - max(open_, close); lower = min(open_, close) - low
     if side == "LONG":
         return (close > open_ and lower >= body * 0.25) or (close > open_ and close > (high + low) / 2)
     if side == "SHORT":
@@ -148,416 +171,259 @@ def strong_rejection(row, side: str) -> bool:
     return False
 
 
-def candle_quality(row, min_body_atr, max_body_atr) -> bool:
-    atr = float(row["atr"])
-    if atr <= 0:
-        return False
-    body_atr = float(row["body"]) / atr
-    return min_body_atr <= body_atr <= max_body_atr
+def bullish_pin(row) -> bool:
+    open_ = float(row["open"]); high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
+    body = abs(close - open_)
+    if body <= 0: return False
+    upper = high - max(open_, close); lower = min(open_, close) - low
+    return close > open_ and lower >= body * 1.5 and upper <= body * 1.2
 
 
-def volume_ok(row, min_volume_mult) -> bool:
-    if float(row["vol_ma"]) <= 0:
-        return True
-    return float(row["volume"]) >= float(row["vol_ma"]) * min_volume_mult
+def bearish_pin(row) -> bool:
+    open_ = float(row["open"]); high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
+    body = abs(close - open_)
+    if body <= 0: return False
+    upper = high - max(open_, close); lower = min(open_, close) - low
+    return close < open_ and upper >= body * 1.5 and lower <= body * 1.2
 
 
-def htf_bias_from_row(row, prev) -> str:
-    if row["close"] > row["ema50"] > row["ema200"] and row["ema50"] >= prev["ema50"]:
-        return "BULL"
-    if row["close"] < row["ema50"] < row["ema200"] and row["ema50"] <= prev["ema50"]:
-        return "BEAR"
-    if row["close"] > row["ema200"]:
-        return "BULL_WEAK"
-    if row["close"] < row["ema200"]:
-        return "BEAR_WEAK"
+def htf_bias_from_df(df15: pd.DataFrame, ts) -> str:
+    sl = df15[df15["time"] <= ts]
+    if len(sl) < 2:
+        return "NONE"
+    r = sl.iloc[-1]; p = sl.iloc[-2]
+    if r["close"] > r["ema50"] > r["ema200"] and r["ema50"] >= p["ema50"]: return "BULL"
+    if r["close"] < r["ema50"] < r["ema200"] and r["ema50"] <= p["ema50"]: return "BEAR"
+    if r["close"] > r["ema200"]: return "BULL_WEAK"
+    if r["close"] < r["ema200"]: return "BEAR_WEAK"
     return "CHOP"
 
 
-def bias_allows(side: str, bias: str, allow_shorts: bool) -> bool:
-    if side == "LONG":
-        return bias in ["BULL", "BULL_WEAK"]
-    if side == "SHORT":
-        return allow_shorts and bias in ["BEAR", "BEAR_WEAK"]
+def bias_allows(side: str, bias: str) -> bool:
+    if side == "LONG": return bias in ["BULL", "BULL_WEAK"]
+    if side == "SHORT": return ALLOW_SHORTS and bias in ["BEAR", "BEAR_WEAK"]
     return False
 
 
-def build_intraday_or(df: pd.DataFrame, idx: int):
-    current_day = df.iloc[idx]["time"].date()
-    day_df = df[df["time"].dt.date == current_day].copy()
-    if day_df.empty:
-        return None, None, False
-    opening = day_df[
-        day_df["time"].apply(lambda x: x.hour == 9 and x.minute >= 30 or x.hour == 9 and x.minute < 60)
-    ]
-    opening = opening[(opening["time"].dt.hour == 9) & (opening["time"].dt.minute >= 30) | ((opening["time"].dt.hour == 10) & (opening["time"].dt.minute < 0))]
-    opening = day_df[(day_df["time"].dt.hour == 9) & (day_df["time"].dt.minute >= 30) | ((day_df["time"].dt.hour == 9) & (day_df["time"].dt.minute < 60))]
+def build_opening_range(day_df):
     opening = day_df[(day_df["time"].dt.hour == 9) & (day_df["time"].dt.minute >= 30)]
     opening = opening[opening["time"].dt.minute < 60]
-    opening = opening[opening["time"].dt.hour == 9]
     if len(opening) < 6:
-        return None, None, False
-    return float(opening["high"].max()), float(opening["low"].min()), True
-
-
-def backtest_symbol(df5: pd.DataFrame, df15: pd.DataFrame, params: dict):
-    balance = INITIAL_BALANCE
-    trades = []
-
-    if df5.empty or df15.empty:
-        return pd.DataFrame(), pd.Series(dtype=float)
-
-    df5 = add_indicators(df5)
-    df15 = add_indicators(df15)
-    if df5.empty or df15.empty:
-        return pd.DataFrame(), pd.Series(dtype=float)
-
-    df15_indexed = df15.set_index("time")
-    equity_curve = []
-
-    last_trade_day = None
-
-    for i in range(1, len(df5) - 12):
-        row = df5.iloc[i]
-        prev5 = df5.iloc[i - 1]
-        ts = row["time"]
-        if ts.hour < 9 or ts.hour > 15:
-            equity_curve.append(balance)
-            continue
-        if ts.hour == 15 and ts.minute > 40:
-            equity_curve.append(balance)
-            continue
-
-        trade_day = ts.date()
-        if last_trade_day == trade_day:
-            equity_curve.append(balance)
-            continue
-
-        # nearest 15m bar
-        htf_slice = df15_indexed[df15_indexed.index <= ts]
-        if len(htf_slice) < 2:
-            equity_curve.append(balance)
-            continue
-        htf_row = htf_slice.iloc[-1]
-        htf_prev = htf_slice.iloc[-2]
-        bias = htf_bias_from_row(htf_row, htf_prev)
-
-        if bias == "CHOP":
-            equity_curve.append(balance)
-            continue
-
-        if float(row["atr_pct"]) < params["min_atr_pct"]:
-            equity_curve.append(balance)
-            continue
-        if not volume_ok(row, params["min_volume_mult"]):
-            equity_curve.append(balance)
-            continue
-        if not candle_quality(row, params["min_body_atr"], params["max_body_atr"]):
-            equity_curve.append(balance)
-            continue
-
-        or_high, or_low, or_ready = build_intraday_or(df5, i)
-        if not or_ready or or_high is None or or_low is None:
-            equity_curve.append(balance)
-            continue
-
-        signal = None
-        close = float(row["close"])
-        low = float(row["low"])
-        high = float(row["high"])
-        open_ = float(row["open"])
-        atr = float(row["atr"])
-
-        # OR continuation
-        if close > or_high and bias_allows("LONG", bias, params["allow_shorts"]) and close > open_:
-            sl = min(low, or_low)
-            risk = close - sl
-            if risk > 0:
-                signal = {"side": "buy", "entry": close, "sl": sl, "tp": close + risk * params["rr_target"], "model": "OR_LONG"}
-        elif close < or_low and bias_allows("SHORT", bias, params["allow_shorts"]) and close < open_:
-            sl = max(high, or_high)
-            risk = sl - close
-            if risk > 0:
-                signal = {"side": "sell", "entry": close, "sl": sl, "tp": close - risk * params["rr_target"], "model": "OR_SHORT"}
-
-        # Pullback
-        if signal is None and bias_allows("LONG", bias, params["allow_shorts"]):
-            touched = low <= float(row["ema20"]) + atr * params["pullback_buffer_atr"]
-            reclaimed = close > open_ and close > float(row["ema20"])
-            if touched and reclaimed and strong_rejection(row, "LONG"):
-                sl = min(low, float(row["ema50"]) - atr * 0.10)
-                risk = close - sl
-                if risk > 0:
-                    signal = {"side": "buy", "entry": close, "sl": sl, "tp": close + risk * params["rr_target"], "model": "PB_LONG"}
-
-        if signal is None and bias_allows("SHORT", bias, params["allow_shorts"]):
-            touched = high >= float(row["ema20"]) - atr * params["pullback_buffer_atr"]
-            rejected = close < open_ and close < float(row["ema20"])
-            if touched and rejected and strong_rejection(row, "SHORT"):
-                sl = max(high, float(row["ema50"]) + atr * 0.10)
-                risk = sl - close
-                if risk > 0:
-                    signal = {"side": "sell", "entry": close, "sl": sl, "tp": close - risk * params["rr_target"], "model": "PB_SHORT"}
-
-        if signal is None:
-            equity_curve.append(balance)
-            continue
-
-        risk_per_share = abs(signal["entry"] - signal["sl"])
-        if risk_per_share <= 0:
-            equity_curve.append(balance)
-            continue
-
-        risk_cash = balance * RISK_PER_TRADE
-        qty = max(math.floor(risk_cash / risk_per_share), 1)
-
-        exit_price = None
-        exit_type = "TIME"
-        future = df5.iloc[i + 1:i + 13]
-
-        for _, bar in future.iterrows():
-            if signal["side"] == "buy":
-                if float(bar["low"]) <= signal["sl"]:
-                    exit_price = signal["sl"]
-                    exit_type = "STOP"
-                    break
-                if float(bar["high"]) >= signal["tp"]:
-                    exit_price = signal["tp"]
-                    exit_type = "TARGET"
-                    break
-            else:
-                if float(bar["high"]) >= signal["sl"]:
-                    exit_price = signal["sl"]
-                    exit_type = "STOP"
-                    break
-                if float(bar["low"]) <= signal["tp"]:
-                    exit_price = signal["tp"]
-                    exit_type = "TARGET"
-                    break
-
-        if exit_price is None:
-            exit_price = float(future.iloc[-1]["close"]) if len(future) else signal["entry"]
-
-        gross = (exit_price - signal["entry"]) * qty if signal["side"] == "buy" else (signal["entry"] - exit_price) * qty
-        fees = qty * signal["entry"] * (FEE_BPS / 10000)
-        pnl = gross - fees
-        balance += pnl
-        last_trade_day = trade_day
-
-        trades.append({
-            "time": ts,
-            "side": signal["side"],
-            "model": signal["model"],
-            "entry": signal["entry"],
-            "exit": exit_price,
-            "pnl": pnl,
-            "balance": balance,
-            "exit_type": exit_type,
-        })
-        equity_curve.append(balance)
-
-    return pd.DataFrame(trades), pd.Series(equity_curve)
-
-
-def performance(trades: pd.DataFrame, equity: pd.Series):
-    if trades.empty or equity.empty:
-        return None
-
-    wins = trades[trades["pnl"] > 0]
-    losses = trades[trades["pnl"] <= 0]
-
-    win_rate = len(wins) / len(trades)
-    gross_profit = float(wins["pnl"].sum()) if not wins.empty else 0.0
-    gross_loss = abs(float(losses["pnl"].sum())) if not losses.empty else 0.0
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-    expectancy = float(trades["pnl"].mean())
-
-    drawdown = equity / equity.cummax() - 1
-    max_drawdown = float(drawdown.min()) if len(drawdown) else 0.0
-    total_return = float(equity.iloc[-1] / INITIAL_BALANCE - 1)
-
-    return {
-        "trades": len(trades),
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "expectancy": expectancy,
-        "max_drawdown": max_drawdown,
-        "total_return": total_return,
-        "final_balance": float(equity.iloc[-1]),
-    }
-
-
-def parameter_grid():
-    for min_atr_pct in [0.0018, 0.0022, 0.0028]:
-        for min_volume_mult in [0.70, 0.85, 1.00]:
-            for min_body_atr in [0.10, 0.15, 0.20]:
-                for max_body_atr in [2.0, 2.8]:
-                    for pullback_buffer_atr in [0.30, 0.45]:
-                        for rr_target in [1.5, 1.8, 2.0]:
-                            yield {
-                                "min_atr_pct": min_atr_pct,
-                                "min_volume_mult": min_volume_mult,
-                                "min_body_atr": min_body_atr,
-                                "max_body_atr": max_body_atr,
-                                "pullback_buffer_atr": pullback_buffer_atr,
-                                "rr_target": rr_target,
-                                "allow_shorts": False,
-                            }
-
-
-def optimize(df5: pd.DataFrame, df15: pd.DataFrame):
-    rows = []
-    for params in parameter_grid():
-        trades, equity = backtest_symbol(df5, df15, params)
-        stats = performance(trades, equity)
-        if not stats or stats["trades"] < 5:
-            continue
-        score = stats["profit_factor"] * 0.4 + stats["win_rate"] * 0.3 + stats["total_return"] * 0.3
-        rows.append({**params, **stats, "score": score})
-    if not rows:
-        return None
-    ranked = pd.DataFrame(rows).sort_values("score", ascending=False)
-    return ranked.iloc[0].to_dict()
-
-
-def walk_forward(df5: pd.DataFrame, df15: pd.DataFrame):
-    reports = []
-    trades_all = []
-
-    if len(df5) < TRAIN_BARS + TEST_BARS + 20:
-        return pd.DataFrame(), pd.DataFrame()
-
-    start = 0
-    window = 1
-
-    while start + TRAIN_BARS + TEST_BARS < len(df5):
-        train5 = df5.iloc[start:start + TRAIN_BARS].reset_index(drop=True)
-        test5 = df5.iloc[start + TRAIN_BARS:start + TRAIN_BARS + TEST_BARS].reset_index(drop=True)
-
-        train_start = train5.iloc[0]["time"]
-        train_end = train5.iloc[-1]["time"]
-        test_start = test5.iloc[0]["time"]
-        test_end = test5.iloc[-1]["time"]
-
-        train15 = df15[(df15["time"] >= train_start) & (df15["time"] <= train_end)].reset_index(drop=True)
-        test15 = df15[(df15["time"] >= test_start) & (df15["time"] <= test_end)].reset_index(drop=True)
-
-        best = optimize(train5, train15)
-        if best is None:
-            start += TEST_BARS
-            window += 1
-            continue
-
-        params = {
-            "min_atr_pct": best["min_atr_pct"],
-            "min_volume_mult": best["min_volume_mult"],
-            "min_body_atr": best["min_body_atr"],
-            "max_body_atr": best["max_body_atr"],
-            "pullback_buffer_atr": best["pullback_buffer_atr"],
-            "rr_target": best["rr_target"],
-            "allow_shorts": bool(best["allow_shorts"]),
-        }
-
-        test_trades, test_equity = backtest_symbol(test5, test15, params)
-        stats = performance(test_trades, test_equity)
-
-        if stats:
-            reports.append({"window": window, **params, **stats})
-            test_trades["window"] = window
-            trades_all.append(test_trades)
-
-        start += TEST_BARS
-        window += 1
-
-    return pd.DataFrame(reports), (pd.concat(trades_all, ignore_index=True) if trades_all else pd.DataFrame())
-
-
-def monte_carlo(trades: pd.DataFrame):
-    if trades.empty:
         return None, None
-
-    pnl = trades["pnl"].values
-    results = []
-
-    for _ in range(MONTE_CARLO_RUNS):
-        sampled = np.random.choice(pnl, size=len(pnl), replace=True)
-        equity = INITIAL_BALANCE + np.cumsum(sampled)
-        peak = np.maximum.accumulate(equity)
-        dd = equity / peak - 1
-        results.append({
-            "final_balance": float(equity[-1]),
-            "total_return": float(equity[-1] / INITIAL_BALANCE - 1),
-            "max_drawdown": float(dd.min()),
-        })
-
-    mc = pd.DataFrame(results)
-    summary = {
-        "median_final_balance": float(mc["final_balance"].median()),
-        "worst_5pct_balance": float(mc["final_balance"].quantile(0.05)),
-        "median_return": float(mc["total_return"].median()),
-        "worst_5pct_return": float(mc["total_return"].quantile(0.05)),
-        "median_drawdown": float(mc["max_drawdown"].median()),
-        "worst_5pct_drawdown": float(mc["max_drawdown"].quantile(0.05)),
-        "risk_of_loss": float((mc["final_balance"] < INITIAL_BALANCE).mean()),
-    }
-    return mc, summary
+    return float(opening["high"].max()), float(opening["low"].min())
 
 
-def run_symbol(symbol: str):
-    print(f"Researching {symbol} ...")
-    df5 = bars_to_df(symbol, "5Min", 2000)
-    df15 = bars_to_df(symbol, "15Min", 800)
-    if df5.empty or df15.empty:
-        return {"symbol": symbol, "status": "NO_DATA"}
+def time_bucket(ts):
+    ts = pd.Timestamp(ts)
+    minute = (ts.minute // 15) * 15
+    return f"{ts.hour:02d}:{minute:02d}"
 
-    report, trades = walk_forward(df5, df15)
-    if report.empty or trades.empty:
-        return {"symbol": symbol, "status": "NO_ROBUST_RESULT"}
 
-    mc, mc_summary = monte_carlo(trades)
-    avg_pf = float(report["profit_factor"].replace(np.inf, np.nan).mean())
-    avg_wr = float(report["win_rate"].mean())
-    avg_ret = float(report["total_return"].mean())
-    total_trades = int(report["trades"].sum())
+def price_zone(row, or_high, or_low):
+    close = float(row["close"]); ema20 = float(row["ema20"]); ema50 = float(row["ema50"])
+    if or_high is not None and close > or_high: return "above_or"
+    if or_low is not None and close < or_low: return "below_or"
+    if close > ema20 > ema50: return "above_ema_stack"
+    if close < ema20 < ema50: return "below_ema_stack"
+    return "mixed"
 
-    return {
-        "symbol": symbol,
-        "status": "OK",
-        "windows": len(report),
-        "avg_profit_factor": avg_pf,
-        "avg_win_rate": avg_wr,
-        "avg_return_per_window": avg_ret,
-        "total_trades": total_trades,
-        "risk_of_loss": mc_summary["risk_of_loss"] if mc_summary else None,
-        "worst_5pct_return": mc_summary["worst_5pct_return"] if mc_summary else None,
-    }
+
+def trade_outcome(df, i, side, entry, stop, target, max_hold=12):
+    for j in range(i + 1, min(i + max_hold, len(df))):
+        bar = df.iloc[j]
+        if side == "LONG":
+            if float(bar["low"]) <= stop: return -1.0
+            if float(bar["high"]) >= target: return (target - entry) / max(entry - stop, 1e-9)
+        else:
+            if float(bar["high"]) >= stop: return -1.0
+            if float(bar["low"]) <= target: return (entry - target) / max(stop - entry, 1e-9)
+    last_close = float(df.iloc[min(i + max_hold, len(df) - 1)]["close"])
+    if side == "LONG":
+        return (last_close - entry) / max(entry - stop, 1e-9)
+    return (entry - last_close) / max(stop - entry, 1e-9)
+
+
+def collect_candidates(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, i: int, or_high, or_low):
+    row = df5.iloc[i]
+    if not in_window(row["time"], TRADE_START, LAST_ENTRY_TIME):
+        return []
+
+    bias = htf_bias_from_df(df15, row["time"])
+    if bias in ["CHOP", "NONE"]:
+        return []
+    if float(row["atr_pct"]) < MIN_ATR_PCT:
+        return []
+    if not volume_ok(row) or not candle_quality(row):
+        return []
+
+    close = float(row["close"]); low = float(row["low"]); high = float(row["high"]); open_ = float(row["open"]); atr = float(row["atr"])
+    ema20 = float(row["ema20"]); ema50 = float(row["ema50"])
+
+    out = []
+
+    if or_high is not None and close > or_high and bias_allows("LONG", bias) and close > open_:
+        sl = min(low, or_low)
+        risk = close - sl
+        if risk > 0:
+            out.append(("OR_BREAKOUT_CONTINUATION", "LONG", close, sl, close + risk * RR_TARGET))
+    if or_low is not None and close < or_low and bias_allows("SHORT", bias) and close < open_:
+        sl = max(high, or_high)
+        risk = sl - close
+        if risk > 0:
+            out.append(("OR_BREAKOUT_CONTINUATION", "SHORT", close, sl, close - risk * RR_TARGET))
+
+    recent = df5.iloc[max(0, i - 10):i + 1]
+    bull_broke = or_high is not None and (recent["close"] > or_high).any()
+    bear_broke = or_low is not None and (recent["close"] < or_low).any()
+
+    if bull_broke and low <= or_high + atr * RETEST_BUFFER_ATR and close > or_high and strong_rejection(row, "LONG") and bias_allows("LONG", bias):
+        sl = min(low, or_low)
+        risk = close - sl
+        if risk > 0:
+            out.append(("OR_RETEST_REJECTION", "LONG", close, sl, close + risk * RR_TARGET))
+    if bear_broke and high >= or_low - atr * RETEST_BUFFER_ATR and close < or_low and strong_rejection(row, "SHORT") and bias_allows("SHORT", bias):
+        sl = max(high, or_high)
+        risk = sl - close
+        if risk > 0:
+            out.append(("OR_RETEST_REJECTION", "SHORT", close, sl, close - risk * RR_TARGET))
+
+    touched_value = low <= ema20 + atr * PULLBACK_BUFFER_ATR or low <= ema50 + atr * 0.20
+    reclaimed = close > open_ and close > ema20
+    if touched_value and reclaimed and strong_rejection(row, "LONG") and bias_allows("LONG", bias):
+        sl = min(low, ema50 - atr * 0.10)
+        risk = close - sl
+        if risk > 0:
+            out.append(("TREND_PULLBACK", "LONG", close, sl, close + risk * RR_TARGET))
+
+    touched_value_s = high >= ema20 - atr * PULLBACK_BUFFER_ATR or high >= ema50 - atr * 0.20
+    rejected = close < open_ and close < ema20
+    if touched_value_s and rejected and strong_rejection(row, "SHORT") and bias_allows("SHORT", bias):
+        sl = max(high, ema50 + atr * 0.10)
+        risk = sl - close
+        if risk > 0:
+            out.append(("TREND_PULLBACK", "SHORT", close, sl, close - risk * RR_TARGET))
+
+    recent8 = df5.iloc[max(0, i - 8):i]
+    if len(recent8) >= 6:
+        swing_low = float(recent8["low"].min()); swing_high = float(recent8["high"].max())
+        if low < swing_low and close > swing_low and bullish_pin(row) and bias != "BEAR":
+            sl = low; risk = close - sl
+            if risk > 0:
+                out.append(("LIQUIDITY_SWEEP_REVERSAL", "LONG", close, sl, close + risk * RR_TARGET))
+        if high > swing_high and close < swing_high and bearish_pin(row) and bias != "BULL" and ALLOW_SHORTS:
+            sl = high; risk = sl - close
+            if risk > 0:
+                out.append(("LIQUIDITY_SWEEP_REVERSAL", "SHORT", close, sl, close - risk * RR_TARGET))
+
+    recent20 = df5.iloc[max(0, i - 20):i]
+    if len(recent20) >= 10:
+        range_high = float(recent20["high"].max()); range_low = float(recent20["low"].min())
+        if low <= range_low and close > range_low and bullish_pin(row):
+            sl = low; risk = close - sl
+            if risk > 0:
+                out.append(("RANGE_REJECTION", "LONG", close, sl, close + risk * RR_TARGET))
+        if high >= range_high and close < range_high and bearish_pin(row) and ALLOW_SHORTS:
+            sl = high; risk = sl - close
+            if risk > 0:
+                out.append(("RANGE_REJECTION", "SHORT", close, sl, close - risk * RR_TARGET))
+
+    recent12 = df5.iloc[max(0, i - 12):i]
+    if len(recent12) >= 8:
+        width = float(recent12["high"].max() - recent12["low"].min())
+        if width <= atr * 2.4:
+            hi = float(recent12["high"].max()); lo = float(recent12["low"].min())
+            if close > hi and bias_allows("LONG", bias):
+                sl = low; risk = close - sl
+                if risk > 0:
+                    out.append(("COMPRESSION_BREAKOUT", "LONG", close, sl, close + risk * RR_TARGET))
+            if close < lo and bias_allows("SHORT", bias):
+                sl = high; risk = sl - close
+                if risk > 0:
+                    out.append(("COMPRESSION_BREAKOUT", "SHORT", close, sl, close - risk * RR_TARGET))
+
+    if i >= 1:
+        prev = df5.iloc[i - 1]
+        if prev["close"] < prev["ema20"] and close > ema20 and close > open_ and bias_allows("LONG", bias):
+            sl = min(low, ema20); risk = close - sl
+            if risk > 0:
+                out.append(("EMA_RECLAIM", "LONG", close, sl, close + risk * RR_TARGET))
+        if prev["close"] > prev["ema20"] and close < ema20 and close < open_ and bias_allows("SHORT", bias):
+            sl = max(high, ema20); risk = sl - close
+            if risk > 0:
+                out.append(("EMA_RECLAIM", "SHORT", close, sl, close - risk * RR_TARGET))
+
+    return out
 
 
 def run():
-    rows = []
-    for sym in WATCHLIST:
-        try:
-            rows.append(run_symbol(sym))
-        except Exception as e:
-            rows.append({"symbol": sym, "status": f"ERROR: {e}"})
+    bucket_stats = {}
 
-    out = pd.DataFrame(rows)
-    out.to_csv("stock_research_summary.csv", index=False)
+    for symbol in WATCHLIST:
+        print(f"Researching {symbol} ...")
+        df5 = add_indicators(bars_to_df(symbol, "5Min", 1500))
+        df15 = add_indicators(bars_to_df(symbol, "15Min", 600))
+        if df5.empty or df15.empty:
+            continue
 
-    ok = out[out["status"] == "OK"].copy()
-    if not ok.empty:
-        ok = ok.sort_values(["avg_profit_factor", "avg_win_rate"], ascending=False)
-        lines = []
-        for _, r in ok.head(8).iterrows():
-            lines.append(
-                f"{r['symbol']}: PF {r['avg_profit_factor']:.2f}, WR {r['avg_win_rate']:.1%}, "
-                f"Trades {int(r['total_trades'])}, RiskLoss {r['risk_of_loss']:.1%}"
-            )
-        send("STOCK BOT RESEARCH SUMMARY\n\n" + "\n".join(lines))
-    else:
-        send("STOCK BOT RESEARCH SUMMARY\n\nNo robust results.")
+        for day, day_df in df5.groupby(df5["time"].dt.date):
+            if len(day_df) < 30:
+                continue
+            or_high, or_low = build_opening_range(day_df)
+            if or_high is None:
+                continue
 
-    print(out.to_string(index=False))
+            idxs = day_df.index.tolist()
+            for i in idxs:
+                row = df5.loc[i]
+                if not in_window(row["time"], TRADE_START, LAST_ENTRY_TIME):
+                    continue
+                candidates = collect_candidates(symbol, df5, df15, i, or_high, or_low)
+                if not candidates:
+                    continue
+
+                bucket = time_bucket(row["time"])
+                zone = price_zone(row, or_high, or_low)
+
+                for model, direction, entry, stop, target in candidates:
+                    r_mult = trade_outcome(df5, i, direction, entry, stop, target, max_hold=12)
+                    keys = [
+                        f"{symbol}|{model}|{direction}|{bucket}|{zone}",
+                        f"{symbol}|{model}|{direction}|{bucket}|ALL",
+                        f"ALL|{model}|{direction}|{bucket}|ALL",
+                        f"ALL|{model}|{direction}|ALL|ALL",
+                    ]
+                    for k in keys:
+                        bucket_stats.setdefault(k, []).append(float(r_mult))
+
+    profile = {"updated_at": pd.Timestamp.utcnow().isoformat(), "buckets": {}}
+    for k, vals in bucket_stats.items():
+        arr = np.array(vals, dtype=float)
+        if len(arr) < 6:
+            continue
+        profile["buckets"][k] = {
+            "trades": int(len(arr)),
+            "expectancy_r": float(arr.mean()),
+            "win_rate": float((arr > 0).mean()),
+            "median_r": float(np.median(arr)),
+        }
+
+    with open(OUT_FILE, "w") as f:
+        json.dump(profile, f, indent=2)
+
+    lines = []
+    model_groups = {}
+    for k, info in profile["buckets"].items():
+        sym, model, direction, bucket, zone = k.split("|")
+        if bucket == "ALL":
+            model_groups.setdefault((sym, model, direction), []).append(info)
+    for key, infos in model_groups.items():
+        exp = np.mean([x["expectancy_r"] for x in infos])
+        wr = np.mean([x["win_rate"] for x in infos])
+        n = int(sum([x["trades"] for x in infos]))
+        sym, model, direction = key
+        lines.append(f"{sym} {model} {direction}: expR {exp:.2f}, WR {wr:.1%}, n {n}")
+
+    send("STOCK EDGE RESEARCH COMPLETE\n\n" + ("\n".join(lines[:15]) if lines else "No robust buckets found."))
 
 
 if __name__ == "__main__":
