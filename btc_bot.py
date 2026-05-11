@@ -1,67 +1,38 @@
-import ccxt
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import requests
+import os
 import time
 import json
-import os
+import math
+import requests
+import numpy as np
+import pandas as pd
+import ccxt
+import yfinance as yf
 
 from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
 
-TIMEFRAME = "1h"
-HIGHER_TIMEFRAME = "4h"
+# ============================================================
+# TELEGRAM
+# ============================================================
 
-BTC_LIMIT = 1500
-BTC_HTF_LIMIT = 500
-
-GOLD_PERIOD = "730d"
-GOLD_HTF_PERIOD = "730d"
-
-FEE = 0.0006
-INITIAL_BALANCE = 10_000
-RISK_PER_TRADE = 0.01
-
-TRAIN_SIZE = 500
-TEST_SIZE = 150
-MONTE_CARLO_RUNS = 500
-
-LIVE_SCAN_SECONDS = 300
-
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 SENT_SIGNAL_FILE = "sent_signals.json"
 
-EXCHANGES = [
-    ("coinbase", "BTC/USD"),
-    ("kraken", "BTC/USD"),
-    ("bybit", "BTC/USDT"),
-    ("binanceus", "BTC/USDT"),
-]
 
-
-def send_telegram(message):
+def send_telegram(message: str):
+    print(message)
+    if BOT_TOKEN == "YOUR_BOT_TOKEN" or CHAT_ID == "YOUR_CHAT_ID":
+        print("Telegram not configured.")
+        return
     try:
-        if BOT_TOKEN == "YOUR_BOT_TOKEN":
-            print("Telegram not configured")
-            print(message)
-            return
-
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
         requests.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message,
-            },
-            timeout=10
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": message},
+            timeout=10,
         )
-
     except Exception as e:
         print("Telegram error:", e)
 
@@ -69,11 +40,10 @@ def send_telegram(message):
 def load_json(path, default):
     if not os.path.exists(path):
         return default
-
     try:
         with open(path, "r") as f:
             return json.load(f)
-    except:
+    except Exception:
         return default
 
 
@@ -82,743 +52,829 @@ def save_json(path, data):
         json.dump(data, f, indent=2, default=str)
 
 
+# ============================================================
+# SETTINGS
+# ============================================================
+
+LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "300"))
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() in ["1", "true", "yes", "y"]
+TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "1"))
+MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "60"))
+
+EXCHANGES = [
+    ("coinbase", "BTC/USD"),
+    ("kraken", "BTC/USD"),
+    ("bybit", "BTC/USDT"),
+    ("binanceus", "BTC/USDT"),
+]
+
+SUPPORTED_TFS = ["5m", "15m", "30m", "1h", "4h", "1d"]
+TF_TO_MINUTES = {
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+    "1d": 1440,
+}
+PANDAS_RULES = {
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1H",
+    "4h": "4H",
+    "1d": "1D",
+}
+YF_INTERVALS = {
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "60m",
+    "1d": "1d",
+}
+YF_PERIODS = {
+    "5m": "60d",
+    "15m": "60d",
+    "30m": "60d",
+    "1h": "730d",
+    "1d": "10y",
+}
+
+# Mutable multi-timeframe setups.
+# The bot will scan all enabled setups each cycle, score them,
+# and send the best candidate(s).
+SETUPS = [
+    {
+        "name": "fast",
+        "entry_tf": "5m",
+        "confirm_tf": "15m",
+        "bias_tf": "1h",
+        "enabled": os.getenv("ENABLE_FAST_SETUP", "true").lower() in ["1", "true", "yes", "y"],
+    },
+    {
+        "name": "intraday",
+        "entry_tf": "15m",
+        "confirm_tf": "1h",
+        "bias_tf": "4h",
+        "enabled": os.getenv("ENABLE_INTRADAY_SETUP", "true").lower() in ["1", "true", "yes", "y"],
+    },
+    {
+        "name": "swing",
+        "entry_tf": "1h",
+        "confirm_tf": "4h",
+        "bias_tf": "1d",
+        "enabled": os.getenv("ENABLE_SWING_SETUP", "true").lower() in ["1", "true", "yes", "y"],
+    },
+]
+
+MARKETS = ["BTC", "GOLD"]
+
+PARAMS = {
+    "sweep_lookback": int(os.getenv("SWEEP_LOOKBACK", "8")),
+    "min_adx": float(os.getenv("MIN_ADX", "12")),
+    "rsi_bull": float(os.getenv("RSI_BULL", "50")),
+    "rsi_bear": float(os.getenv("RSI_BEAR", "50")),
+    "volume_mult": float(os.getenv("VOLUME_MULT", "0.80")),
+    "atr_stop": float(os.getenv("ATR_STOP", "1.20")),
+    "rr": float(os.getenv("RR_TARGET", "1.70")),
+}
+
+# Pullback / retest tuning
+PULLBACK_BUFFER_ATR = float(os.getenv("PULLBACK_BUFFER_ATR", "0.35"))
+RETEST_BUFFER_ATR = float(os.getenv("RETEST_BUFFER_ATR", "0.25"))
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_setup(setup):
+    for key in ["entry_tf", "confirm_tf", "bias_tf"]:
+        if setup[key] not in SUPPORTED_TFS:
+            raise ValueError(f"Unsupported timeframe {setup[key]} in setup {setup['name']}")
+
+    e = TF_TO_MINUTES[setup["entry_tf"]]
+    c = TF_TO_MINUTES[setup["confirm_tf"]]
+    b = TF_TO_MINUTES[setup["bias_tf"]]
+
+    if not (e <= c <= b):
+        raise ValueError(
+            f"Invalid setup order for {setup['name']}: "
+            f"{setup['entry_tf']} / {setup['confirm_tf']} / {setup['bias_tf']}"
+        )
+
+
+for _setup in SETUPS:
+    validate_setup(_setup)
+
+
+# ============================================================
+# FETCH HELPERS
+# ============================================================
+
 def get_exchange(name):
     return getattr(ccxt, name)({
         "enableRateLimit": True,
-        "timeout": 10000,
+        "timeout": 15000,
     })
 
 
 def validate_data(df):
-
-    if df is None or len(df) < 300:
+    if df is None or len(df) < 250:
         return False, "Not enough candles"
-
     if df.isna().sum().sum() > 0:
         return False, "NaN values"
-
+    if "volume" in df.columns and (df["volume"] < 0).any():
+        return False, "Negative volume"
     return True, "OK"
 
 
-def fetch_btc(timeframe=TIMEFRAME, limit=BTC_LIMIT):
+def bars_needed(tf):
+    if tf == "5m":
+        return 3000
+    if tf == "15m":
+        return 2200
+    if tf == "30m":
+        return 1600
+    if tf == "1h":
+        return 1500
+    if tf == "4h":
+        return 1000
+    return 800
+
+
+def fetch_btc(tf):
+    needed = bars_needed(tf)
 
     for name, symbol in EXCHANGES:
-
         try:
             exchange = get_exchange(name)
+            exchange_tf = tf
+            limit = needed
 
-            exchange_timeframe = timeframe
+            # Coinbase does not support 4h, so resample from 1h.
+            if name == "coinbase" and tf == "4h":
+                exchange_tf = "1h"
+                limit = needed * 4 + 50
 
-            if name == "coinbase" and timeframe == "4h":
-                exchange_timeframe = "1h"
-
-            candles = exchange.fetch_ohlcv(
-                symbol,
-                timeframe=exchange_timeframe,
-                limit=limit
-            )
+            candles = exchange.fetch_ohlcv(symbol, timeframe=exchange_tf, limit=limit)
 
             df = pd.DataFrame(
                 candles,
-                columns=[
-                    "timestamp",
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume"
-                ]
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
 
-            df["timestamp"] = pd.to_datetime(
-                df["timestamp"],
-                unit="ms",
-                utc=True
-            )
+            if name == "coinbase" and tf == "4h":
+                df = resample_ohlcv(df, "4h")
 
-            valid, _ = validate_data(df)
+            valid, reason = validate_data(df)
+            if not valid:
+                print(f"{name} {tf} rejected: {reason}")
+                continue
 
-            if valid:
-                return df
+            print(f"Using BTC feed: {name} {tf}")
+            return df.sort_values("timestamp").reset_index(drop=True)
 
         except Exception as e:
-            print(f"{name} failed:", e)
+            print(f"{name} {tf} failed:", e)
 
-    raise Exception("No BTC feed available")
+    raise Exception(f"No BTC feed available for {tf}")
 
 
-def fetch_gold(interval=TIMEFRAME, period=GOLD_PERIOD):
+def fetch_gold(tf):
+    if tf == "4h":
+        # resample from 1h
+        base = fetch_gold("1h")
+        return resample_ohlcv(base, "4h")
+
+    if tf not in YF_INTERVALS:
+        raise ValueError(f"Gold timeframe unsupported directly: {tf}")
+
+    interval = YF_INTERVALS[tf]
+    period = YF_PERIODS[tf]
 
     df = yf.download(
         "GC=F",
         period=period,
         interval=interval,
         auto_adjust=True,
-        progress=False
+        progress=False,
     ).reset_index()
 
     if "Datetime" in df.columns:
         df = df.rename(columns={"Datetime": "timestamp"})
-
     elif "Date" in df.columns:
         df = df.rename(columns={"Date": "timestamp"})
 
+    df.columns = [str(c).lower() for c in df.columns]
+    keep = ["timestamp", "open", "high", "low", "close", "volume"]
+    df = df[keep].dropna()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    return df[
-        [
-            "timestamp",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume"
-        ]
-    ].dropna()
+    valid, reason = validate_data(df)
+    if not valid:
+        raise Exception(f"Gold {tf} invalid: {reason}")
+
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+def fetch_market_tf(market, tf):
+    if market == "BTC":
+        return fetch_btc(tf)
+    if market == "GOLD":
+        return fetch_gold(tf)
+    raise ValueError(f"Unknown market {market}")
+
+
+# ============================================================
+# OHLCV / INDICATORS
+# ============================================================
+
+def resample_ohlcv(df, tf):
+    rule = PANDAS_RULES[tf]
+    rdf = (
+        df.set_index("timestamp")
+        .sort_index()
+        .resample(rule)
+        .agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum",
+        })
+        .dropna()
+        .reset_index()
+    )
+    return rdf
 
 
 def add_indicators(df):
+    if df.empty or len(df) < 220:
+        return pd.DataFrame()
 
-    df = df.copy()
+    out = df.copy()
 
-    df["ema_20"] = EMAIndicator(df["Close"], 20).ema_indicator()
-    df["ema_50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-    df["ema_200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+    out["ema20"] = EMAIndicator(out["close"], 20).ema_indicator()
+    out["ema50"] = EMAIndicator(out["close"], 50).ema_indicator()
+    out["ema200"] = EMAIndicator(out["close"], 200).ema_indicator()
 
-    df["rsi"] = RSIIndicator(df["Close"], 14).rsi()
+    out["rsi"] = RSIIndicator(out["close"], 14).rsi()
+    out["adx"] = ADXIndicator(out["high"], out["low"], out["close"], 14).adx()
+    out["atr"] = AverageTrueRange(out["high"], out["low"], out["close"], 14).average_true_range()
+    out["avg_volume"] = out["volume"].rolling(30).mean()
 
-    df["adx"] = ADXIndicator(
-        df["High"],
-        df["Low"],
-        df["Close"],
-        14
-    ).adx()
-
-    df["atr"] = AverageTrueRange(
-        df["High"],
-        df["Low"],
-        df["Close"],
-        14
-    ).average_true_range()
-
-    df["avg_volume"] = df["Volume"].rolling(30).mean()
-
-    return df.dropna().reset_index(drop=True)
+    return out.dropna().reset_index(drop=True)
 
 
-def trend(row):
+def prefix_df(df, prefix):
+    return df.rename(columns={c: f"{prefix}{c}" for c in df.columns if c != "timestamp"})
 
-    if row["Close"] > row["ema_20"] > row["ema_50"] > row["ema_200"]:
+
+def build_mtf_frame(market, setup):
+    entry_df = add_indicators(fetch_market_tf(market, setup["entry_tf"]))
+    confirm_df = add_indicators(fetch_market_tf(market, setup["confirm_tf"]))
+    bias_df = add_indicators(fetch_market_tf(market, setup["bias_tf"]))
+
+    if entry_df.empty or confirm_df.empty or bias_df.empty:
+        return pd.DataFrame()
+
+    confirm_df = prefix_df(confirm_df, "c_")
+    bias_df = prefix_df(bias_df, "b_")
+
+    merged = pd.merge_asof(
+        entry_df.sort_values("timestamp"),
+        confirm_df.sort_values("timestamp"),
+        on="timestamp",
+        direction="backward",
+    )
+    merged = pd.merge_asof(
+        merged.sort_values("timestamp"),
+        bias_df.sort_values("timestamp"),
+        on="timestamp",
+        direction="backward",
+    )
+
+    return merged.dropna().reset_index(drop=True)
+
+
+# ============================================================
+# SIGNAL COMPONENTS
+# ============================================================
+
+def trend_values(close, ema20, ema50, ema200):
+    if pd.isna(close) or pd.isna(ema20) or pd.isna(ema50) or pd.isna(ema200):
+        return "NEUTRAL"
+    if close > ema20 > ema50 > ema200:
         return "BULLISH"
-
-    if row["Close"] < row["ema_20"] < row["ema_50"] < row["ema_200"]:
+    if close < ema20 < ema50 < ema200:
         return "BEARISH"
-
     return "NEUTRAL"
 
 
+def entry_trend(row):
+    return trend_values(row["close"], row["ema20"], row["ema50"], row["ema200"])
+
+
+def confirm_trend(row):
+    return trend_values(row["c_close"], row["c_ema20"], row["c_ema50"], row["c_ema200"])
+
+
+def bias_trend(row):
+    return trend_values(row["b_close"], row["b_ema20"], row["b_ema50"], row["b_ema200"])
+
+
 def bullish_pin(row):
-
-    body = abs(row["Close"] - row["Open"])
-    rng = row["High"] - row["Low"]
-
-    if rng == 0:
+    body = abs(row["close"] - row["open"])
+    rng = row["high"] - row["low"]
+    if rng <= 0:
         return False
-
-    lower = min(row["Open"], row["Close"]) - row["Low"]
-    upper = row["High"] - max(row["Open"], row["Close"])
-
-    return (
-        lower > body * 2.5
-        and upper < body * 1.2
-        and row["Close"] > row["Open"]
-    )
+    lower = min(row["open"], row["close"]) - row["low"]
+    upper = row["high"] - max(row["open"], row["close"])
+    return lower > body * 1.8 and upper < body * 1.5 and row["close"] > row["open"]
 
 
 def bearish_pin(row):
-
-    body = abs(row["Close"] - row["Open"])
-    rng = row["High"] - row["Low"]
-
-    if rng == 0:
+    body = abs(row["close"] - row["open"])
+    rng = row["high"] - row["low"]
+    if rng <= 0:
         return False
-
-    upper = row["High"] - max(row["Open"], row["Close"])
-    lower = min(row["Open"], row["Close"]) - row["Low"]
-
-    return (
-        upper > body * 2.5
-        and lower < body * 1.2
-        and row["Close"] < row["Open"]
-    )
+    upper = row["high"] - max(row["open"], row["close"])
+    lower = min(row["open"], row["close"]) - row["low"]
+    return upper > body * 1.8 and lower < body * 1.5 and row["close"] < row["open"]
 
 
 def bullish_engulf(prev, curr):
-
     return bool(
-        prev["Close"] < prev["Open"]
-        and curr["Close"] > curr["Open"]
-        and curr["Close"] > prev["Open"]
-        and curr["Open"] < prev["Close"]
+        prev["close"] < prev["open"]
+        and curr["close"] > curr["open"]
+        and curr["close"] > prev["open"]
+        and curr["open"] < prev["close"]
     )
 
 
 def bearish_engulf(prev, curr):
-
     return bool(
-        prev["Close"] > prev["Open"]
-        and curr["Close"] < curr["Open"]
-        and curr["Open"] > prev["Close"]
-        and curr["Close"] < prev["Open"]
+        prev["close"] > prev["open"]
+        and curr["close"] < curr["open"]
+        and curr["open"] > prev["close"]
+        and curr["close"] < prev["open"]
     )
 
 
 def liquidity_sweep_low(df, i, lookback):
-
-    swing_low = df["Low"].iloc[i - lookback:i].min()
-
-    return bool(
-        df.iloc[i]["Low"] < swing_low
-        and df.iloc[i]["Close"] > swing_low
-    )
+    if i - lookback < 1:
+        return False
+    swing_low = df["low"].iloc[i - lookback:i].min()
+    return bool(df.iloc[i]["low"] < swing_low and df.iloc[i]["close"] > swing_low)
 
 
 def liquidity_sweep_high(df, i, lookback):
-
-    swing_high = df["High"].iloc[i - lookback:i].max()
-
-    return bool(
-        df.iloc[i]["High"] > swing_high
-        and df.iloc[i]["Close"] < swing_high
-    )
-
-
-def displacement(row, atr_mult):
-
-    body = abs(row["Close"] - row["Open"])
-    rng = row["High"] - row["Low"]
-
-    if rng == 0:
+    if i - lookback < 1:
         return False
-
-    return bool(
-        body / rng > 0.55
-        and rng > row["atr"] * atr_mult
-    )
+    swing_high = df["high"].iloc[i - lookback:i].max()
+    return bool(df.iloc[i]["high"] > swing_high and df.iloc[i]["close"] < swing_high)
 
 
-def performance(trades, equity):
+def volume_ok(row):
+    if pd.isna(row["avg_volume"]) or row["avg_volume"] <= 0:
+        return True
+    return row["volume"] >= row["avg_volume"] * PARAMS["volume_mult"]
 
-    if trades.empty or len(equity) < 2:
+
+def breakout_level_high(df, i, lookback=20):
+    if i - lookback < 1:
         return None
+    return float(df["high"].iloc[i - lookback:i].max())
 
-    wins = trades[trades["pnl"] > 0]
-    losses = trades[trades["pnl"] <= 0]
 
-    win_rate = len(wins) / len(trades)
+def breakout_level_low(df, i, lookback=20):
+    if i - lookback < 1:
+        return None
+    return float(df["low"].iloc[i - lookback:i].min())
 
-    profit_factor = (
-        wins["pnl"].sum() / abs(losses["pnl"].sum())
-        if len(losses)
-        else np.inf
+
+def trend_score(ltf, ctf, btf, direction):
+    score = 0
+    if direction == "LONG":
+        if ltf == "BULLISH":
+            score += 12
+        if ctf == "BULLISH":
+            score += 18
+        if btf == "BULLISH":
+            score += 20
+        elif btf == "NEUTRAL":
+            score += 8
+    else:
+        if ltf == "BEARISH":
+            score += 12
+        if ctf == "BEARISH":
+            score += 18
+        if btf == "BEARISH":
+            score += 20
+        elif btf == "NEUTRAL":
+            score += 8
+    return score
+
+
+def momentum_score(row, direction):
+    score = 0
+    adx = float(row["adx"])
+    rsi = float(row["rsi"])
+
+    score += max(0, min((adx - 10) * 1.2, 16))
+
+    if direction == "LONG":
+        if rsi >= 60:
+            score += 12
+        elif rsi >= 55:
+            score += 9
+        elif rsi >= 50:
+            score += 6
+    else:
+        if rsi <= 40:
+            score += 12
+        elif rsi <= 45:
+            score += 9
+        elif rsi <= 50:
+            score += 6
+
+    if volume_ok(row):
+        score += 8
+
+    return score
+
+
+def risk_levels(curr, next_open, direction):
+    atr = float(curr["atr"])
+    if direction == "LONG":
+        stop = next_open - atr * PARAMS["atr_stop"]
+        target = next_open + ((next_open - stop) * PARAMS["rr"])
+    else:
+        stop = next_open + atr * PARAMS["atr_stop"]
+        target = next_open - ((stop - next_open) * PARAMS["rr"])
+
+    return round(float(stop), 2), round(float(target), 2)
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+def detect_breakout_continuation(df, i, setup_name):
+    prev = df.iloc[i - 1]
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
+
+    ltf = entry_trend(curr)
+    ctf = confirm_trend(curr)
+    btf = bias_trend(curr)
+
+    high_level = breakout_level_high(df, i, 20)
+    low_level = breakout_level_low(df, i, 20)
+    if high_level is None or low_level is None:
+        return []
+
+    candidates = []
+
+    bull = (
+        curr["close"] > high_level
+        and curr["close"] > prev["high"]
+        and curr["close"] > curr["open"]
+        and curr["close"] > curr["ema20"]
+        and ctf == "BULLISH"
+        and btf in ["BULLISH", "NEUTRAL"]
+        and float(curr["adx"]) >= PARAMS["min_adx"]
+        and float(curr["rsi"]) >= PARAMS["rsi_bull"]
     )
 
-    expectancy = trades["pnl"].mean()
+    bear = (
+        ALLOW_SHORTS
+        and curr["close"] < low_level
+        and curr["close"] < prev["low"]
+        and curr["close"] < curr["open"]
+        and curr["close"] < curr["ema20"]
+        and ctf == "BEARISH"
+        and btf in ["BEARISH", "NEUTRAL"]
+        and float(curr["adx"]) >= PARAMS["min_adx"]
+        and float(curr["rsi"]) <= PARAMS["rsi_bear"]
+    )
 
-    drawdown = equity / equity.cummax() - 1
-    max_drawdown = drawdown.min()
-
-    total_return = equity.iloc[-1] / INITIAL_BALANCE - 1
-
-    return {
-        "trades": len(trades),
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "expectancy": expectancy,
-        "max_drawdown": max_drawdown,
-        "total_return": total_return,
-        "final_balance": equity.iloc[-1]
-    }
-
-
-def backtest(df, params):
-
-    balance = INITIAL_BALANCE
-    equity_curve = []
-    trades = []
-
-    lookback = int(params["sweep_lookback"])
-
-    for i in range(max(220, lookback + 2), len(df) - 2):
-
-        prev = df.iloc[i - 1]
-        curr = df.iloc[i]
-
-        market_trend = trend(curr)
-
-        bull_pattern = bool(
-            bullish_pin(curr)
-            or bullish_engulf(prev, curr)
-        )
-
-        bear_pattern = bool(
-            bearish_pin(curr)
-            or bearish_engulf(prev, curr)
-        )
-
-        bull_signal = (
-            market_trend == "BULLISH"
-            and liquidity_sweep_low(df, i, lookback)
-            and curr["rsi"] >= params["rsi_bull"]
-            and curr["adx"] >= params["min_adx"]
-            and bull_pattern
-        )
-
-        bear_signal = (
-            market_trend == "BEARISH"
-            and liquidity_sweep_high(df, i, lookback)
-            and curr["rsi"] <= params["rsi_bear"]
-            and curr["adx"] >= params["min_adx"]
-            and bear_pattern
-        )
-
-        if not bull_signal and not bear_signal:
-            equity_curve.append(balance)
-            continue
-
-        entry = df.iloc[i + 1]["Open"]
-        atr = curr["atr"]
-
-        risk_amount = balance * RISK_PER_TRADE
-
-        if bull_signal:
-            stop = entry - atr * params["atr_stop"]
-            target = entry + ((entry - stop) * params["rr"])
-            risk_per_unit = entry - stop
-            direction = "LONG"
-
-        else:
-            stop = entry + atr * params["atr_stop"]
-            target = entry - ((stop - entry) * params["rr"])
-            risk_per_unit = stop - entry
-            direction = "SHORT"
-
-        if risk_per_unit <= 0:
-            continue
-
-        position_size = risk_amount / risk_per_unit
-
-        exit_price = None
-
-        for j in range(i + 1, min(i + int(params["max_hold"]), len(df))):
-
-            candle = df.iloc[j]
-
-            if direction == "LONG":
-
-                if candle["Low"] <= stop:
-                    exit_price = stop
-                    break
-
-                if candle["High"] >= target:
-                    exit_price = target
-                    break
-
-            else:
-
-                if candle["High"] >= stop:
-                    exit_price = stop
-                    break
-
-                if candle["Low"] <= target:
-                    exit_price = target
-                    break
-
-        if exit_price is None:
-            exit_price = df.iloc[
-                min(i + int(params["max_hold"]), len(df) - 1)
-            ]["Close"]
-
-        if direction == "LONG":
-            pnl = (exit_price - entry) * position_size
-        else:
-            pnl = (entry - exit_price) * position_size
-
-        pnl -= abs(entry * position_size) * FEE
-
-        balance += pnl
-
-        trades.append({
-            "time": curr["timestamp"],
-            "direction": direction,
-            "pnl": pnl,
-            "balance": balance
+    if bull:
+        score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 18
+        stop, target = risk_levels(curr, next_open, "LONG")
+        candidates.append({
+            "model": "BREAKOUT_CONTINUATION",
+            "direction": "LONG",
+            "score": round(score, 1),
+            "entry": round(next_open, 2),
+            "stop": stop,
+            "target": target,
+            "reason": f"Breakout above {high_level:.2f} with trend continuation",
         })
 
-        equity_curve.append(balance)
-
-    return pd.DataFrame(trades), pd.Series(equity_curve)
-
-
-def parameter_grid():
-
-    for sweep_lookback in [5, 10, 20]:
-
-        for min_adx in [10, 15, 18]:
-
-            for rsi_bull in [48, 50, 52]:
-
-                for rsi_bear in [52, 50, 48]:
-
-                    for volume_mult in [0.8, 1.0]:
-
-                        for atr_stop in [1.0, 1.2]:
-
-                            for rr in [1.2, 1.5, 2.0]:
-
-                                for displacement_atr in [0.5, 0.8]:
-
-                                    yield {
-                                        "sweep_lookback": sweep_lookback,
-                                        "min_adx": min_adx,
-                                        "rsi_bull": rsi_bull,
-                                        "rsi_bear": rsi_bear,
-                                        "volume_mult": volume_mult,
-                                        "atr_stop": atr_stop,
-                                        "rr": rr,
-                                        "displacement_atr": displacement_atr,
-                                        "max_hold": 48
-                                    }
-
-
-def optimize(train_df):
-
-    results = []
-
-    for params in parameter_grid():
-
-        trades, equity = backtest(train_df, params)
-
-        stats = performance(trades, equity)
-
-        if not stats:
-            continue
-
-        if stats["trades"] < 5:
-            continue
-
-        score = (
-            stats["profit_factor"] * 0.35
-            + stats["win_rate"] * 0.25
-            + stats["total_return"] * 0.25
-        )
-
-        results.append({
-            **params,
-            **stats,
-            "score": score
+    if bear:
+        score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 18
+        stop, target = risk_levels(curr, next_open, "SHORT")
+        candidates.append({
+            "model": "BREAKOUT_CONTINUATION",
+            "direction": "SHORT",
+            "score": round(score, 1),
+            "entry": round(next_open, 2),
+            "stop": stop,
+            "target": target,
+            "reason": f"Breakdown below {low_level:.2f} with trend continuation",
         })
 
-    if not results:
-        return None
+    return candidates
 
-    ranked = pd.DataFrame(results).sort_values(
-        "score",
-        ascending=False
+
+def detect_pullback_continuation(df, i, setup_name):
+    prev = df.iloc[i - 1]
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
+
+    ltf = entry_trend(curr)
+    ctf = confirm_trend(curr)
+    btf = bias_trend(curr)
+
+    atr = float(curr["atr"])
+    candidates = []
+
+    touched_long = (
+        curr["low"] <= curr["ema20"] + atr * PULLBACK_BUFFER_ATR
+        or curr["low"] <= curr["ema50"] + atr * 0.15
+    )
+    reclaimed_long = curr["close"] > curr["open"] and curr["close"] > curr["ema20"]
+    bull_reject = bullish_pin(curr) or bullish_engulf(prev, curr)
+
+    bull = (
+        touched_long
+        and reclaimed_long
+        and bull_reject
+        and ctf == "BULLISH"
+        and btf in ["BULLISH", "NEUTRAL"]
+        and float(curr["rsi"]) >= PARAMS["rsi_bull"]
+        and float(curr["adx"]) >= PARAMS["min_adx"]
     )
 
-    return ranked.iloc[0].to_dict()
+    touched_short = (
+        curr["high"] >= curr["ema20"] - atr * PULLBACK_BUFFER_ATR
+        or curr["high"] >= curr["ema50"] - atr * 0.15
+    )
+    reclaimed_short = curr["close"] < curr["open"] and curr["close"] < curr["ema20"]
+    bear_reject = bearish_pin(curr) or bearish_engulf(prev, curr)
 
-
-def walk_forward(df):
-
-    reports = []
-    all_trades = []
-
-    start = 0
-
-    while start + TRAIN_SIZE + TEST_SIZE < len(df):
-
-        train_df = df.iloc[
-            start:start + TRAIN_SIZE
-        ].reset_index(drop=True)
-
-        test_df = df.iloc[
-            start + TRAIN_SIZE:
-            start + TRAIN_SIZE + TEST_SIZE
-        ].reset_index(drop=True)
-
-        best = optimize(train_df)
-
-        if best is None:
-            start += TEST_SIZE
-            continue
-
-        params = {
-            "sweep_lookback": best["sweep_lookback"],
-            "min_adx": best["min_adx"],
-            "rsi_bull": best["rsi_bull"],
-            "rsi_bear": best["rsi_bear"],
-            "volume_mult": best["volume_mult"],
-            "atr_stop": best["atr_stop"],
-            "rr": best["rr"],
-            "displacement_atr": best["displacement_atr"],
-            "max_hold": best["max_hold"]
-        }
-
-        test_trades, test_equity = backtest(test_df, params)
-
-        stats = performance(test_trades, test_equity)
-
-        if stats:
-            reports.append({
-                **params,
-                **stats
-            })
-
-            all_trades.append(test_trades)
-
-        start += TEST_SIZE
-
-    report_df = pd.DataFrame(reports)
-
-    trades_df = (
-        pd.concat(all_trades, ignore_index=True)
-        if all_trades
-        else pd.DataFrame()
+    bear = (
+        ALLOW_SHORTS
+        and touched_short
+        and reclaimed_short
+        and bear_reject
+        and ctf == "BEARISH"
+        and btf in ["BEARISH", "NEUTRAL"]
+        and float(curr["rsi"]) <= PARAMS["rsi_bear"]
+        and float(curr["adx"]) >= PARAMS["min_adx"]
     )
 
-    return report_df, trades_df
+    if bull:
+        score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 16
+        stop, target = risk_levels(curr, next_open, "LONG")
+        candidates.append({
+            "model": "PULLBACK_CONTINUATION",
+            "direction": "LONG",
+            "score": round(score, 1),
+            "entry": round(next_open, 2),
+            "stop": stop,
+            "target": target,
+            "reason": "Pullback into EMA zone and bullish reclaim",
+        })
+
+    if bear:
+        score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 16
+        stop, target = risk_levels(curr, next_open, "SHORT")
+        candidates.append({
+            "model": "PULLBACK_CONTINUATION",
+            "direction": "SHORT",
+            "score": round(score, 1),
+            "entry": round(next_open, 2),
+            "stop": stop,
+            "target": target,
+            "reason": "Pullback into EMA zone and bearish rejection",
+        })
+
+    return candidates
 
 
-def build_live_signal(name, df, htf_df, params):
+def detect_retest_rejection(df, i, setup_name):
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
 
-    try:
+    ltf = entry_trend(curr)
+    ctf = confirm_trend(curr)
+    btf = bias_trend(curr)
 
-        df = add_indicators(df)
-        htf_df = add_indicators(htf_df)
+    atr = float(curr["atr"])
+    candidates = []
 
-        lookback = int(params["sweep_lookback"])
+    high_level = breakout_level_high(df, i, 20)
+    low_level = breakout_level_low(df, i, 20)
+    if high_level is None or low_level is None:
+        return []
 
-        i = len(df) - 2
+    recent_bull_break = False
+    recent_bear_break = False
 
-        prev = df.iloc[i - 1]
-        curr = df.iloc[i]
+    for j in range(max(1, i - 6), i):
+        if df.iloc[j]["close"] > high_level:
+            recent_bull_break = True
+        if df.iloc[j]["close"] < low_level:
+            recent_bear_break = True
 
-        htf_curr = htf_df.iloc[-2]
+    bull_retest = (
+        recent_bull_break
+        and curr["low"] <= high_level + atr * RETEST_BUFFER_ATR
+        and curr["close"] > high_level
+        and (bullish_pin(curr) or curr["close"] > curr["open"])
+        and ctf == "BULLISH"
+        and btf in ["BULLISH", "NEUTRAL"]
+    )
 
-        market_trend = trend(curr)
-        htf_trend = trend(htf_curr)
+    bear_retest = (
+        ALLOW_SHORTS
+        and recent_bear_break
+        and curr["high"] >= low_level - atr * RETEST_BUFFER_ATR
+        and curr["close"] < low_level
+        and (bearish_pin(curr) or curr["close"] < curr["open"])
+        and ctf == "BEARISH"
+        and btf in ["BEARISH", "NEUTRAL"]
+    )
 
-        bull_pattern = bool(
-            bullish_pin(curr)
-            or bullish_engulf(prev, curr)
-            or liquidity_sweep_low(df, i, lookback)
-        )
+    if bull_retest:
+        score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 20
+        stop, target = risk_levels(curr, next_open, "LONG")
+        candidates.append({
+            "model": "BREAKOUT_RETEST_REJECTION",
+            "direction": "LONG",
+            "score": round(score, 1),
+            "entry": round(next_open, 2),
+            "stop": stop,
+            "target": target,
+            "reason": f"Retest/rejection of breakout level {high_level:.2f}",
+        })
 
-        bear_pattern = bool(
-            bearish_pin(curr)
-            or bearish_engulf(prev, curr)
-            or liquidity_sweep_high(df, i, lookback)
-        )
+    if bear_retest:
+        score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 20
+        stop, target = risk_levels(curr, next_open, "SHORT")
+        candidates.append({
+            "model": "BREAKOUT_RETEST_REJECTION",
+            "direction": "SHORT",
+            "score": round(score, 1),
+            "entry": round(next_open, 2),
+            "stop": stop,
+            "target": target,
+            "reason": f"Retest/rejection of breakdown level {low_level:.2f}",
+        })
 
-        bullish_bias = (
-            market_trend == "BULLISH"
-            and htf_trend in ["BULLISH", "NEUTRAL"]
-            and curr["rsi"] >= params["rsi_bull"]
-            and curr["adx"] >= params["min_adx"]
-            and bull_pattern
-        )
+    return candidates
 
-        bearish_bias = (
-            market_trend == "BEARISH"
-            and htf_trend in ["BEARISH", "NEUTRAL"]
-            and curr["rsi"] <= params["rsi_bear"]
-            and curr["adx"] >= params["min_adx"]
-            and bear_pattern
-        )
 
-        print(
-            f"{name} | "
-            f"LTF={market_trend} | "
-            f"HTF={htf_trend} | "
-            f"RSI={curr['rsi']:.2f} | "
-            f"ADX={curr['adx']:.2f}"
-        )
+def scan_setup_market(market, setup):
+    df = build_mtf_frame(market, setup)
+    if df.empty or len(df) < 260:
+        return []
 
-        if not bullish_bias and not bearish_bias:
-            return None
+    i = len(df) - 2
 
-        direction = "LONG" if bullish_bias else "SHORT"
+    current = df.iloc[i]
+    print(
+        f"{market} {setup['name']} | "
+        f"{setup['entry_tf']}/{setup['confirm_tf']}/{setup['bias_tf']} | "
+        f"LTF={entry_trend(current)} CTF={confirm_trend(current)} BTF={bias_trend(current)} | "
+        f"RSI={current['rsi']:.2f} ADX={current['adx']:.2f}"
+    )
 
-        entry = float(df.iloc[i + 1]["Open"])
+    candidates = []
+    candidates.extend(detect_breakout_continuation(df, i, setup["name"]))
+    candidates.extend(detect_pullback_continuation(df, i, setup["name"]))
+    candidates.extend(detect_retest_rejection(df, i, setup["name"]))
 
-        atr = float(curr["atr"])
+    for c in candidates:
+        c["market"] = market
+        c["setup_name"] = setup["name"]
+        c["entry_tf"] = setup["entry_tf"]
+        c["confirm_tf"] = setup["confirm_tf"]
+        c["bias_tf"] = setup["bias_tf"]
+        c["time"] = str(df.iloc[i]["timestamp"])
+        rr = abs(c["target"] - c["entry"]) / max(abs(c["entry"] - c["stop"]), 1e-9)
+        c["rr"] = round(rr, 2)
 
-        if direction == "LONG":
+    return candidates
 
-            stop = entry - atr * params["atr_stop"]
 
-            target = entry + ((entry - stop) * params["rr"])
-
-        else:
-
-            stop = entry + atr * params["atr_stop"]
-
-            target = entry - ((stop - entry) * params["rr"])
-
-        return {
-            "market": name,
-            "direction": direction,
-            "entry": round(entry, 2),
-            "stop": round(float(stop), 2),
-            "target": round(float(target), 2),
-            "time": str(curr["timestamp"]),
-        }
-
-    except Exception as e:
-        print(f"{name} live signal error:", e)
-        return None
-
+# ============================================================
+# OUTPUT
+# ============================================================
 
 def format_signal(signal):
-
-    return f"""
-ð¨ LIVE TRADE SIGNAL ð¨
-
-Market: {signal['market']}
-
-Direction: {signal['direction']}
-
-Entry: {signal['entry']}
-
-Stop Loss: {signal['stop']}
-
-Take Profit: {signal['target']}
-
-Time: {signal['time']}
-"""
+    return (
+        "ð¨ BEST LIVE SIGNAL ð¨\n\n"
+        f"Market: {signal['market']}\n"
+        f"Model: {signal['model']}\n"
+        f"Direction: {signal['direction']}\n"
+        f"Score: {signal['score']}/100\n\n"
+        f"Entry: {signal['entry']}\n"
+        f"Stop Loss: {signal['stop']}\n"
+        f"Take Profit: {signal['target']}\n"
+        f"R:R: {signal['rr']}\n\n"
+        f"Setup: {signal['setup_name']} "
+        f"({signal['entry_tf']} / {signal['confirm_tf']} / {signal['bias_tf']})\n"
+        f"Reason: {signal['reason']}\n"
+        f"Time: {signal['time']}"
+    )
 
 
 def maybe_send_signal(signal):
-
     sent = load_json(SENT_SIGNAL_FILE, {})
-
     key = (
         f"{signal['market']}_"
+        f"{signal['setup_name']}_"
+        f"{signal['model']}_"
         f"{signal['direction']}_"
         f"{signal['time']}"
     )
 
     if sent.get(key):
-        print("Duplicate signal blocked")
+        print("Duplicate signal blocked:", key)
         return
 
     send_telegram(format_signal(signal))
-
     sent[key] = True
-
     save_json(SENT_SIGNAL_FILE, sent)
 
 
-def run_market(name, df, htf_df):
+# ============================================================
+# MAIN LOOP
+# ============================================================
 
-    print(f"\nRUNNING {name}")
+def run():
+    enabled_setups = [s for s in SETUPS if s.get("enabled", True)]
+    if not enabled_setups:
+        raise ValueError("No setups enabled.")
 
-    df_ind = add_indicators(df)
-
-    report, trades = walk_forward(df_ind)
-
-    if report.empty:
-        print("No valid walk-forward results")
-        return
-
-    best_params = report.iloc[-1].to_dict()
-
-    signal = build_live_signal(
-        name,
-        df,
-        htf_df,
-        best_params
+    send_telegram(
+        "CRYPTO/GOLD MULTI-SETUP BOT STARTED\n\n"
+        "Watching for:\n"
+        "- breakout continuation\n"
+        "- pullback continuation\n"
+        "- breakout retest rejection\n\n"
+        "Enabled setups:\n" +
+        "\n".join(
+            f"- {s['name']}: {s['entry_tf']} / {s['confirm_tf']} / {s['bias_tf']}"
+            for s in enabled_setups
+        ) +
+        f"\n\nTop signals sent each cycle: {TOP_SIGNALS_TO_SEND}\n"
+        f"Min score to alert: {MIN_SCORE_TO_ALERT}"
     )
 
-    if signal:
-        maybe_send_signal(signal)
-        print(format_signal(signal))
-    else:
-        print("No live signal")
+    while True:
+        try:
+            all_candidates = []
 
-    if not trades.empty:
+            for market in MARKETS:
+                for setup in enabled_setups:
+                    try:
+                        candidates = scan_setup_market(market, setup)
+                        all_candidates.extend(candidates)
+                    except Exception as e:
+                        print(f"{market} {setup['name']} scan error:", e)
 
-        pnl = trades["pnl"].values
-        mc_results = []
+            if not all_candidates:
+                print("No candidates this cycle.")
+            else:
+                ranked = sorted(all_candidates, key=lambda x: x["score"], reverse=True)
+                ranked = [r for r in ranked if r["score"] >= MIN_SCORE_TO_ALERT]
 
-        for _ in range(MONTE_CARLO_RUNS):
+                if not ranked:
+                    print("Candidates found but none met alert score threshold.")
+                else:
+                    top = ranked[:TOP_SIGNALS_TO_SEND]
 
-            sampled = np.random.choice(
-                pnl,
-                size=len(pnl),
-                replace=True
-            )
+                    print("Top candidates:")
+                    for r in top:
+                        print(
+                            f"{r['market']} {r['setup_name']} {r['model']} "
+                            f"{r['direction']} score={r['score']}"
+                        )
 
-            mc_results.append(
-                INITIAL_BALANCE + np.cumsum(sampled)
-            )
+                    for signal in top:
+                        maybe_send_signal(signal)
 
-        plt.figure()
+        except Exception as e:
+            send_telegram(f"Bot error: {e}")
 
-        for line in mc_results[:50]:
-            plt.plot(line)
-
-        plt.title(f"{name} Monte Carlo")
-        plt.savefig(f"{name}_mc.png")
-        plt.close()
+        time.sleep(LIVE_SCAN_SECONDS)
 
 
 if __name__ == "__main__":
-
-    while True:
-
-        try:
-
-            btc = fetch_btc(
-                TIMEFRAME,
-                BTC_LIMIT
-            )
-
-            btc_htf = fetch_btc(
-                HIGHER_TIMEFRAME,
-                BTC_HTF_LIMIT
-            )
-
-            gold = fetch_gold(
-                TIMEFRAME,
-                GOLD_PERIOD
-            )
-
-            gold_htf = fetch_gold(
-                HIGHER_TIMEFRAME,
-                GOLD_HTF_PERIOD
-            )
-
-            run_market(
-                "BTC",
-                btc,
-                btc_htf
-            )
-
-            run_market(
-                "GOLD",
-                gold,
-                gold_htf
-            )
-
-        except Exception as e:
-
-            print("Bot error:", e)
-
-            send_telegram(
-                f"Bot error: {e}"
-            )
-
-        time.sleep(LIVE_SCAN_SECONDS)
+    run()
