@@ -12,18 +12,22 @@ from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
 # ============================================================
-# CRYPTO/GOLD BEST-SETUP SELECTOR WITH TIME/PRICE EDGE FILTER
+# CRYPTO / GOLD MERGED LIVE BOT
+# - multi-setup scan
+# - ranked best-candidate selection
+# - soft edge weighting from research profile
+# - Telegram signals only
 # ============================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-SENT_SIGNAL_FILE = "sent_signals.json"
+SENT_SIGNAL_FILE = "crypto_gold_sent_signals.json"
 EDGE_PROFILE_FILE = os.getenv("CRYPTO_GOLD_EDGE_PROFILE_FILE", "crypto_gold_edge_profile.json")
 
 LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "300"))
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() in ["1", "true", "yes", "y"]
 TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "1"))
-MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "62"))
+MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "60"))
 
 MARKETS = ["BTC", "GOLD"]
 
@@ -41,9 +45,9 @@ YF_INTERVALS = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
 YF_PERIODS = {"5m": "60d", "15m": "60d", "30m": "60d", "1h": "730d", "1d": "10y"}
 
 SETUPS = [
-    {"name": "fast", "entry_tf": "5m", "confirm_tf": "15m", "bias_tf": "1h", "enabled": True},
-    {"name": "intraday", "entry_tf": "15m", "confirm_tf": "1h", "bias_tf": "4h", "enabled": True},
-    {"name": "swing", "entry_tf": "1h", "confirm_tf": "4h", "bias_tf": "1d", "enabled": True},
+    {"name": "fast", "entry_tf": "5m", "confirm_tf": "15m", "bias_tf": "1h", "enabled": os.getenv("ENABLE_FAST_SETUP", "true").lower() in ["1", "true", "yes", "y"]},
+    {"name": "intraday", "entry_tf": "15m", "confirm_tf": "1h", "bias_tf": "4h", "enabled": os.getenv("ENABLE_INTRADAY_SETUP", "true").lower() in ["1", "true", "yes", "y"]},
+    {"name": "swing", "entry_tf": "1h", "confirm_tf": "4h", "bias_tf": "1d", "enabled": os.getenv("ENABLE_SWING_SETUP", "true").lower() in ["1", "true", "yes", "y"]},
 ]
 
 PARAMS = {
@@ -60,9 +64,12 @@ PARAMS = {
     "sweep_lookback": int(os.getenv("SWEEP_LOOKBACK", "8")),
 }
 
-
 FETCH_CACHE = {}
 
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def send_telegram(message: str):
     print(message)
@@ -95,12 +102,13 @@ def save_json(path, data):
 
 
 def validate_setup(setup):
-    e = setup["entry_tf"]
-    c = setup["confirm_tf"]
-    b = setup["bias_tf"]
-    if e not in SUPPORTED_TFS or c not in SUPPORTED_TFS or b not in SUPPORTED_TFS:
-        raise ValueError(f"Unsupported timeframe in setup {setup['name']}")
-    if not (TF_TO_MINUTES[e] <= TF_TO_MINUTES[c] <= TF_TO_MINUTES[b]):
+    for key in ["entry_tf", "confirm_tf", "bias_tf"]:
+        if setup[key] not in SUPPORTED_TFS:
+            raise ValueError(f"Unsupported timeframe {setup[key]} in setup {setup['name']}")
+    e = TF_TO_MINUTES[setup["entry_tf"]]
+    c = TF_TO_MINUTES[setup["confirm_tf"]]
+    b = TF_TO_MINUTES[setup["bias_tf"]]
+    if not (e <= c <= b):
         raise ValueError(f"Invalid setup order in {setup['name']}")
 
 
@@ -117,6 +125,8 @@ def validate_data(df):
         return False, "Not enough candles"
     if df.isna().sum().sum() > 0:
         return False, "NaN values"
+    if "volume" in df.columns and (df["volume"] < 0).any():
+        return False, "Negative volume"
     return True, "OK"
 
 
@@ -124,12 +134,18 @@ def bars_needed(tf):
     return {"5m": 3000, "15m": 2200, "30m": 1800, "1h": 1500, "4h": 1000, "1d": 800}.get(tf, 1200)
 
 
+# ============================================================
+# DATA FETCH
+# ============================================================
+
 def resample_ohlcv(df, tf):
-    rule = PANDAS_RULES[tf]
     return (
-        df.set_index("timestamp").sort_index().resample(rule)
+        df.set_index("timestamp")
+        .sort_index()
+        .resample(PANDAS_RULES[tf])
         .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-        .dropna().reset_index()
+        .dropna()
+        .reset_index()
     )
 
 
@@ -139,11 +155,13 @@ def fetch_btc(tf):
         return FETCH_CACHE[cache_key].copy()
 
     needed = bars_needed(tf)
+
     for name, symbol in EXCHANGES:
         try:
             exchange = get_exchange(name)
             exchange_tf = tf
             limit = needed
+
             if name == "coinbase" and tf == "4h":
                 exchange_tf = "1h"
                 limit = needed * 4 + 50
@@ -151,16 +169,20 @@ def fetch_btc(tf):
             candles = exchange.fetch_ohlcv(symbol, timeframe=exchange_tf, limit=limit)
             df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+
             if name == "coinbase" and tf == "4h":
                 df = resample_ohlcv(df, "4h")
-            valid, reason = validate_data(df)
-            if not valid:
-                continue
-            df = df.sort_values("timestamp").reset_index(drop=True)
-            FETCH_CACHE[cache_key] = df.copy()
-            return df
-        except Exception:
-            continue
+
+            valid, _ = validate_data(df)
+            if valid:
+                df = df.sort_values("timestamp").reset_index(drop=True)
+                FETCH_CACHE[cache_key] = df.copy()
+                print(f"Using BTC feed: {name} {tf}")
+                return df
+
+        except Exception as e:
+            print(f"{name} {tf} failed:", e)
+
     raise Exception(f"No BTC feed available for {tf}")
 
 
@@ -178,29 +200,46 @@ def fetch_gold(tf):
     if tf not in YF_INTERVALS:
         raise ValueError(f"Gold timeframe unsupported directly: {tf}")
 
-    df = yf.download("GC=F", period=YF_PERIODS[tf], interval=YF_INTERVALS[tf], auto_adjust=True, progress=False).reset_index()
+    df = yf.download(
+        "GC=F",
+        period=YF_PERIODS[tf],
+        interval=YF_INTERVALS[tf],
+        auto_adjust=True,
+        progress=False,
+    ).reset_index()
+
     if "Datetime" in df.columns:
         df = df.rename(columns={"Datetime": "timestamp"})
     elif "Date" in df.columns:
         df = df.rename(columns={"Date": "timestamp"})
+
     df.columns = [str(c).lower() for c in df.columns]
     df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
     valid, reason = validate_data(df)
     if not valid:
         raise Exception(f"Gold {tf} invalid: {reason}")
+
     df = df.sort_values("timestamp").reset_index(drop=True)
     FETCH_CACHE[cache_key] = df.copy()
     return df
 
 
 def fetch_market_tf(market, tf):
-    return fetch_btc(tf) if market == "BTC" else fetch_gold(tf)
+    if market == "BTC":
+        return fetch_btc(tf)
+    return fetch_gold(tf)
 
+
+# ============================================================
+# INDICATORS / FRAME BUILD
+# ============================================================
 
 def add_indicators(df):
     if df.empty or len(df) < 220:
         return pd.DataFrame()
+
     out = df.copy()
     out["ema20"] = EMAIndicator(out["close"], 20).ema_indicator()
     out["ema50"] = EMAIndicator(out["close"], 50).ema_indicator()
@@ -222,14 +261,21 @@ def build_mtf_frame(market, setup):
     entry_df = add_indicators(fetch_market_tf(market, setup["entry_tf"]))
     confirm_df = add_indicators(fetch_market_tf(market, setup["confirm_tf"]))
     bias_df = add_indicators(fetch_market_tf(market, setup["bias_tf"]))
+
     if entry_df.empty or confirm_df.empty or bias_df.empty:
         return pd.DataFrame()
+
     confirm_df = prefix_df(confirm_df, "c_")
     bias_df = prefix_df(bias_df, "b_")
+
     merged = pd.merge_asof(entry_df.sort_values("timestamp"), confirm_df.sort_values("timestamp"), on="timestamp", direction="backward")
     merged = pd.merge_asof(merged.sort_values("timestamp"), bias_df.sort_values("timestamp"), on="timestamp", direction="backward")
     return merged.dropna().reset_index(drop=True)
 
+
+# ============================================================
+# STRUCTURE / LOGIC
+# ============================================================
 
 def trend_values(close, ema20, ema50, ema200):
     if pd.isna(close) or pd.isna(ema20) or pd.isna(ema50) or pd.isna(ema200):
@@ -249,7 +295,8 @@ def bias_trend(row): return trend_values(row["b_close"], row["b_ema20"], row["b_
 def bullish_pin(row):
     body = abs(row["close"] - row["open"])
     rng = row["high"] - row["low"]
-    if rng <= 0: return False
+    if rng <= 0:
+        return False
     lower = min(row["open"], row["close"]) - row["low"]
     upper = row["high"] - max(row["open"], row["close"])
     return lower > body * 1.8 and upper < body * 1.5 and row["close"] > row["open"]
@@ -258,7 +305,8 @@ def bullish_pin(row):
 def bearish_pin(row):
     body = abs(row["close"] - row["open"])
     rng = row["high"] - row["low"]
-    if rng <= 0: return False
+    if rng <= 0:
+        return False
     upper = row["high"] - max(row["open"], row["close"])
     lower = min(row["open"], row["close"]) - row["low"]
     return upper > body * 1.8 and lower < body * 1.5 and row["close"] < row["open"]
@@ -356,7 +404,10 @@ def time_bucket(ts, tf):
 
 
 def price_zone(row):
-    close = float(row["close"]); ema20 = float(row["ema20"]); ema50 = float(row["ema50"]); ema200 = float(row["ema200"])
+    close = float(row["close"])
+    ema20 = float(row["ema20"])
+    ema50 = float(row["ema50"])
+    ema200 = float(row["ema200"])
     if close > ema20 > ema50 > ema200:
         return "above_all"
     if close > ema20 > ema50 and close < ema200:
@@ -387,53 +438,84 @@ def edge_adjustment(signal, row):
         f"{market}|ALL|{model}|{direction}|ALL|ALL",
     ]
 
-    best = None
+    chosen = None
     for k in keys:
         info = buckets.get(k)
         if info and info.get("trades", 0) >= 12:
-            best = info
+            chosen = info
             break
 
-    if not best:
+    if not chosen:
         signal["edge_note"] = "no_profile"
         return signal
 
-    expectancy_r = float(best.get("expectancy_r", 0))
-    win_rate = float(best.get("win_rate", 0))
-    trades = int(best.get("trades", 0))
+    expectancy_r = float(chosen.get("expectancy_r", 0))
+    win_rate = float(chosen.get("win_rate", 0))
+    trades = int(chosen.get("trades", 0))
 
-    adj = max(-15, min(15, expectancy_r * 8 + (win_rate - 0.5) * 18))
+    # Soft weighting only. No hard blocking.
+    adj = max(-10, min(10, expectancy_r * 6 + (win_rate - 0.5) * 12))
     signal["score"] = round(signal["score"] + adj, 1)
-    signal["edge_note"] = f"edge expR={expectancy_r:.2f}, wr={win_rate:.1%}, n={trades}"
-
-    if trades >= 20 and expectancy_r < -0.08:
-        signal["blocked_by_edge"] = True
+    signal["edge_note"] = f"expR={expectancy_r:.2f}, wr={win_rate:.1%}, n={trades}"
     return signal
 
 
+# ============================================================
+# MODELS
+# ============================================================
+
 def detect_breakout_continuation(df, i):
-    prev = df.iloc[i - 1]; curr = df.iloc[i]; next_open = float(df.iloc[i + 1]["open"])
+    prev = df.iloc[i - 1]
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
-    high_level = breakout_level_high(df, i, 20); low_level = breakout_level_low(df, i, 20)
-    if high_level is None or low_level is None: return []
+    high_level = breakout_level_high(df, i, 20)
+    low_level = breakout_level_low(df, i, 20)
     out = []
-    bull = curr["close"] > high_level and curr["close"] > prev["high"] and curr["close"] > curr["open"] and curr["close"] > curr["ema20"] and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"] and float(curr["adx"]) >= PARAMS["min_adx"] and float(curr["rsi"]) >= PARAMS["rsi_bull"]
-    if bull:
-        score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 18
-        stop, target = risk_levels(curr, next_open, "LONG")
-        out.append({"model": "BREAKOUT_CONTINUATION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Breakout above {high_level:.2f} with follow-through"})
-    bear = ALLOW_SHORTS and curr["close"] < low_level and curr["close"] < prev["low"] and curr["close"] < curr["open"] and curr["close"] < curr["ema20"] and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"] and float(curr["adx"]) >= PARAMS["min_adx"] and float(curr["rsi"]) <= PARAMS["rsi_bear"]
-    if bear:
-        score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 18
-        stop, target = risk_levels(curr, next_open, "SHORT")
-        out.append({"model": "BREAKOUT_CONTINUATION", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Breakdown below {low_level:.2f} with follow-through"})
+
+    if high_level is not None:
+        bull = (
+            curr["close"] > high_level
+            and curr["close"] > prev["high"]
+            and curr["close"] > curr["open"]
+            and curr["close"] > curr["ema20"]
+            and ctf == "BULLISH"
+            and btf in ["BULLISH", "NEUTRAL"]
+            and float(curr["adx"]) >= PARAMS["min_adx"]
+            and float(curr["rsi"]) >= PARAMS["rsi_bull"]
+        )
+        if bull:
+            score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 18
+            stop, target = risk_levels(curr, next_open, "LONG")
+            out.append({"model": "BREAKOUT_CONTINUATION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Breakout above {high_level:.2f} with follow-through"})
+
+    if low_level is not None and ALLOW_SHORTS:
+        bear = (
+            curr["close"] < low_level
+            and curr["close"] < prev["low"]
+            and curr["close"] < curr["open"]
+            and curr["close"] < curr["ema20"]
+            and ctf == "BEARISH"
+            and btf in ["BEARISH", "NEUTRAL"]
+            and float(curr["adx"]) >= PARAMS["min_adx"]
+            and float(curr["rsi"]) <= PARAMS["rsi_bear"]
+        )
+        if bear:
+            score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 18
+            stop, target = risk_levels(curr, next_open, "SHORT")
+            out.append({"model": "BREAKOUT_CONTINUATION", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Breakdown below {low_level:.2f} with follow-through"})
+
     return out
 
 
 def detect_pullback_continuation(df, i):
-    prev = df.iloc[i - 1]; curr = df.iloc[i]; next_open = float(df.iloc[i + 1]["open"])
+    prev = df.iloc[i - 1]
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
-    atr = float(curr["atr"]); out = []
+    atr = float(curr["atr"])
+    out = []
+
     touched_long = curr["low"] <= curr["ema20"] + atr * PARAMS["pullback_buffer_atr"] or curr["low"] <= curr["ema50"] + atr * 0.15
     reclaimed_long = curr["close"] > curr["open"] and curr["close"] > curr["ema20"]
     bull_reject = bullish_pin(curr) or bullish_engulf(prev, curr)
@@ -441,6 +523,7 @@ def detect_pullback_continuation(df, i):
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 16
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "PULLBACK_CONTINUATION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Trend pullback into value and bullish reclaim"})
+
     touched_short = curr["high"] >= curr["ema20"] - atr * PARAMS["pullback_buffer_atr"] or curr["high"] >= curr["ema50"] - atr * 0.15
     reclaimed_short = curr["close"] < curr["open"] and curr["close"] < curr["ema20"]
     bear_reject = bearish_pin(curr) or bearish_engulf(prev, curr)
@@ -448,105 +531,139 @@ def detect_pullback_continuation(df, i):
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 16
         stop, target = risk_levels(curr, next_open, "SHORT")
         out.append({"model": "PULLBACK_CONTINUATION", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Trend pullback into value and bearish rejection"})
+
     return out
 
 
 def detect_breakout_retest_rejection(df, i):
-    curr = df.iloc[i]; next_open = float(df.iloc[i + 1]["open"])
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
-    atr = float(curr["atr"]); out = []
-    high_level = breakout_level_high(df, i, 20); low_level = breakout_level_low(df, i, 20)
-    if high_level is None or low_level is None: return out
-    recent_bull_break = False; recent_bear_break = False
-    for j in range(max(1, i - 6), i):
-        if df.iloc[j]["close"] > high_level: recent_bull_break = True
-        if df.iloc[j]["close"] < low_level: recent_bear_break = True
+    atr = float(curr["atr"])
+    out = []
+
+    high_level = breakout_level_high(df, i, 20)
+    low_level = breakout_level_low(df, i, 20)
+    if high_level is None or low_level is None:
+        return out
+
+    recent_bull_break = any(df.iloc[j]["close"] > high_level for j in range(max(1, i - 6), i))
+    recent_bear_break = any(df.iloc[j]["close"] < low_level for j in range(max(1, i - 6), i))
+
     bull = recent_bull_break and curr["low"] <= high_level + atr * PARAMS["retest_buffer_atr"] and curr["close"] > high_level and (bullish_pin(curr) or curr["close"] > curr["open"]) and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"]
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 20
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "BREAKOUT_RETEST_REJECTION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Retest/rejection of breakout level {high_level:.2f}"})
+
     bear = ALLOW_SHORTS and recent_bear_break and curr["high"] >= low_level - atr * PARAMS["retest_buffer_atr"] and curr["close"] < low_level and (bearish_pin(curr) or curr["close"] < curr["open"]) and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"]
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 20
         stop, target = risk_levels(curr, next_open, "SHORT")
         out.append({"model": "BREAKOUT_RETEST_REJECTION", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Retest/rejection of breakdown level {low_level:.2f}"})
+
     return out
 
 
 def detect_liquidity_sweep_reversal(df, i):
-    prev = df.iloc[i - 1]; curr = df.iloc[i]; next_open = float(df.iloc[i + 1]["open"])
+    prev = df.iloc[i - 1]
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
     out = []
+
     bull = liquidity_sweep_low(df, i, PARAMS["sweep_lookback"]) and (bullish_pin(curr) or bullish_engulf(prev, curr)) and ctf != "BEARISH" and btf != "BEARISH" and float(curr["adx"]) >= PARAMS["min_adx"] - 2
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 14
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "LIQUIDITY_SWEEP_REVERSAL", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Downside liquidity sweep and reversal candle"})
+
     bear = ALLOW_SHORTS and liquidity_sweep_high(df, i, PARAMS["sweep_lookback"]) and (bearish_pin(curr) or bearish_engulf(prev, curr)) and ctf != "BULLISH" and btf != "BULLISH" and float(curr["adx"]) >= PARAMS["min_adx"] - 2
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 14
         stop, target = risk_levels(curr, next_open, "SHORT")
         out.append({"model": "LIQUIDITY_SWEEP_REVERSAL", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Upside liquidity sweep and reversal candle"})
+
     return out
 
 
 def detect_range_rejection(df, i):
-    curr = df.iloc[i]; next_open = float(df.iloc[i + 1]["open"])
-    if i - PARAMS["range_window"] < 2: return []
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
+    if i - PARAMS["range_window"] < 2:
+        return []
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
     out = []
+
     range_high = float(df["high"].iloc[i - PARAMS["range_window"]:i].max())
     range_low = float(df["low"].iloc[i - PARAMS["range_window"]:i].min())
+
     bull = curr["low"] <= range_low and curr["close"] > range_low and bullish_pin(curr) and ctf != "BEARISH"
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 10
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "RANGE_REJECTION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Range low rejection near {range_low:.2f}"})
+
     bear = ALLOW_SHORTS and curr["high"] >= range_high and curr["close"] < range_high and bearish_pin(curr) and ctf != "BULLISH"
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 10
         stop, target = risk_levels(curr, next_open, "SHORT")
         out.append({"model": "RANGE_REJECTION", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Range high rejection near {range_high:.2f}"})
+
     return out
 
 
 def detect_compression_breakout(df, i):
-    curr = df.iloc[i]; prev = df.iloc[i - 1]; next_open = float(df.iloc[i + 1]["open"])
-    if i - PARAMS["compression_window"] < 2: return []
+    curr = df.iloc[i]
+    prev = df.iloc[i - 1]
+    next_open = float(df.iloc[i + 1]["open"])
+    if i - PARAMS["compression_window"] < 2:
+        return []
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
     out = []
+
     recent_width = recent_range_width(df, i, PARAMS["compression_window"])
-    if recent_width is None: return out
+    if recent_width is None:
+        return out
+
     compressed = recent_width <= float(curr["atr"]) * 2.4
-    high_level = breakout_level_high(df, i, PARAMS["compression_window"]); low_level = breakout_level_low(df, i, PARAMS["compression_window"])
+    high_level = breakout_level_high(df, i, PARAMS["compression_window"])
+    low_level = breakout_level_low(df, i, PARAMS["compression_window"])
+
     bull = compressed and curr["close"] > high_level and curr["close"] > prev["high"] and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"]
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 15
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "COMPRESSION_BREAKOUT", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Compression resolved upward"})
+
     bear = ALLOW_SHORTS and compressed and curr["close"] < low_level and curr["close"] < prev["low"] and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"]
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 15
         stop, target = risk_levels(curr, next_open, "SHORT")
         out.append({"model": "COMPRESSION_BREAKOUT", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Compression resolved downward"})
+
     return out
 
 
 def detect_ema_reclaim(df, i):
-    prev = df.iloc[i - 1]; curr = df.iloc[i]; next_open = float(df.iloc[i + 1]["open"])
+    prev = df.iloc[i - 1]
+    curr = df.iloc[i]
+    next_open = float(df.iloc[i + 1]["open"])
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
     out = []
+
     bull = prev["close"] < prev["ema20"] and curr["close"] > curr["ema20"] and curr["close"] > curr["open"] and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"] and float(curr["rsi"]) >= PARAMS["rsi_bull"]
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 9
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "EMA_RECLAIM", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Price reclaimed EMA20 in trend context"})
+
     bear = ALLOW_SHORTS and prev["close"] > prev["ema20"] and curr["close"] < curr["ema20"] and curr["close"] < curr["open"] and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"] and float(curr["rsi"]) <= PARAMS["rsi_bear"]
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 9
         stop, target = risk_levels(curr, next_open, "SHORT")
         out.append({"model": "EMA_RECLAIM", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Price lost EMA20 in bearish context"})
+
     return out
 
 
@@ -565,16 +682,26 @@ def scan_setup_market(market, setup):
     df = build_mtf_frame(market, setup)
     if df.empty or len(df) < 260:
         return []
+
     i = len(df) - 2
-    current = df.iloc[i]
-    print(f"{market} {setup['name']} | {setup['entry_tf']}/{setup['confirm_tf']}/{setup['bias_tf']} | LTF={entry_trend(current)} CTF={confirm_trend(current)} BTF={bias_trend(current)} | RSI={current['rsi']:.2f} ADX={current['adx']:.2f}")
-    all_candidates = []
+    row = df.iloc[i]
+
+    print(
+        f"{market} {setup['name']} | "
+        f"{setup['entry_tf']}/{setup['confirm_tf']}/{setup['bias_tf']} | "
+        f"LTF={entry_trend(row)} CTF={confirm_trend(row)} BTF={bias_trend(row)} | "
+        f"RSI={row['rsi']:.2f} ADX={row['adx']:.2f}"
+    )
+
+    candidates = []
     for fn in ALL_MODELS:
         try:
-            all_candidates.extend(fn(df, i))
+            candidates.extend(fn(df, i))
         except Exception as e:
             print(f"{market} {setup['name']} {fn.__name__} error:", e)
-    for c in all_candidates:
+
+    out = []
+    for c in candidates:
         c["market"] = market
         c["setup_name"] = setup["name"]
         c["entry_tf"] = setup["entry_tf"]
@@ -582,17 +709,17 @@ def scan_setup_market(market, setup):
         c["bias_tf"] = setup["bias_tf"]
         c["time"] = str(df.iloc[i]["timestamp"])
         c["rr"] = round(abs(c["target"] - c["entry"]) / max(abs(c["entry"] - c["stop"]), 1e-9), 2)
-        c = edge_adjustment(c, current)
-    return all_candidates
+        out.append(edge_adjustment(c, row))
+
+    return out
 
 
 def dedupe_candidates(candidates):
-    kept, seen = [], set()
+    kept = []
+    seen = set()
     for c in sorted(candidates, key=lambda x: x["score"], reverse=True):
         key = (c["market"], c["direction"], c["time"])
         if key in seen:
-            continue
-        if c.get("blocked_by_edge"):
             continue
         kept.append(c)
         seen.add(key)
@@ -600,7 +727,6 @@ def dedupe_candidates(candidates):
 
 
 def format_signal(signal):
-    edge_note = signal.get("edge_note", "none")
     return (
         "ð¨ BEST LIVE SIGNAL ð¨\n\n"
         f"Market: {signal['market']}\n"
@@ -613,7 +739,7 @@ def format_signal(signal):
         f"R:R: {signal['rr']}\n\n"
         f"Setup: {signal['setup_name']} ({signal['entry_tf']} / {signal['confirm_tf']} / {signal['bias_tf']})\n"
         f"Reason: {signal['reason']}\n"
-        f"Edge: {edge_note}\n"
+        f"Edge: {signal.get('edge_note', 'no_profile')}\n"
         f"Time: {signal['time']}"
     )
 
@@ -624,10 +750,15 @@ def maybe_send_signal(signal):
     if sent.get(key):
         print("Duplicate signal blocked:", key)
         return
+
     send_telegram(format_signal(signal))
     sent[key] = True
     save_json(SENT_SIGNAL_FILE, sent)
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def run():
     enabled_setups = [s for s in SETUPS if s.get("enabled", True)]
@@ -635,9 +766,16 @@ def run():
         raise ValueError("No setups enabled.")
 
     send_telegram(
-        "CRYPTO/GOLD BEST-SETUP BOT STARTED\n\n"
-        "It scans multiple timeframe structures and chooses the strongest current setup.\n"
-        "It also uses historical time-of-day and price-zone expectancy if a research profile exists.\n\n"
+        "CRYPTO/GOLD MERGED LIVE BOT STARTED\n\n"
+        "Models:\n"
+        "- breakout continuation\n"
+        "- pullback continuation\n"
+        "- breakout retest rejection\n"
+        "- liquidity sweep reversal\n"
+        "- range rejection\n"
+        "- compression breakout\n"
+        "- EMA reclaim\n\n"
+        "Using soft edge weighting if research profile exists.\n\n"
         "Enabled setups:\n" +
         "\n".join(f"- {s['name']}: {s['entry_tf']} / {s['confirm_tf']} / {s['bias_tf']}" for s in enabled_setups) +
         f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}"
@@ -647,6 +785,7 @@ def run():
         try:
             FETCH_CACHE.clear()
             all_candidates = []
+
             for market in MARKETS:
                 for setup in enabled_setups:
                     try:
@@ -659,6 +798,7 @@ def run():
             else:
                 ranked = dedupe_candidates(all_candidates)
                 ranked = [r for r in ranked if r["score"] >= MIN_SCORE_TO_ALERT]
+
                 if not ranked:
                     print("Candidates found but none passed alert threshold.")
                 else:
