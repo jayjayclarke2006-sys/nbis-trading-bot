@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import requests
 import numpy as np
 import pandas as pd
@@ -9,7 +8,8 @@ from zoneinfo import ZoneInfo
 
 # ============================================================
 # STOCK EDGE RESEARCH
-# Builds time-of-day + price-zone expectancy profile
+# - studies time-of-day + price-zone expectancy
+# - produces stock_edge_profile.json
 # ============================================================
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_KEY_ID")
@@ -128,42 +128,54 @@ def bars_to_df(symbol: str, timeframe: str, limit: int = 1200) -> pd.DataFrame:
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < EMA_SLOW + 5:
         return pd.DataFrame()
+
     out = df.copy()
     out["ema20"] = out["close"].ewm(span=EMA_FAST, adjust=False).mean()
     out["ema50"] = out["close"].ewm(span=EMA_MID, adjust=False).mean()
     out["ema200"] = out["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+
     tr = pd.concat([
         out["high"] - out["low"],
         (out["high"] - out["close"].shift()).abs(),
         (out["low"] - out["close"].shift()).abs(),
     ], axis=1).max(axis=1)
+
     out["atr"] = tr.rolling(ATR_LEN).mean()
     out["atr_pct"] = out["atr"] / out["close"]
     out["body"] = (out["close"] - out["open"]).abs()
     out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
     out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
     out["vol_ma"] = out["volume"].rolling(20).mean()
+
     out.dropna(inplace=True)
     return out.reset_index(drop=True)
 
 
 def candle_quality(row) -> bool:
-    atr = float(row["atr"]); body = float(row["body"])
-    if atr <= 0: return False
+    atr = float(row["atr"])
+    body = float(row["body"])
+    if atr <= 0:
+        return False
     body_atr = body / atr
     return MIN_BODY_ATR <= body_atr <= MAX_BODY_ATR
 
 
 def volume_ok(row) -> bool:
-    if float(row["vol_ma"]) <= 0: return True
+    if float(row["vol_ma"]) <= 0:
+        return True
     return float(row["volume"]) >= float(row["vol_ma"]) * MIN_VOLUME_MULT
 
 
 def strong_rejection(row, side: str) -> bool:
-    open_ = float(row["open"]); high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
     body = abs(close - open_)
-    if body <= 0: return False
-    upper = high - max(open_, close); lower = min(open_, close) - low
+    if body <= 0:
+        return False
+    upper = high - max(open_, close)
+    lower = min(open_, close) - low
     if side == "LONG":
         return (close > open_ and lower >= body * 0.25) or (close > open_ and close > (high + low) / 2)
     if side == "SHORT":
@@ -172,18 +184,28 @@ def strong_rejection(row, side: str) -> bool:
 
 
 def bullish_pin(row) -> bool:
-    open_ = float(row["open"]); high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
     body = abs(close - open_)
-    if body <= 0: return False
-    upper = high - max(open_, close); lower = min(open_, close) - low
+    if body <= 0:
+        return False
+    upper = high - max(open_, close)
+    lower = min(open_, close) - low
     return close > open_ and lower >= body * 1.5 and upper <= body * 1.2
 
 
 def bearish_pin(row) -> bool:
-    open_ = float(row["open"]); high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
     body = abs(close - open_)
-    if body <= 0: return False
-    upper = high - max(open_, close); lower = min(open_, close) - low
+    if body <= 0:
+        return False
+    upper = high - max(open_, close)
+    lower = min(open_, close) - low
     return close < open_ and upper >= body * 1.5 and lower <= body * 1.2
 
 
@@ -191,17 +213,24 @@ def htf_bias_from_df(df15: pd.DataFrame, ts) -> str:
     sl = df15[df15["time"] <= ts]
     if len(sl) < 2:
         return "NONE"
-    r = sl.iloc[-1]; p = sl.iloc[-2]
-    if r["close"] > r["ema50"] > r["ema200"] and r["ema50"] >= p["ema50"]: return "BULL"
-    if r["close"] < r["ema50"] < r["ema200"] and r["ema50"] <= p["ema50"]: return "BEAR"
-    if r["close"] > r["ema200"]: return "BULL_WEAK"
-    if r["close"] < r["ema200"]: return "BEAR_WEAK"
+    r = sl.iloc[-1]
+    p = sl.iloc[-2]
+    if r["close"] > r["ema50"] > r["ema200"] and r["ema50"] >= p["ema50"]:
+        return "BULL"
+    if r["close"] < r["ema50"] < r["ema200"] and r["ema50"] <= p["ema50"]:
+        return "BEAR"
+    if r["close"] > r["ema200"]:
+        return "BULL_WEAK"
+    if r["close"] < r["ema200"]:
+        return "BEAR_WEAK"
     return "CHOP"
 
 
 def bias_allows(side: str, bias: str) -> bool:
-    if side == "LONG": return bias in ["BULL", "BULL_WEAK"]
-    if side == "SHORT": return ALLOW_SHORTS and bias in ["BEAR", "BEAR_WEAK"]
+    if side == "LONG":
+        return bias in ["BULL", "BULL_WEAK"]
+    if side == "SHORT":
+        return ALLOW_SHORTS and bias in ["BEAR", "BEAR_WEAK"]
     return False
 
 
@@ -220,11 +249,17 @@ def time_bucket(ts):
 
 
 def price_zone(row, or_high, or_low):
-    close = float(row["close"]); ema20 = float(row["ema20"]); ema50 = float(row["ema50"])
-    if or_high is not None and close > or_high: return "above_or"
-    if or_low is not None and close < or_low: return "below_or"
-    if close > ema20 > ema50: return "above_ema_stack"
-    if close < ema20 < ema50: return "below_ema_stack"
+    close = float(row["close"])
+    ema20 = float(row["ema20"])
+    ema50 = float(row["ema50"])
+    if or_high is not None and close > or_high:
+        return "above_or"
+    if or_low is not None and close < or_low:
+        return "below_or"
+    if close > ema20 > ema50:
+        return "above_ema_stack"
+    if close < ema20 < ema50:
+        return "below_ema_stack"
     return "mixed"
 
 
@@ -232,11 +267,16 @@ def trade_outcome(df, i, side, entry, stop, target, max_hold=12):
     for j in range(i + 1, min(i + max_hold, len(df))):
         bar = df.iloc[j]
         if side == "LONG":
-            if float(bar["low"]) <= stop: return -1.0
-            if float(bar["high"]) >= target: return (target - entry) / max(entry - stop, 1e-9)
+            if float(bar["low"]) <= stop:
+                return -1.0
+            if float(bar["high"]) >= target:
+                return (target - entry) / max(entry - stop, 1e-9)
         else:
-            if float(bar["high"]) >= stop: return -1.0
-            if float(bar["low"]) <= target: return (entry - target) / max(stop - entry, 1e-9)
+            if float(bar["high"]) >= stop:
+                return -1.0
+            if float(bar["low"]) <= target:
+                return (entry - target) / max(stop - entry, 1e-9)
+
     last_close = float(df.iloc[min(i + max_hold, len(df) - 1)]["close"])
     if side == "LONG":
         return (last_close - entry) / max(entry - stop, 1e-9)
@@ -256,8 +296,13 @@ def collect_candidates(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, i: in
     if not volume_ok(row) or not candle_quality(row):
         return []
 
-    close = float(row["close"]); low = float(row["low"]); high = float(row["high"]); open_ = float(row["open"]); atr = float(row["atr"])
-    ema20 = float(row["ema20"]); ema50 = float(row["ema50"])
+    close = float(row["close"])
+    low = float(row["low"])
+    high = float(row["high"])
+    open_ = float(row["open"])
+    atr = float(row["atr"])
+    ema20 = float(row["ema20"])
+    ema50 = float(row["ema50"])
 
     out = []
 
@@ -266,6 +311,7 @@ def collect_candidates(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, i: in
         risk = close - sl
         if risk > 0:
             out.append(("OR_BREAKOUT_CONTINUATION", "LONG", close, sl, close + risk * RR_TARGET))
+
     if or_low is not None and close < or_low and bias_allows("SHORT", bias) and close < open_:
         sl = max(high, or_high)
         risk = sl - close
@@ -281,6 +327,7 @@ def collect_candidates(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, i: in
         risk = close - sl
         if risk > 0:
             out.append(("OR_RETEST_REJECTION", "LONG", close, sl, close + risk * RR_TARGET))
+
     if bear_broke and high >= or_low - atr * RETEST_BUFFER_ATR and close < or_low and strong_rejection(row, "SHORT") and bias_allows("SHORT", bias):
         sl = max(high, or_high)
         risk = sl - close
@@ -305,25 +352,31 @@ def collect_candidates(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, i: in
 
     recent8 = df5.iloc[max(0, i - 8):i]
     if len(recent8) >= 6:
-        swing_low = float(recent8["low"].min()); swing_high = float(recent8["high"].max())
-        if low < swing_low and close > swing_low and bullish_pin(row) and bias != "BEAR":
-            sl = low; risk = close - sl
+        swing_low = float(recent8["low"].min())
+        swing_high = float(recent8["high"].max())
+        if low < swing_low and close > swing_low and bullish_pin(row):
+            sl = low
+            risk = close - sl
             if risk > 0:
                 out.append(("LIQUIDITY_SWEEP_REVERSAL", "LONG", close, sl, close + risk * RR_TARGET))
-        if high > swing_high and close < swing_high and bearish_pin(row) and bias != "BULL" and ALLOW_SHORTS:
-            sl = high; risk = sl - close
+        if ALLOW_SHORTS and high > swing_high and close < swing_high and bearish_pin(row):
+            sl = high
+            risk = sl - close
             if risk > 0:
                 out.append(("LIQUIDITY_SWEEP_REVERSAL", "SHORT", close, sl, close - risk * RR_TARGET))
 
     recent20 = df5.iloc[max(0, i - 20):i]
     if len(recent20) >= 10:
-        range_high = float(recent20["high"].max()); range_low = float(recent20["low"].min())
+        range_high = float(recent20["high"].max())
+        range_low = float(recent20["low"].min())
         if low <= range_low and close > range_low and bullish_pin(row):
-            sl = low; risk = close - sl
+            sl = low
+            risk = close - sl
             if risk > 0:
                 out.append(("RANGE_REJECTION", "LONG", close, sl, close + risk * RR_TARGET))
-        if high >= range_high and close < range_high and bearish_pin(row) and ALLOW_SHORTS:
-            sl = high; risk = sl - close
+        if ALLOW_SHORTS and high >= range_high and close < range_high and bearish_pin(row):
+            sl = high
+            risk = sl - close
             if risk > 0:
                 out.append(("RANGE_REJECTION", "SHORT", close, sl, close - risk * RR_TARGET))
 
@@ -331,24 +384,29 @@ def collect_candidates(symbol: str, df5: pd.DataFrame, df15: pd.DataFrame, i: in
     if len(recent12) >= 8:
         width = float(recent12["high"].max() - recent12["low"].min())
         if width <= atr * 2.4:
-            hi = float(recent12["high"].max()); lo = float(recent12["low"].min())
+            hi = float(recent12["high"].max())
+            lo = float(recent12["low"].min())
             if close > hi and bias_allows("LONG", bias):
-                sl = low; risk = close - sl
+                sl = low
+                risk = close - sl
                 if risk > 0:
                     out.append(("COMPRESSION_BREAKOUT", "LONG", close, sl, close + risk * RR_TARGET))
-            if close < lo and bias_allows("SHORT", bias):
-                sl = high; risk = sl - close
+            if ALLOW_SHORTS and close < lo and bias_allows("SHORT", bias):
+                sl = high
+                risk = sl - close
                 if risk > 0:
                     out.append(("COMPRESSION_BREAKOUT", "SHORT", close, sl, close - risk * RR_TARGET))
 
     if i >= 1:
         prev = df5.iloc[i - 1]
         if prev["close"] < prev["ema20"] and close > ema20 and close > open_ and bias_allows("LONG", bias):
-            sl = min(low, ema20); risk = close - sl
+            sl = min(low, ema20)
+            risk = close - sl
             if risk > 0:
                 out.append(("EMA_RECLAIM", "LONG", close, sl, close + risk * RR_TARGET))
-        if prev["close"] > prev["ema20"] and close < ema20 and close < open_ and bias_allows("SHORT", bias):
-            sl = max(high, ema20); risk = sl - close
+        if ALLOW_SHORTS and prev["close"] > prev["ema20"] and close < ema20 and close < open_ and bias_allows("SHORT", bias):
+            sl = max(high, ema20)
+            risk = sl - close
             if risk > 0:
                 out.append(("EMA_RECLAIM", "SHORT", close, sl, close - risk * RR_TARGET))
 
@@ -362,12 +420,14 @@ def run():
         print(f"Researching {symbol} ...")
         df5 = add_indicators(bars_to_df(symbol, "5Min", 1500))
         df15 = add_indicators(bars_to_df(symbol, "15Min", 600))
+
         if df5.empty or df15.empty:
             continue
 
         for day, day_df in df5.groupby(df5["time"].dt.date):
             if len(day_df) < 30:
                 continue
+
             or_high, or_low = build_opening_range(day_df)
             if or_high is None:
                 continue
@@ -377,6 +437,7 @@ def run():
                 row = df5.loc[i]
                 if not in_window(row["time"], TRADE_START, LAST_ENTRY_TIME):
                     continue
+
                 candidates = collect_candidates(symbol, df5, df15, i, or_high, or_low)
                 if not candidates:
                     continue
@@ -416,6 +477,7 @@ def run():
         sym, model, direction, bucket, zone = k.split("|")
         if bucket == "ALL":
             model_groups.setdefault((sym, model, direction), []).append(info)
+
     for key, infos in model_groups.items():
         exp = np.mean([x["expectancy_r"] for x in infos])
         wr = np.mean([x["win_rate"] for x in infos])
