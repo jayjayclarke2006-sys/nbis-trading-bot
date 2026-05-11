@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # ============================================================
-# NBIS ALPACA STOCK BOT - RENDER OPTIMIZED LIVE VERSION
+# STOCK BEST-SETUP SELECTOR AUTO-TRADER
+# Render/live version
+# - scans multiple stock setups
+# - scores them
+# - auto trades the best candidate(s)
+# - sends Telegram only for orders/status, not every weak signal
 # ============================================================
 
 E_CHECK = "\u2705"
@@ -39,11 +44,15 @@ HEADERS = {
 NY_TZ = ZoneInfo("America/New_York")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 
-WATCHLIST = ["AAPL", "TSLA", "NVDA", "AMD", "META", "MSFT", "AMZN", "SPY", "QQQ", "NBIS", "WULF", "IREN"]
+WATCHLIST = [
+    "AAPL", "TSLA", "NVDA", "AMD", "META", "MSFT",
+    "AMZN", "SPY", "QQQ", "NBIS", "WULF", "IREN"
+]
 
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.12"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
+MAX_NEW_ORDERS_PER_SCAN = int(os.getenv("MAX_NEW_ORDERS_PER_SCAN", "1"))
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "false").lower() in ["1", "true", "yes", "y"]
 
 RR_TARGET = float(os.getenv("RR_TARGET", "1.8"))
@@ -52,13 +61,13 @@ EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
 
-# Loosened from original
 MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.0022"))
 MIN_VOLUME_MULT = float(os.getenv("MIN_VOLUME_MULT", "0.75"))
 MIN_BODY_ATR = float(os.getenv("MIN_BODY_ATR", "0.12"))
 MAX_BODY_ATR = float(os.getenv("MAX_BODY_ATR", "2.80"))
 RETEST_BUFFER_ATR = float(os.getenv("RETEST_BUFFER_ATR", "0.35"))
 PULLBACK_BUFFER_ATR = float(os.getenv("PULLBACK_BUFFER_ATR", "0.45"))
+MIN_SCORE_TO_TRADE = float(os.getenv("MIN_SCORE_TO_TRADE", "62"))
 
 MARKET_OPEN = "09:30"
 OPENING_RANGE_END = "10:00"
@@ -73,8 +82,6 @@ STATE = {
         "OR_HIGH": None,
         "OR_LOW": None,
         "OR_SET": False,
-        "BREAK_SIDE": None,
-        "RETEST_DONE": False,
         "TRADED_TODAY": False,
         "IN_POSITION": False,
         "LAST_REASON": "STARTING",
@@ -94,8 +101,12 @@ BOT_STATE = {
 }
 
 _BAR_CACHE = {}
-_HTF_CACHE = {"time": None, "bias": {}}
+_HTF_CACHE = {"stamp": None, "bias": {}}
 
+
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
 
 def send(msg: str):
     print(msg)
@@ -119,6 +130,10 @@ def send_once(key: str, msg: str):
     BOT_STATE["SENT_KEYS"].add(key)
 
 
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
 def now_ny() -> datetime:
     return datetime.now(NY_TZ)
 
@@ -141,6 +156,10 @@ def iso_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# ============================================================
+# DAILY RESET
+# ============================================================
+
 def reset_daily_state():
     today = now_ny().date()
     if BOT_STATE["DATE"] == today:
@@ -156,8 +175,6 @@ def reset_daily_state():
         STATE[sym]["OR_HIGH"] = None
         STATE[sym]["OR_LOW"] = None
         STATE[sym]["OR_SET"] = False
-        STATE[sym]["BREAK_SIDE"] = None
-        STATE[sym]["RETEST_DONE"] = False
         STATE[sym]["TRADED_TODAY"] = False
         STATE[sym]["IN_POSITION"] = False
         STATE[sym]["LAST_REASON"] = "NEW_DAY"
@@ -167,16 +184,20 @@ def reset_daily_state():
         STATE[sym]["LAST_SIGNAL_MODEL"] = None
 
     _BAR_CACHE.clear()
-    _HTF_CACHE["time"] = None
+    _HTF_CACHE["stamp"] = None
     _HTF_CACHE["bias"] = {}
 
+
+# ============================================================
+# ALPACA API
+# ============================================================
 
 def alpaca_get(path: str, params=None, data_api=False):
     base = ALPACA_DATA_BASE if data_api else ALPACA_TRADE_BASE
     try:
-        r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=15)
+        r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=20)
         if r.status_code >= 400:
-            print("ALPACA GET ERROR:", r.status_code, r.text[:300])
+            print("ALPACA GET ERROR:", r.status_code, r.text[:400])
             return None
         return r.json()
     except Exception as e:
@@ -186,9 +207,9 @@ def alpaca_get(path: str, params=None, data_api=False):
 
 def alpaca_post(path: str, payload: dict):
     try:
-        r = requests.post(f"{ALPACA_TRADE_BASE}{path}", headers=HEADERS, json=payload, timeout=15)
+        r = requests.post(f"{ALPACA_TRADE_BASE}{path}", headers=HEADERS, json=payload, timeout=20)
         if r.status_code >= 400:
-            print("ALPACA POST ERROR:", r.status_code, r.text[:300])
+            print("ALPACA POST ERROR:", r.status_code, r.text[:400])
             return None
         return r.json()
     except Exception as e:
@@ -230,7 +251,11 @@ def has_open_order(symbol: str) -> bool:
     return False
 
 
-def bars_to_df(symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
+# ============================================================
+# DATA
+# ============================================================
+
+def bars_to_df(symbol: str, timeframe: str, limit: int = 400) -> pd.DataFrame:
     cache_key = (symbol, timeframe, limit, now_ny().strftime("%Y-%m-%d %H:%M"))
     if cache_key in _BAR_CACHE:
         return _BAR_CACHE[cache_key].copy()
@@ -304,8 +329,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def htf_bias(symbol: str) -> str:
-    mark = now_ny().strftime("%Y-%m-%d %H:%M")
-    if _HTF_CACHE["time"] == mark and symbol in _HTF_CACHE["bias"]:
+    stamp = now_ny().strftime("%Y-%m-%d %H:%M")
+    if _HTF_CACHE["stamp"] == stamp and symbol in _HTF_CACHE["bias"]:
         return _HTF_CACHE["bias"][symbol]
 
     df = add_indicators(bars_to_df(symbol, "15Min", 400))
@@ -325,10 +350,14 @@ def htf_bias(symbol: str) -> str:
         else:
             bias = "CHOP"
 
-    _HTF_CACHE["time"] = mark
+    _HTF_CACHE["stamp"] = stamp
     _HTF_CACHE["bias"][symbol] = bias
     return bias
 
+
+# ============================================================
+# STRUCTURE HELPERS
+# ============================================================
 
 def candle_quality(row) -> bool:
     atr = float(row["atr"])
@@ -375,6 +404,32 @@ def strong_rejection(row, side: str) -> bool:
     return False
 
 
+def bullish_pin(row) -> bool:
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
+    body = abs(close - open_)
+    if body <= 0:
+        return False
+    upper = high - max(open_, close)
+    lower = min(open_, close) - low
+    return close > open_ and lower >= body * 1.5 and upper <= body * 1.2
+
+
+def bearish_pin(row) -> bool:
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
+    body = abs(close - open_)
+    if body <= 0:
+        return False
+    upper = high - max(open_, close)
+    lower = min(open_, close) - low
+    return close < open_ and upper >= body * 1.5 and lower <= body * 1.2
+
+
 def bias_allows(side: str, bias: str) -> bool:
     if side == "LONG":
         return bias in ["BULL", "BULL_WEAK"]
@@ -408,144 +463,410 @@ def build_opening_range(symbol: str, df5: pd.DataFrame):
     s["LAST_REASON"] = "OPENING_RANGE_SET"
 
 
-def get_signal(symbol: str):
+# ============================================================
+# SCORING
+# ============================================================
+
+def score_candidate(side: str, bias: str, row, bonus: float) -> float:
+    score = 0.0
+
+    close = float(row["close"])
+    ema20 = float(row["ema20"])
+    ema50 = float(row["ema50"])
+    ema200 = float(row["ema200"])
+    rsi = float(row["close"] * 0 + 50)  # fallback placeholder
+    if "atr" in row.index:
+        pass
+
+    if side == "LONG":
+        if close > ema20:
+            score += 8
+        if ema20 > ema50:
+            score += 10
+        if ema50 > ema200:
+            score += 12
+        if bias == "BULL":
+            score += 18
+        elif bias == "BULL_WEAK":
+            score += 8
+    else:
+        if close < ema20:
+            score += 8
+        if ema20 < ema50:
+            score += 10
+        if ema50 < ema200:
+            score += 12
+        if bias == "BEAR":
+            score += 18
+        elif bias == "BEAR_WEAK":
+            score += 8
+
+    if "atr_pct" in row.index and float(row["atr_pct"]) >= MIN_ATR_PCT:
+        score += 8
+    if volume_ok(row):
+        score += 8
+    if candle_quality(row):
+        score += 8
+
+    adx_like = 0.0
+    if len(row.index) > 0:
+        # derived trend strength using EMA spread / ATR
+        atr = max(float(row["atr"]), 1e-9)
+        adx_like = abs(float(row["ema20"]) - float(row["ema50"])) / atr
+    score += min(adx_like * 6, 12)
+
+    score += bonus
+    return round(score, 1)
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+def make_candidate(symbol: str, side: str, model: str, bias: str, row, entry: float, sl: float, tp: float, bonus: float, reason: str):
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+    score = score_candidate(side, bias, row, bonus)
+    return {
+        "symbol": symbol,
+        "side": "buy" if side == "LONG" else "sell",
+        "direction": side,
+        "model": model,
+        "bias": bias,
+        "price": float(entry),
+        "sl": float(sl),
+        "tp": float(tp),
+        "score": score,
+        "reason": reason,
+    }
+
+
+def detect_or_breakout_continuation(symbol: str, df5: pd.DataFrame, row, bias: str):
+    s = STATE[symbol]
+    if not s["OR_SET"]:
+        return None
+
+    close = float(row["close"])
+    low = float(row["low"])
+    high = float(row["high"])
+    open_ = float(row["open"])
+
+    if close > s["OR_HIGH"] and bias_allows("LONG", bias) and candle_quality(row) and close > open_:
+        sl = min(low, s["OR_LOW"])
+        risk = close - sl
+        if risk > 0:
+            return make_candidate(
+                symbol, "LONG", "OR_BREAKOUT_CONTINUATION", bias, row,
+                close, sl, close + risk * RR_TARGET, 18,
+                f"Opening range breakout continuation above {s['OR_HIGH']:.2f}"
+            )
+
+    if close < s["OR_LOW"] and bias_allows("SHORT", bias) and candle_quality(row) and close < open_:
+        sl = max(high, s["OR_HIGH"])
+        risk = sl - close
+        if risk > 0:
+            return make_candidate(
+                symbol, "SHORT", "OR_BREAKOUT_CONTINUATION", bias, row,
+                close, sl, close - risk * RR_TARGET, 18,
+                f"Opening range breakdown continuation below {s['OR_LOW']:.2f}"
+            )
+    return None
+
+
+def detect_or_retest_rejection(symbol: str, df5: pd.DataFrame, row, bias: str):
+    s = STATE[symbol]
+    if not s["OR_SET"]:
+        return None
+
+    close = float(row["close"])
+    low = float(row["low"])
+    high = float(row["high"])
+    atr = float(row["atr"])
+
+    recent = df5.tail(10)
+    bull_broke = (recent["close"] > s["OR_HIGH"]).any()
+    bear_broke = (recent["close"] < s["OR_LOW"]).any()
+
+    if bull_broke and low <= s["OR_HIGH"] + atr * RETEST_BUFFER_ATR and close > s["OR_HIGH"] and strong_rejection(row, "LONG") and bias_allows("LONG", bias):
+        sl = min(low, s["OR_LOW"])
+        risk = close - sl
+        if risk > 0:
+            return make_candidate(
+                symbol, "LONG", "OR_RETEST_REJECTION", bias, row,
+                close, sl, close + risk * RR_TARGET, 22,
+                f"Retest/rejection of opening range high {s['OR_HIGH']:.2f}"
+            )
+
+    if bear_broke and high >= s["OR_LOW"] - atr * RETEST_BUFFER_ATR and close < s["OR_LOW"] and strong_rejection(row, "SHORT") and bias_allows("SHORT", bias):
+        sl = max(high, s["OR_HIGH"])
+        risk = sl - close
+        if risk > 0:
+            return make_candidate(
+                symbol, "SHORT", "OR_RETEST_REJECTION", bias, row,
+                close, sl, close - risk * RR_TARGET, 22,
+                f"Retest/rejection of opening range low {s['OR_LOW']:.2f}"
+            )
+    return None
+
+
+def detect_trend_pullback(symbol: str, df5: pd.DataFrame, row, bias: str):
+    close = float(row["close"])
+    low = float(row["low"])
+    high = float(row["high"])
+    open_ = float(row["open"])
+    atr = float(row["atr"])
+    ema20 = float(row["ema20"])
+    ema50 = float(row["ema50"])
+
+    if bias_allows("LONG", bias):
+        touched_value = low <= ema20 + atr * PULLBACK_BUFFER_ATR or low <= ema50 + atr * 0.20
+        reclaimed = close > open_ and close > ema20
+        if touched_value and reclaimed and strong_rejection(row, "LONG") and candle_quality(row):
+            sl = min(low, ema50 - atr * 0.10)
+            risk = close - sl
+            if risk > 0:
+                return make_candidate(
+                    symbol, "LONG", "TREND_PULLBACK", bias, row,
+                    close, sl, close + risk * RR_TARGET, 16,
+                    "Pullback into EMA zone and bullish reclaim"
+                )
+
+    if bias_allows("SHORT", bias):
+        touched_value = high >= ema20 - atr * PULLBACK_BUFFER_ATR or high >= ema50 - atr * 0.20
+        rejected = close < open_ and close < ema20
+        if touched_value and rejected and strong_rejection(row, "SHORT") and candle_quality(row):
+            sl = max(high, ema50 + atr * 0.10)
+            risk = sl - close
+            if risk > 0:
+                return make_candidate(
+                    symbol, "SHORT", "TREND_PULLBACK", bias, row,
+                    close, sl, close - risk * RR_TARGET, 16,
+                    "Pullback into EMA zone and bearish rejection"
+                )
+    return None
+
+
+def detect_liquidity_sweep_reversal(symbol: str, df5: pd.DataFrame, row, bias: str):
+    i = len(df5) - 1
+    if i < PARAMS["sweep_lookback"] + 2:
+        return None
+
+    close = float(row["close"])
+    low = float(row["low"])
+    high = float(row["high"])
+
+    if liquidity_sweep_low(df5, i, PARAMS["sweep_lookback"]) and bullish_pin(row) and bias != "BEAR":
+        sl = low
+        risk = close - sl
+        if risk > 0:
+            return make_candidate(
+                symbol, "LONG", "LIQUIDITY_SWEEP_REVERSAL", bias, row,
+                close, sl, close + risk * RR_TARGET, 14,
+                "Downside liquidity sweep and bullish reversal candle"
+            )
+
+    if liquidity_sweep_high(df5, i, PARAMS["sweep_lookback"]) and bearish_pin(row) and bias != "BULL" and ALLOW_SHORTS:
+        sl = high
+        risk = sl - close
+        if risk > 0:
+            return make_candidate(
+                symbol, "SHORT", "LIQUIDITY_SWEEP_REVERSAL", bias, row,
+                close, sl, close - risk * RR_TARGET, 14,
+                "Upside liquidity sweep and bearish reversal candle"
+            )
+    return None
+
+
+def detect_range_rejection(symbol: str, df5: pd.DataFrame, row, bias: str):
+    if len(df5) < PARAMS["range_window"] + 5:
+        return None
+
+    recent = df5.tail(PARAMS["range_window"])
+    range_high = float(recent["high"].max())
+    range_low = float(recent["low"].min())
+    close = float(row["close"])
+    low = float(row["low"])
+    high = float(row["high"])
+
+    if low <= range_low and close > range_low and bullish_pin(row) and bias != "BEAR":
+        sl = low
+        risk = close - sl
+        if risk > 0:
+            return make_candidate(
+                symbol, "LONG", "RANGE_REJECTION", bias, row,
+                close, sl, close + risk * RR_TARGET, 10,
+                f"Range-low rejection near {range_low:.2f}"
+            )
+
+    if high >= range_high and close < range_high and bearish_pin(row) and bias != "BULL" and ALLOW_SHORTS:
+        sl = high
+        risk = sl - close
+        if risk > 0:
+            return make_candidate(
+                symbol, "SHORT", "RANGE_REJECTION", bias, row,
+                close, sl, close - risk * RR_TARGET, 10,
+                f"Range-high rejection near {range_high:.2f}"
+            )
+    return None
+
+
+def detect_compression_breakout(symbol: str, df5: pd.DataFrame, row, bias: str):
+    if len(df5) < PARAMS["compression_window"] + 5:
+        return None
+
+    recent = df5.tail(PARAMS["compression_window"])
+    width = float(recent["high"].max() - recent["low"].min())
+    atr = float(row["atr"])
+    if atr <= 0:
+        return None
+
+    high_level = float(recent["high"].max())
+    low_level = float(recent["low"].min())
+    close = float(row["close"])
+
+    if width <= atr * 2.4 and close > high_level and bias_allows("LONG", bias):
+        sl = float(row["low"])
+        risk = close - sl
+        if risk > 0:
+            return make_candidate(
+                symbol, "LONG", "COMPRESSION_BREAKOUT", bias, row,
+                close, sl, close + risk * RR_TARGET, 15,
+                "Compression resolved upward"
+            )
+
+    if width <= atr * 2.4 and close < low_level and bias_allows("SHORT", bias):
+        sl = float(row["high"])
+        risk = sl - close
+        if risk > 0:
+            return make_candidate(
+                symbol, "SHORT", "COMPRESSION_BREAKOUT", bias, row,
+                close, sl, close - risk * RR_TARGET, 15,
+                "Compression resolved downward"
+            )
+    return None
+
+
+def detect_ema_reclaim(symbol: str, df5: pd.DataFrame, row, bias: str):
+    if len(df5) < 2:
+        return None
+
+    prev = df5.iloc[-2]
+    close = float(row["close"])
+    high = float(row["high"])
+    low = float(row["low"])
+    ema20 = float(row["ema20"])
+
+    if prev["close"] < prev["ema20"] and close > ema20 and close > row["open"] and bias_allows("LONG", bias):
+        sl = min(low, ema20)
+        risk = close - sl
+        if risk > 0:
+            return make_candidate(
+                symbol, "LONG", "EMA_RECLAIM", bias, row,
+                close, sl, close + risk * RR_TARGET, 9,
+                "Price reclaimed EMA20 in bullish context"
+            )
+
+    if prev["close"] > prev["ema20"] and close < ema20 and close < row["open"] and bias_allows("SHORT", bias):
+        sl = max(high, ema20)
+        risk = sl - close
+        if risk > 0:
+            return make_candidate(
+                symbol, "SHORT", "EMA_RECLAIM", bias, row,
+                close, sl, close - risk * RR_TARGET, 9,
+                "Price lost EMA20 in bearish context"
+            )
+    return None
+
+
+DETECTORS = [
+    detect_or_breakout_continuation,
+    detect_or_retest_rejection,
+    detect_trend_pullback,
+    detect_liquidity_sweep_reversal,
+    detect_range_rejection,
+    detect_compression_breakout,
+    detect_ema_reclaim,
+]
+
+
+# ============================================================
+# SELECTION
+# ============================================================
+
+def get_candidates(symbol: str):
     s = STATE[symbol]
     df5_raw = bars_to_df(symbol, "5Min", 400)
     df5 = add_indicators(df5_raw)
 
     if df5.empty:
         s["LAST_REASON"] = "NO_DATA"
-        return None
+        return []
 
     build_opening_range(symbol, df5)
 
-    r = df5.iloc[-1]
-    p = df5.iloc[-2]
-    close = float(r["close"])
-    high = float(r["high"])
-    low = float(r["low"])
-    open_ = float(r["open"])
-    atr = float(r["atr"])
+    row = df5.iloc[-1]
+    close = float(row["close"])
     s["LAST_PRICE"] = close
 
     t = now_ny()
 
     if not in_window(t, TRADE_START, LAST_ENTRY_TIME):
         s["LAST_REASON"] = "OUTSIDE_TRADE_WINDOW"
-        return None
+        return []
     if not s["OR_SET"]:
         s["LAST_REASON"] = "OPENING_RANGE_NOT_READY"
-        return None
+        return []
     if s["TRADED_TODAY"]:
         s["LAST_REASON"] = "TRADED_TODAY"
-        return None
+        return []
     if BOT_STATE["TRADES_TODAY"] >= MAX_TRADES_PER_DAY:
         s["LAST_REASON"] = "MAX_DAILY_TRADES"
-        return None
+        return []
     if has_position(symbol):
         s["IN_POSITION"] = True
         s["LAST_REASON"] = "ALREADY_IN_POSITION"
-        return None
+        return []
     if has_open_order(symbol):
         s["LAST_REASON"] = "OPEN_ORDER_EXISTS"
-        return None
+        return []
 
     bias = htf_bias(symbol)
     if bias in ["CHOP", "NONE"]:
         s["LAST_REASON"] = f"HTF_{bias}"
-        return None
-    if float(r["atr_pct"]) < MIN_ATR_PCT:
+        return []
+    if float(row["atr_pct"]) < MIN_ATR_PCT:
         s["LAST_REASON"] = "LOW_VOLATILITY"
-        return None
+        return []
     if not not_dead_chop(df5):
         s["LAST_REASON"] = "CHOP_BLOCK"
-        return None
-    if not volume_ok(r):
+        return []
+    if not volume_ok(row):
         s["LAST_REASON"] = "LOW_VOLUME"
-        return None
+        return []
 
-    # Model 1: Opening range break + retest
-    if s["BREAK_SIDE"] is None:
-        if close > s["OR_HIGH"] and bias_allows("LONG", bias) and candle_quality(r):
-            s["BREAK_SIDE"] = "LONG"
-            s["LAST_REASON"] = "OR_BREAK_LONG_WAIT_RETEST"
-            # Looser continuation entry if the break candle is decisive
-            if close > open_ and close >= high - atr * 0.10:
-                sl = min(low, s["OR_LOW"])
-                risk = close - sl
-                if risk > 0:
-                    s["LAST_SIGNAL_MODEL"] = "OR_BREAK_CONTINUATION_LONG"
-                    return {"symbol": symbol, "side": "buy", "model": "OR_BREAK_CONTINUATION_LONG", "price": close, "sl": sl, "tp": close + risk * RR_TARGET, "bias": bias}
-            return None
+    candidates = []
+    for fn in DETECTORS:
+        try:
+            c = fn(symbol, df5, row, bias)
+            if c:
+                candidates.append(c)
+        except Exception as e:
+            print(f"{symbol} detector {fn.__name__} error:", e)
 
-        if close < s["OR_LOW"] and bias_allows("SHORT", bias) and candle_quality(r):
-            s["BREAK_SIDE"] = "SHORT"
-            s["LAST_REASON"] = "OR_BREAK_SHORT_WAIT_RETEST"
-            if close < open_ and close <= low + atr * 0.10:
-                sl = max(high, s["OR_HIGH"])
-                risk = sl - close
-                if risk > 0:
-                    s["LAST_SIGNAL_MODEL"] = "OR_BREAK_CONTINUATION_SHORT"
-                    return {"symbol": symbol, "side": "sell", "model": "OR_BREAK_CONTINUATION_SHORT", "price": close, "sl": sl, "tp": close - risk * RR_TARGET, "bias": bias}
-            return None
+    if not candidates:
+        s["LAST_REASON"] = "NO_SETUP"
+        return []
 
-    if s["BREAK_SIDE"] == "LONG" and not s["RETEST_DONE"]:
-        if low <= s["OR_HIGH"] + atr * RETEST_BUFFER_ATR:
-            s["RETEST_DONE"] = True
-            s["LAST_REASON"] = "LONG_RETEST_HIT"
-            return None
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
 
-    if s["BREAK_SIDE"] == "SHORT" and not s["RETEST_DONE"]:
-        if high >= s["OR_LOW"] - atr * RETEST_BUFFER_ATR:
-            s["RETEST_DONE"] = True
-            s["LAST_REASON"] = "SHORT_RETEST_HIT"
-            return None
+    for c in candidates:
+        c["time"] = str(row["time"])
+        c["last_price"] = close
 
-    if s["BREAK_SIDE"] == "LONG" and s["RETEST_DONE"]:
-        if strong_rejection(r, "LONG") and bias_allows("LONG", bias) and candle_quality(r):
-            sl = min(low, s["OR_LOW"])
-            risk = close - sl
-            if risk > 0:
-                s["LAST_SIGNAL_MODEL"] = "OR_BREAK_RETEST_LONG"
-                return {"symbol": symbol, "side": "buy", "model": "OR_BREAK_RETEST_LONG", "price": close, "sl": sl, "tp": close + risk * RR_TARGET, "bias": bias}
-
-    if s["BREAK_SIDE"] == "SHORT" and s["RETEST_DONE"]:
-        if strong_rejection(r, "SHORT") and bias_allows("SHORT", bias) and candle_quality(r):
-            sl = max(high, s["OR_HIGH"])
-            risk = sl - close
-            if risk > 0:
-                s["LAST_SIGNAL_MODEL"] = "OR_BREAK_RETEST_SHORT"
-                return {"symbol": symbol, "side": "sell", "model": "OR_BREAK_RETEST_SHORT", "price": close, "sl": sl, "tp": close - risk * RR_TARGET, "bias": bias}
-
-    # Model 2: Trend pullback continuation
-    if bias_allows("LONG", bias):
-        touched_value = low <= float(r["ema20"]) + atr * PULLBACK_BUFFER_ATR or low <= float(r["ema50"]) + atr * 0.20
-        reclaimed = close > open_ and close > float(r["ema20"])
-        momentum = close > float(p["close"]) or close > float(r["ema50"])
-        if touched_value and reclaimed and momentum and candle_quality(r):
-            sl = min(low, float(r["ema50"]) - atr * 0.10)
-            risk = close - sl
-            if risk > 0:
-                s["LAST_SIGNAL_MODEL"] = "TREND_PULLBACK_LONG"
-                return {"symbol": symbol, "side": "buy", "model": "TREND_PULLBACK_LONG", "price": close, "sl": sl, "tp": close + risk * RR_TARGET, "bias": bias}
-
-    if bias_allows("SHORT", bias):
-        touched_value = high >= float(r["ema20"]) - atr * PULLBACK_BUFFER_ATR or high >= float(r["ema50"]) - atr * 0.20
-        rejected = close < open_ and close < float(r["ema20"])
-        momentum = close < float(p["close"]) or close < float(r["ema50"])
-        if touched_value and rejected and momentum and candle_quality(r):
-            sl = max(high, float(r["ema50"]) + atr * 0.10)
-            risk = sl - close
-            if risk > 0:
-                s["LAST_SIGNAL_MODEL"] = "TREND_PULLBACK_SHORT"
-                return {"symbol": symbol, "side": "sell", "model": "TREND_PULLBACK_SHORT", "price": close, "sl": sl, "tp": close - risk * RR_TARGET, "bias": bias}
-
-    s["LAST_REASON"] = "NO_SETUP"
-    return None
-
-
-def round_price(x: float) -> float:
-    return round(float(x), 2)
+    best = candidates[0]
+    s["LAST_SIGNAL_MODEL"] = best["model"]
+    return candidates
 
 
 def calculate_qty(signal: dict) -> int:
@@ -567,6 +888,10 @@ def calculate_qty(signal: dict) -> int:
     max_cash = min(equity, buying_power) * MAX_POSITION_PCT
     cash_qty = math.floor(max_cash / float(signal["price"]))
     return max(min(risk_qty, cash_qty), 0)
+
+
+def round_price(x: float) -> float:
+    return round(float(x), 2)
 
 
 def submit_bracket_order(signal: dict):
@@ -593,7 +918,6 @@ def submit_bracket_order(signal: dict):
     result = alpaca_post("/v2/orders", payload)
     if result:
         return {"ok": True, "dry_run": False, "qty": qty, "id": result.get("id", "UNKNOWN"), "raw": result}
-
     return {"ok": False, "reason": "alpaca order rejected or request failed", "dry_run": False, "qty": qty}
 
 
@@ -602,8 +926,11 @@ def handle_signal(signal: dict):
     result = submit_bracket_order(signal)
 
     if not result["ok"]:
-        send_once(f"{BOT_STATE['DATE']}:{symbol}:ORDER_FAIL", f"{E_WARN} {symbol} ORDER FAILED\n\nReason: {result['reason']}")
-        return
+        send_once(
+            f"{BOT_STATE['DATE']}:{symbol}:ORDER_FAIL",
+            f"{E_WARN} {symbol} ORDER FAILED\n\nReason: {result['reason']}"
+        )
+        return False
 
     STATE[symbol]["TRADED_TODAY"] = True
     STATE[symbol]["ORDER_ID"] = result["id"]
@@ -611,22 +938,25 @@ def handle_signal(signal: dict):
     BOT_STATE["TRADES_TODAY"] += 1
 
     icon = E_ROCKET if signal["side"] == "buy" else E_DOWN
-    mode_text = "PAPER SIGNAL" if result["dry_run"] else "ORDER SENT"
+    mode_text = "PAPER ORDER" if result["dry_run"] else "ORDER SENT"
 
     send_once(
-        f"{BOT_STATE['DATE']}:{symbol}:SIGNAL",
+        f"{BOT_STATE['DATE']}:{symbol}:SIGNAL:{signal['model']}",
         f"{icon} {symbol} {mode_text}\n\n"
         f"Model: {signal['model']}\n"
-        f"Side: {signal['side'].upper()}\n"
+        f"Direction: {signal['direction']}\n"
         f"Bias: {signal['bias']}\n"
+        f"Score: {signal['score']}/100\n"
         f"Qty: {result['qty']}\n"
         f"Entry ref: ${signal['price']:.2f}\n"
         f"SL: ${signal['sl']:.2f}\n"
         f"TP: ${signal['tp']:.2f}\n"
-        f"RR: 1:{RR_TARGET}\n"
+        f"Reason: {signal['reason']}\n"
         f"Paper: {ALPACA_PAPER}\n"
         f"Execute: {EXECUTE_ORDERS}"
     )
+
+    return True
 
 
 def check_order_updates():
@@ -648,12 +978,15 @@ def check_order_updates():
         if status in ["filled"]:
             send_once(
                 f"{BOT_STATE['DATE']}:{symbol}:FILLED",
-                f"{E_CHECK} {symbol} ORDER FILLED\n\nStatus: {status}\nOrder ID: {order_id}"
+                f"{E_CHECK} {symbol} ORDER FILLED\n\n"
+                f"Status: {status}\n"
+                f"Order ID: {order_id}"
             )
         elif status in ["canceled", "expired", "rejected", "suspended"]:
             send_once(
                 f"{BOT_STATE['DATE']}:{symbol}:{status}",
-                f"{E_CROSS} {symbol} ORDER {status.upper()}\n\nOrder ID: {order_id}"
+                f"{E_CROSS} {symbol} ORDER {status.upper()}\n\n"
+                f"Order ID: {order_id}"
             )
 
         s["ORDER_STATUS_NOTIFIED"] = status
@@ -693,6 +1026,7 @@ def end_of_day_summary():
         f"Paper: {ALPACA_PAPER}\n"
         f"Execute: {EXECUTE_ORDERS}"
     )
+
     BOT_STATE["EOD_SENT"] = True
 
 
@@ -707,17 +1041,23 @@ def startup_check():
         return False
 
     send(
-        f"{E_FIRE} ALPACA STOCK BOT LIVE {E_FIRE}\n\n"
+        f"{E_FIRE} STOCK BEST-SETUP AUTO-TRADER LIVE {E_FIRE}\n\n"
         f"Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}\n"
         f"Execute orders: {EXECUTE_ORDERS}\n"
         f"Data feed: {ALPACA_DATA_FEED}\n"
         f"Equity: ${float(account.get('equity', 0)):.2f}\n"
         f"Buying Power: ${float(account.get('buying_power', 0)):.2f}\n"
         f"Watchlist: {', '.join(WATCHLIST)}\n\n"
-        f"Render optimized live mode\n"
-        f"- fast scans\n"
-        f"- looser entry logic\n"
-        f"- no heavy research in live loop"
+        f"Models:\n"
+        f"- OR breakout continuation\n"
+        f"- OR retest rejection\n"
+        f"- trend pullback\n"
+        f"- liquidity sweep reversal\n"
+        f"- range rejection\n"
+        f"- compression breakout\n"
+        f"- EMA reclaim\n\n"
+        f"Min score to trade: {MIN_SCORE_TO_TRADE}\n"
+        f"Max trades/day: {MAX_TRADES_PER_DAY}"
     )
     return True
 
@@ -740,11 +1080,41 @@ def run():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
+            _BAR_CACHE.clear()
+            _HTF_CACHE["stamp"] = None
+            _HTF_CACHE["bias"] = {}
+
+            all_candidates = []
+
             for symbol in WATCHLIST:
-                signal = get_signal(symbol)
-                if signal:
-                    handle_signal(signal)
-                time.sleep(0.4)
+                candidates = get_candidates(symbol)
+                if candidates:
+                    all_candidates.extend(candidates)
+                time.sleep(0.3)
+
+            if all_candidates and BOT_STATE["TRADES_TODAY"] < MAX_TRADES_PER_DAY:
+                ranked = sorted(all_candidates, key=lambda x: x["score"], reverse=True)
+                ranked = [r for r in ranked if r["score"] >= MIN_SCORE_TO_TRADE]
+
+                orders_sent = 0
+                used_symbols = set()
+
+                for signal in ranked:
+                    if orders_sent >= MAX_NEW_ORDERS_PER_SCAN:
+                        break
+                    if BOT_STATE["TRADES_TODAY"] >= MAX_TRADES_PER_DAY:
+                        break
+                    if signal["symbol"] in used_symbols:
+                        continue
+                    if STATE[signal["symbol"]]["TRADED_TODAY"]:
+                        continue
+                    if has_position(signal["symbol"]) or has_open_order(signal["symbol"]):
+                        continue
+
+                    ok = handle_signal(signal)
+                    if ok:
+                        used_symbols.add(signal["symbol"])
+                        orders_sent += 1
 
             check_order_updates()
             end_of_day_summary()
