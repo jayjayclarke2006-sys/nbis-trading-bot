@@ -12,11 +12,12 @@ from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
 # ============================================================
-# CRYPTO / GOLD MERGED LIVE BOT
+# CRYPTO / GOLD MERGED LIVE BOT - LOOSER VERSION
 # - multi-setup scan
 # - ranked best-candidate selection
-# - soft edge weighting from research profile
+# - soft edge weighting only (boost-only)
 # - Telegram signals only
+# - tuned to fire more often
 # ============================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
@@ -24,10 +25,10 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 SENT_SIGNAL_FILE = "crypto_gold_sent_signals.json"
 EDGE_PROFILE_FILE = os.getenv("CRYPTO_GOLD_EDGE_PROFILE_FILE", "crypto_gold_edge_profile.json")
 
-LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "300"))
+LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() in ["1", "true", "yes", "y"]
-TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "1"))
-MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "60"))
+TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "2"))
+MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "54"))
 
 MARKETS = ["BTC", "GOLD"]
 
@@ -47,21 +48,21 @@ YF_PERIODS = {"5m": "60d", "15m": "60d", "30m": "60d", "1h": "730d", "1d": "10y"
 SETUPS = [
     {"name": "fast", "entry_tf": "5m", "confirm_tf": "15m", "bias_tf": "1h", "enabled": os.getenv("ENABLE_FAST_SETUP", "true").lower() in ["1", "true", "yes", "y"]},
     {"name": "intraday", "entry_tf": "15m", "confirm_tf": "1h", "bias_tf": "4h", "enabled": os.getenv("ENABLE_INTRADAY_SETUP", "true").lower() in ["1", "true", "yes", "y"]},
-    {"name": "swing", "entry_tf": "1h", "confirm_tf": "4h", "bias_tf": "1d", "enabled": os.getenv("ENABLE_SWING_SETUP", "true").lower() in ["1", "true", "yes", "y"]},
+    {"name": "swing", "entry_tf": "1h", "confirm_tf": "4h", "bias_tf": "1d", "enabled": os.getenv("ENABLE_SWING_SETUP", "false").lower() in ["1", "true", "yes", "y"]},
 ]
 
 PARAMS = {
-    "min_adx": float(os.getenv("MIN_ADX", "12")),
-    "rsi_bull": float(os.getenv("RSI_BULL", "50")),
-    "rsi_bear": float(os.getenv("RSI_BEAR", "50")),
-    "volume_mult": float(os.getenv("VOLUME_MULT", "0.85")),
-    "atr_stop": float(os.getenv("ATR_STOP", "1.20")),
-    "rr": float(os.getenv("RR_TARGET", "1.70")),
-    "pullback_buffer_atr": float(os.getenv("PULLBACK_BUFFER_ATR", "0.35")),
-    "retest_buffer_atr": float(os.getenv("RETEST_BUFFER_ATR", "0.25")),
-    "compression_window": int(os.getenv("COMPRESSION_WINDOW", "12")),
-    "range_window": int(os.getenv("RANGE_WINDOW", "20")),
-    "sweep_lookback": int(os.getenv("SWEEP_LOOKBACK", "8")),
+    "min_adx": float(os.getenv("MIN_ADX", "10")),
+    "rsi_bull": float(os.getenv("RSI_BULL", "48")),
+    "rsi_bear": float(os.getenv("RSI_BEAR", "52")),
+    "volume_mult": float(os.getenv("VOLUME_MULT", "0.70")),
+    "atr_stop": float(os.getenv("ATR_STOP", "1.10")),
+    "rr": float(os.getenv("RR_TARGET", "1.50")),
+    "pullback_buffer_atr": float(os.getenv("PULLBACK_BUFFER_ATR", "0.50")),
+    "retest_buffer_atr": float(os.getenv("RETEST_BUFFER_ATR", "0.40")),
+    "compression_window": int(os.getenv("COMPRESSION_WINDOW", "10")),
+    "range_window": int(os.getenv("RANGE_WINDOW", "16")),
+    "sweep_lookback": int(os.getenv("SWEEP_LOOKBACK", "6")),
 }
 
 FETCH_CACHE = {}
@@ -299,7 +300,7 @@ def bullish_pin(row):
         return False
     lower = min(row["open"], row["close"]) - row["low"]
     upper = row["high"] - max(row["open"], row["close"])
-    return lower > body * 1.8 and upper < body * 1.5 and row["close"] > row["open"]
+    return lower > body * 1.4 and upper < body * 1.7 and row["close"] > row["open"]
 
 
 def bearish_pin(row):
@@ -309,15 +310,15 @@ def bearish_pin(row):
         return False
     upper = row["high"] - max(row["open"], row["close"])
     lower = min(row["open"], row["close"]) - row["low"]
-    return upper > body * 1.8 and lower < body * 1.5 and row["close"] < row["open"]
+    return upper > body * 1.4 and lower < body * 1.7 and row["close"] < row["open"]
 
 
 def bullish_engulf(prev, curr):
-    return bool(prev["close"] < prev["open"] and curr["close"] > curr["open"] and curr["close"] > prev["open"] and curr["open"] < prev["close"])
+    return bool(prev["close"] < prev["open"] and curr["close"] > curr["open"] and curr["close"] > prev["open"] and curr["open"] <= prev["close"])
 
 
 def bearish_engulf(prev, curr):
-    return bool(prev["close"] > prev["open"] and curr["close"] < curr["open"] and curr["open"] > prev["close"] and curr["close"] < prev["open"])
+    return bool(prev["close"] > prev["open"] and curr["close"] < curr["open"] and curr["open"] >= prev["close"] and curr["close"] < prev["open"])
 
 
 def liquidity_sweep_low(df, i, lookback):
@@ -361,13 +362,13 @@ def recent_range_width(df, i, window):
 def trend_score(ltf, ctf, btf, direction):
     score = 0
     if direction == "LONG":
-        score += 12 if ltf == "BULLISH" else 5 if ltf == "NEUTRAL" else 0
-        score += 18 if ctf == "BULLISH" else 0
-        score += 20 if btf == "BULLISH" else 8 if btf == "NEUTRAL" else 0
+        score += 12 if ltf == "BULLISH" else 7 if ltf == "NEUTRAL" else 0
+        score += 18 if ctf == "BULLISH" else 8 if ctf == "NEUTRAL" else 0
+        score += 20 if btf == "BULLISH" else 10 if btf == "NEUTRAL" else 0
     else:
-        score += 12 if ltf == "BEARISH" else 5 if ltf == "NEUTRAL" else 0
-        score += 18 if ctf == "BEARISH" else 0
-        score += 20 if btf == "BEARISH" else 8 if btf == "NEUTRAL" else 0
+        score += 12 if ltf == "BEARISH" else 7 if ltf == "NEUTRAL" else 0
+        score += 18 if ctf == "BEARISH" else 8 if ctf == "NEUTRAL" else 0
+        score += 20 if btf == "BEARISH" else 10 if btf == "NEUTRAL" else 0
     return score
 
 
@@ -375,11 +376,11 @@ def momentum_score(row, direction):
     score = 0
     adx = float(row["adx"])
     rsi = float(row["rsi"])
-    score += max(0, min((adx - 10) * 1.2, 16))
+    score += max(0, min((adx - 8) * 1.4, 18))
     if direction == "LONG":
-        score += 12 if rsi >= 60 else 9 if rsi >= 55 else 6 if rsi >= 50 else 0
+        score += 12 if rsi >= 58 else 9 if rsi >= 53 else 6 if rsi >= 48 else 0
     else:
-        score += 12 if rsi <= 40 else 9 if rsi <= 45 else 6 if rsi <= 50 else 0
+        score += 12 if rsi <= 42 else 9 if rsi <= 47 else 6 if rsi <= 52 else 0
     if volume_ok(row):
         score += 8
     return score
@@ -441,7 +442,7 @@ def edge_adjustment(signal, row):
     chosen = None
     for k in keys:
         info = buckets.get(k)
-        if info and info.get("trades", 0) >= 12:
+        if info and info.get("trades", 0) >= 15:
             chosen = info
             break
 
@@ -453,8 +454,8 @@ def edge_adjustment(signal, row):
     win_rate = float(chosen.get("win_rate", 0))
     trades = int(chosen.get("trades", 0))
 
-    # Soft weighting only. No hard blocking.
-    adj = max(-10, min(10, expectancy_r * 6 + (win_rate - 0.5) * 12))
+    # Boost-only.
+    adj = max(0, min(8, expectancy_r * 4 + (win_rate - 0.5) * 8))
     signal["score"] = round(signal["score"] + adj, 1)
     signal["edge_note"] = f"expR={expectancy_r:.2f}, wr={win_rate:.1%}, n={trades}"
     return signal
@@ -469,17 +470,16 @@ def detect_breakout_continuation(df, i):
     curr = df.iloc[i]
     next_open = float(df.iloc[i + 1]["open"])
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
-    high_level = breakout_level_high(df, i, 20)
-    low_level = breakout_level_low(df, i, 20)
+    high_level = breakout_level_high(df, i, 18)
+    low_level = breakout_level_low(df, i, 18)
     out = []
 
     if high_level is not None:
         bull = (
             curr["close"] > high_level
             and curr["close"] > prev["high"]
-            and curr["close"] > curr["open"]
-            and curr["close"] > curr["ema20"]
-            and ctf == "BULLISH"
+            and curr["close"] >= curr["open"]
+            and ctf in ["BULLISH", "NEUTRAL"]
             and btf in ["BULLISH", "NEUTRAL"]
             and float(curr["adx"]) >= PARAMS["min_adx"]
             and float(curr["rsi"]) >= PARAMS["rsi_bull"]
@@ -493,9 +493,8 @@ def detect_breakout_continuation(df, i):
         bear = (
             curr["close"] < low_level
             and curr["close"] < prev["low"]
-            and curr["close"] < curr["open"]
-            and curr["close"] < curr["ema20"]
-            and ctf == "BEARISH"
+            and curr["close"] <= curr["open"]
+            and ctf in ["BEARISH", "NEUTRAL"]
             and btf in ["BEARISH", "NEUTRAL"]
             and float(curr["adx"]) >= PARAMS["min_adx"]
             and float(curr["rsi"]) <= PARAMS["rsi_bear"]
@@ -516,18 +515,18 @@ def detect_pullback_continuation(df, i):
     atr = float(curr["atr"])
     out = []
 
-    touched_long = curr["low"] <= curr["ema20"] + atr * PARAMS["pullback_buffer_atr"] or curr["low"] <= curr["ema50"] + atr * 0.15
-    reclaimed_long = curr["close"] > curr["open"] and curr["close"] > curr["ema20"]
+    touched_long = curr["low"] <= curr["ema20"] + atr * PARAMS["pullback_buffer_atr"] or curr["low"] <= curr["ema50"] + atr * 0.25
+    reclaimed_long = curr["close"] >= curr["open"] and curr["close"] > curr["ema20"]
     bull_reject = bullish_pin(curr) or bullish_engulf(prev, curr)
-    if touched_long and reclaimed_long and bull_reject and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"] and float(curr["rsi"]) >= PARAMS["rsi_bull"] and float(curr["adx"]) >= PARAMS["min_adx"]:
+    if touched_long and reclaimed_long and bull_reject and ctf in ["BULLISH", "NEUTRAL"] and btf in ["BULLISH", "NEUTRAL"] and float(curr["rsi"]) >= PARAMS["rsi_bull"] and float(curr["adx"]) >= PARAMS["min_adx"]:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 16
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "PULLBACK_CONTINUATION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Trend pullback into value and bullish reclaim"})
 
-    touched_short = curr["high"] >= curr["ema20"] - atr * PARAMS["pullback_buffer_atr"] or curr["high"] >= curr["ema50"] - atr * 0.15
-    reclaimed_short = curr["close"] < curr["open"] and curr["close"] < curr["ema20"]
+    touched_short = curr["high"] >= curr["ema20"] - atr * PARAMS["pullback_buffer_atr"] or curr["high"] >= curr["ema50"] - atr * 0.25
+    reclaimed_short = curr["close"] <= curr["open"] and curr["close"] < curr["ema20"]
     bear_reject = bearish_pin(curr) or bearish_engulf(prev, curr)
-    if ALLOW_SHORTS and touched_short and reclaimed_short and bear_reject and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"] and float(curr["rsi"]) <= PARAMS["rsi_bear"] and float(curr["adx"]) >= PARAMS["min_adx"]:
+    if ALLOW_SHORTS and touched_short and reclaimed_short and bear_reject and ctf in ["BEARISH", "NEUTRAL"] and btf in ["BEARISH", "NEUTRAL"] and float(curr["rsi"]) <= PARAMS["rsi_bear"] and float(curr["adx"]) >= PARAMS["min_adx"]:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 16
         stop, target = risk_levels(curr, next_open, "SHORT")
         out.append({"model": "PULLBACK_CONTINUATION", "direction": "SHORT", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Trend pullback into value and bearish rejection"})
@@ -542,21 +541,21 @@ def detect_breakout_retest_rejection(df, i):
     atr = float(curr["atr"])
     out = []
 
-    high_level = breakout_level_high(df, i, 20)
-    low_level = breakout_level_low(df, i, 20)
+    high_level = breakout_level_high(df, i, 18)
+    low_level = breakout_level_low(df, i, 18)
     if high_level is None or low_level is None:
         return out
 
-    recent_bull_break = any(df.iloc[j]["close"] > high_level for j in range(max(1, i - 6), i))
-    recent_bear_break = any(df.iloc[j]["close"] < low_level for j in range(max(1, i - 6), i))
+    recent_bull_break = any(df.iloc[j]["close"] > high_level for j in range(max(1, i - 8), i))
+    recent_bear_break = any(df.iloc[j]["close"] < low_level for j in range(max(1, i - 8), i))
 
-    bull = recent_bull_break and curr["low"] <= high_level + atr * PARAMS["retest_buffer_atr"] and curr["close"] > high_level and (bullish_pin(curr) or curr["close"] > curr["open"]) and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"]
+    bull = recent_bull_break and curr["low"] <= high_level + atr * PARAMS["retest_buffer_atr"] and curr["close"] > high_level and (bullish_pin(curr) or curr["close"] > curr["open"]) and ctf in ["BULLISH", "NEUTRAL"] and btf in ["BULLISH", "NEUTRAL"]
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 20
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "BREAKOUT_RETEST_REJECTION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Retest/rejection of breakout level {high_level:.2f}"})
 
-    bear = ALLOW_SHORTS and recent_bear_break and curr["high"] >= low_level - atr * PARAMS["retest_buffer_atr"] and curr["close"] < low_level and (bearish_pin(curr) or curr["close"] < curr["open"]) and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"]
+    bear = ALLOW_SHORTS and recent_bear_break and curr["high"] >= low_level - atr * PARAMS["retest_buffer_atr"] and curr["close"] < low_level and (bearish_pin(curr) or curr["close"] < curr["open"]) and ctf in ["BEARISH", "NEUTRAL"] and btf in ["BEARISH", "NEUTRAL"]
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 20
         stop, target = risk_levels(curr, next_open, "SHORT")
@@ -572,13 +571,13 @@ def detect_liquidity_sweep_reversal(df, i):
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
     out = []
 
-    bull = liquidity_sweep_low(df, i, PARAMS["sweep_lookback"]) and (bullish_pin(curr) or bullish_engulf(prev, curr)) and ctf != "BEARISH" and btf != "BEARISH" and float(curr["adx"]) >= PARAMS["min_adx"] - 2
+    bull = liquidity_sweep_low(df, i, PARAMS["sweep_lookback"]) and (bullish_pin(curr) or bullish_engulf(prev, curr)) and ctf != "BEARISH"
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 14
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "LIQUIDITY_SWEEP_REVERSAL", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Downside liquidity sweep and reversal candle"})
 
-    bear = ALLOW_SHORTS and liquidity_sweep_high(df, i, PARAMS["sweep_lookback"]) and (bearish_pin(curr) or bearish_engulf(prev, curr)) and ctf != "BULLISH" and btf != "BULLISH" and float(curr["adx"]) >= PARAMS["min_adx"] - 2
+    bear = ALLOW_SHORTS and liquidity_sweep_high(df, i, PARAMS["sweep_lookback"]) and (bearish_pin(curr) or bearish_engulf(prev, curr)) and ctf != "BULLISH"
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 14
         stop, target = risk_levels(curr, next_open, "SHORT")
@@ -598,13 +597,13 @@ def detect_range_rejection(df, i):
     range_high = float(df["high"].iloc[i - PARAMS["range_window"]:i].max())
     range_low = float(df["low"].iloc[i - PARAMS["range_window"]:i].min())
 
-    bull = curr["low"] <= range_low and curr["close"] > range_low and bullish_pin(curr) and ctf != "BEARISH"
+    bull = curr["low"] <= range_low and curr["close"] > range_low and bullish_pin(curr)
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 10
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "RANGE_REJECTION", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": f"Range low rejection near {range_low:.2f}"})
 
-    bear = ALLOW_SHORTS and curr["high"] >= range_high and curr["close"] < range_high and bearish_pin(curr) and ctf != "BULLISH"
+    bear = ALLOW_SHORTS and curr["high"] >= range_high and curr["close"] < range_high and bearish_pin(curr)
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 10
         stop, target = risk_levels(curr, next_open, "SHORT")
@@ -626,17 +625,17 @@ def detect_compression_breakout(df, i):
     if recent_width is None:
         return out
 
-    compressed = recent_width <= float(curr["atr"]) * 2.4
+    compressed = recent_width <= float(curr["atr"]) * 2.8
     high_level = breakout_level_high(df, i, PARAMS["compression_window"])
     low_level = breakout_level_low(df, i, PARAMS["compression_window"])
 
-    bull = compressed and curr["close"] > high_level and curr["close"] > prev["high"] and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"]
+    bull = compressed and curr["close"] > high_level and curr["close"] >= prev["high"] and ctf in ["BULLISH", "NEUTRAL"] and btf in ["BULLISH", "NEUTRAL"]
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 15
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "COMPRESSION_BREAKOUT", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Compression resolved upward"})
 
-    bear = ALLOW_SHORTS and compressed and curr["close"] < low_level and curr["close"] < prev["low"] and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"]
+    bear = ALLOW_SHORTS and compressed and curr["close"] < low_level and curr["close"] <= prev["low"] and ctf in ["BEARISH", "NEUTRAL"] and btf in ["BEARISH", "NEUTRAL"]
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 15
         stop, target = risk_levels(curr, next_open, "SHORT")
@@ -652,13 +651,13 @@ def detect_ema_reclaim(df, i):
     ltf, ctf, btf = entry_trend(curr), confirm_trend(curr), bias_trend(curr)
     out = []
 
-    bull = prev["close"] < prev["ema20"] and curr["close"] > curr["ema20"] and curr["close"] > curr["open"] and ctf == "BULLISH" and btf in ["BULLISH", "NEUTRAL"] and float(curr["rsi"]) >= PARAMS["rsi_bull"]
+    bull = prev["close"] < prev["ema20"] and curr["close"] > curr["ema20"] and curr["close"] >= curr["open"] and ctf in ["BULLISH", "NEUTRAL"] and btf in ["BULLISH", "NEUTRAL"] and float(curr["rsi"]) >= PARAMS["rsi_bull"]
     if bull:
         score = trend_score(ltf, ctf, btf, "LONG") + momentum_score(curr, "LONG") + 9
         stop, target = risk_levels(curr, next_open, "LONG")
         out.append({"model": "EMA_RECLAIM", "direction": "LONG", "score": round(score, 1), "entry": round(next_open, 2), "stop": stop, "target": target, "reason": "Price reclaimed EMA20 in trend context"})
 
-    bear = ALLOW_SHORTS and prev["close"] > prev["ema20"] and curr["close"] < curr["ema20"] and curr["close"] < curr["open"] and ctf == "BEARISH" and btf in ["BEARISH", "NEUTRAL"] and float(curr["rsi"]) <= PARAMS["rsi_bear"]
+    bear = ALLOW_SHORTS and prev["close"] > prev["ema20"] and curr["close"] < curr["ema20"] and curr["close"] <= curr["open"] and ctf in ["BEARISH", "NEUTRAL"] and btf in ["BEARISH", "NEUTRAL"] and float(curr["rsi"]) <= PARAMS["rsi_bear"]
     if bear:
         score = trend_score(ltf, ctf, btf, "SHORT") + momentum_score(curr, "SHORT") + 9
         stop, target = risk_levels(curr, next_open, "SHORT")
@@ -709,7 +708,12 @@ def scan_setup_market(market, setup):
         c["bias_tf"] = setup["bias_tf"]
         c["time"] = str(df.iloc[i]["timestamp"])
         c["rr"] = round(abs(c["target"] - c["entry"]) / max(abs(c["entry"] - c["stop"]), 1e-9), 2)
-        out.append(edge_adjustment(c, row))
+        c = edge_adjustment(c, row)
+        out.append(c)
+        print(
+            f"{market} {setup['name']} {c['model']} {c['direction']} "
+            f"score={c['score']} edge={c.get('edge_note', 'none')}"
+        )
 
     return out
 
@@ -766,7 +770,7 @@ def run():
         raise ValueError("No setups enabled.")
 
     send_telegram(
-        "CRYPTO/GOLD MERGED LIVE BOT STARTED\n\n"
+        "CRYPTO/GOLD MERGED LIVE BOT - LOOSER VERSION STARTED\n\n"
         "Models:\n"
         "- breakout continuation\n"
         "- pullback continuation\n"
@@ -775,7 +779,8 @@ def run():
         "- range rejection\n"
         "- compression breakout\n"
         "- EMA reclaim\n\n"
-        "Using soft edge weighting if research profile exists.\n\n"
+        "Soft edge weighting only.\n"
+        "Swing disabled by default.\n\n"
         "Enabled setups:\n" +
         "\n".join(f"- {s['name']}: {s['entry_tf']} / {s['confirm_tf']} / {s['bias_tf']}" for s in enabled_setups) +
         f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}"
