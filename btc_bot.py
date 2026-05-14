@@ -28,8 +28,10 @@ EDGE_PROFILE_FILE = os.getenv("CRYPTO_GOLD_EDGE_PROFILE_FILE", "crypto_gold_edge
 
 LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() in ["1", "true", "yes", "y"]
-TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "2"))
+TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "1"))
 MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "54"))
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "30"))
+SAME_DIRECTION_COOLDOWN = os.getenv("SAME_DIRECTION_COOLDOWN", "true").lower() in ["1", "true", "yes", "y"]
 
 # Market regime detection.
 # Default is SOFT scoring, not hard blocking.
@@ -988,46 +990,121 @@ def scan_setup_market(market, setup):
 
 
 def dedupe_candidates(candidates):
+    """
+    Keep the best version of the same idea.
+
+    This stops fast + intraday from both alerting the same GOLD short,
+    while still allowing different markets or opposite directions.
+    """
     kept = []
     seen = set()
+
     for c in sorted(candidates, key=lambda x: x["score"], reverse=True):
-        key = (c["market"], c["direction"], c["time"])
+        market = c["market"]
+        direction = c["direction"]
+
+        # Bucket entry so tiny price differences do not create duplicate alerts.
+        entry = float(c["entry"])
+        if market == "BTC":
+            entry_bucket = round(entry / 50) * 50
+        elif market == "GOLD":
+            entry_bucket = round(entry / 2) * 2
+        else:
+            entry_bucket = round(entry, 1)
+
+        key = (market, direction, entry_bucket)
+
         if key in seen:
             continue
+
+        # Scores can exceed 100 after regime boost. Cap display at 100.
+        c["score"] = min(round(float(c["score"]), 1), 100.0)
+
         kept.append(c)
         seen.add(key)
+
     return kept
 
-
 def format_signal(signal):
-    return (
-        "ð¨ BEST LIVE SIGNAL ð¨\n\n"
-        f"Market: {signal['market']}\n"
-        f"Model: {signal['model']}\n"
-        f"Direction: {signal['direction']}\n"
-        f"Score: {signal['score']}/100\n\n"
-        f"Entry: {signal['entry']}\n"
-        f"Stop Loss: {signal['stop']}\n"
-        f"Take Profit: {signal['target']}\n"
-        f"R:R: {signal['rr']}\n\n"
-        f"Setup: {signal['setup_name']} ({signal['entry_tf']} / {signal['confirm_tf']} / {signal['bias_tf']})\n"
-        f"Reason: {signal['reason']}\n"
-        f"Edge: {signal.get('edge_note', 'no_profile')}\n"
-        f"Regime: {signal.get('regime', 'unknown')}\n"
-        f"Regime adj: {signal.get('regime_adjustment', 0)}\n"
-        f"Time: {signal['time']}"
-    )
+    market = signal["market"]
+    direction = signal["direction"]
+    model = signal["model"]
 
+    market_emoji = "ð¡" if market == "GOLD" else "â¿"
+    side_emoji = "ðð¢" if direction == "LONG" else "ð»ð´"
+
+    model_emojis = {
+        "BREAKOUT_CONTINUATION": "ð¥",
+        "PULLBACK_CONTINUATION": "ð¯",
+        "BREAKOUT_RETEST_REJECTION": "ð",
+        "LIQUIDITY_SWEEP_REVERSAL": "ð§",
+        "RANGE_REJECTION": "ð¦",
+        "COMPRESSION_BREAKOUT": "â¡",
+        "EMA_RECLAIM": "ð",
+    }
+
+    model_emoji = model_emojis.get(model, "ð")
+
+    return (
+        f"ð¨ {market_emoji} {market} {side_emoji} SIGNAL ð¨\n\n"
+        f"{model_emoji} Model: {model}\n"
+        f"Direction: {direction}\n"
+        f"Score: {signal['score']}/100\n\n"
+        f"ð¯ Entry: {signal['entry']}\n"
+        f"ð Stop Loss: {signal['stop']}\n"
+        f"ð° Take Profit: {signal['target']}\n"
+        f"âï¸ R:R: {signal['rr']}\n\n"
+        f"â±ï¸ Setup: {signal['setup_name']} ({signal['entry_tf']} / {signal['confirm_tf']} / {signal['bias_tf']})\n"
+        f"ð§  Reason: {signal['reason']}\n"
+        f"ð Edge: {signal.get('edge_note', 'no_profile')}\n"
+        f"ð¦ï¸ Regime: {signal.get('regime', 'unknown')}\n"
+        f"â Regime adj: {signal.get('regime_adjustment', 0)}\n"
+        f"ð Time: {signal['time']}"
+    )
 
 def maybe_send_signal(signal):
     sent = load_json(SENT_SIGNAL_FILE, {})
-    key = f"{signal['market']}_{signal['setup_name']}_{signal['model']}_{signal['direction']}_{signal['time']}"
-    if sent.get(key):
-        print("Duplicate signal blocked:", key)
+    now_ts = time.time()
+
+    market = signal["market"]
+    direction = signal["direction"]
+    setup = signal["setup_name"]
+    model = signal["model"]
+    signal_time = signal["time"]
+
+    # Exact candle duplicate block.
+    exact_key = f"exact:{market}:{setup}:{model}:{direction}:{signal_time}"
+    if sent.get(exact_key):
+        print("Duplicate exact signal blocked:", exact_key)
         return
 
+    # Cooldown block.
+    # Stops repeated GOLD SHORT / BTC LONG spam while the same move continues.
+    if SAME_DIRECTION_COOLDOWN:
+        cooldown_key = f"cooldown:{market}:{direction}"
+        last = sent.get(cooldown_key)
+
+        if isinstance(last, dict):
+            elapsed = now_ts - float(last.get("ts", 0))
+            if elapsed < SIGNAL_COOLDOWN_MINUTES * 60:
+                remaining = int((SIGNAL_COOLDOWN_MINUTES * 60 - elapsed) / 60) + 1
+                print(
+                    f"Cooldown blocked {market} {direction}. "
+                    f"Last alert {elapsed/60:.1f} min ago. Remaining ~{remaining} min."
+                )
+                return
+
     send_telegram(format_signal(signal))
-    sent[key] = True
+
+    sent[exact_key] = True
+    sent[f"cooldown:{market}:{direction}"] = {
+        "ts": now_ts,
+        "entry": signal["entry"],
+        "model": model,
+        "setup": setup,
+        "time": signal_time,
+    }
+
     save_json(SENT_SIGNAL_FILE, sent)
 
 
@@ -1055,7 +1132,7 @@ def run():
         "Swing disabled by default.\n\n"
         "Enabled setups:\n" +
         "\n".join(f"- {s['name']}: {s['entry_tf']} / {s['confirm_tf']} / {s['bias_tf']}" for s in enabled_setups) +
-        f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}"
+        f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}\nCooldown: {SIGNAL_COOLDOWN_MINUTES} min"
     )
 
     while True:
