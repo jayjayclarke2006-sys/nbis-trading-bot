@@ -43,7 +43,7 @@ HEADERS = {
 }
 
 NY_TZ = ZoneInfo("America/New_York")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "45"))
 
 WATCHLIST = ["AAPL", "TSLA", "NVDA", "AMD", "META", "MSFT", "AMZN", "SPY", "QQQ", "NBIS", "WULF", "IREN"]
 
@@ -53,19 +53,19 @@ MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
 MAX_NEW_ORDERS_PER_SCAN = int(os.getenv("MAX_NEW_ORDERS_PER_SCAN", "1"))
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "false").lower() in ["1", "true", "yes", "y"]
 
-RR_TARGET = float(os.getenv("RR_TARGET", "1.8"))
+RR_TARGET = float(os.getenv("RR_TARGET", "1.6"))
 ATR_LEN = 14
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
 
-MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.0022"))
-MIN_VOLUME_MULT = float(os.getenv("MIN_VOLUME_MULT", "0.75"))
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.0015"))
+MIN_VOLUME_MULT = float(os.getenv("MIN_VOLUME_MULT", "0.60"))
 MIN_BODY_ATR = float(os.getenv("MIN_BODY_ATR", "0.12"))
 MAX_BODY_ATR = float(os.getenv("MAX_BODY_ATR", "2.80"))
-RETEST_BUFFER_ATR = float(os.getenv("RETEST_BUFFER_ATR", "0.35"))
-PULLBACK_BUFFER_ATR = float(os.getenv("PULLBACK_BUFFER_ATR", "0.45"))
-MIN_SCORE_TO_TRADE = float(os.getenv("MIN_SCORE_TO_TRADE", "60"))
+RETEST_BUFFER_ATR = float(os.getenv("RETEST_BUFFER_ATR", "0.45"))
+PULLBACK_BUFFER_ATR = float(os.getenv("PULLBACK_BUFFER_ATR", "0.55"))
+MIN_SCORE_TO_TRADE = float(os.getenv("MIN_SCORE_TO_TRADE", "54"))
 
 MARKET_OPEN = "09:30"
 OPENING_RANGE_END = "10:00"
@@ -551,7 +551,9 @@ def edge_adjustment(signal, symbol, row):
     win_rate = float(chosen.get("win_rate", 0))
     trades = int(chosen.get("trades", 0))
 
-    adj = max(-10, min(10, expectancy_r * 6 + (win_rate - 0.5) * 12))
+    # Boost-only edge weighting.
+    # Research can help a setup rank higher, but it cannot suppress a live setup yet.
+    adj = max(0, min(8, expectancy_r * 4 + (win_rate - 0.5) * 8))
     signal["score"] = round(signal["score"] + adj, 1)
     signal["edge_note"] = f"expR={expectancy_r:.2f}, wr={win_rate:.1%}, n={trades}"
     return signal
@@ -787,8 +789,10 @@ def get_candidates(symbol: str):
     t = now_ny()
     if not in_window(t, TRADE_START, LAST_ENTRY_TIME):
         s["LAST_REASON"] = "OUTSIDE_TRADE_WINDOW"; return []
+    # Opening-range models need OR_SET, but trend/reclaim/range/compression setups do not.
+    # So do not globally block here. The OR-specific detectors check OR_SET themselves.
     if not s["OR_SET"]:
-        s["LAST_REASON"] = "OPENING_RANGE_NOT_READY"; return []
+        s["LAST_REASON"] = "OPENING_RANGE_NOT_READY_NON_OR_MODELS_ALLOWED"
     if s["TRADED_TODAY"]:
         s["LAST_REASON"] = "TRADED_TODAY"; return []
     if BOT_STATE["TRADES_TODAY"] >= MAX_TRADES_PER_DAY:
@@ -799,8 +803,13 @@ def get_candidates(symbol: str):
         s["LAST_REASON"] = "OPEN_ORDER_EXISTS"; return []
 
     bias = htf_bias(symbol)
-    if bias in ["CHOP", "NONE"]:
-        s["LAST_REASON"] = f"HTF_{bias}"; return []
+
+    # Do not globally block CHOP.
+    # CHOP should still allow reversal/range/sweep setups, while trend/breakout models
+    # remain controlled by bias_allows().
+    if bias == "NONE":
+        s["LAST_REASON"] = "HTF_NONE"; return []
+
     if float(row["atr_pct"]) < MIN_ATR_PCT:
         s["LAST_REASON"] = "LOW_VOLATILITY"; return []
     if not not_dead_chop(df5):
@@ -822,6 +831,13 @@ def get_candidates(symbol: str):
         return []
 
     candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+
+    for c in candidates:
+        print(
+            f"{symbol} candidate {c['model']} {c['direction']} "
+            f"score={c['score']} bias={c['bias']} edge={c.get('edge_note', 'none')}"
+        )
+
     s["LAST_SIGNAL_MODEL"] = candidates[0]["model"]
     return candidates
 
@@ -1008,6 +1024,9 @@ def startup_check():
         f"- EMA reclaim\n\n"
         f"Using soft edge weighting if research profile exists.\n"
         f"Min score to trade: {MIN_SCORE_TO_TRADE}\n"
+        f"Min ATR pct: {MIN_ATR_PCT}\n"
+        f"Volume mult: {MIN_VOLUME_MULT}\n"
+        f"RR target: {RR_TARGET}\n"
         f"Max trades/day: {MAX_TRADES_PER_DAY}"
     )
     return True
