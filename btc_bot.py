@@ -41,7 +41,7 @@ EXCHANGES = [
 
 SUPPORTED_TFS = ["5m", "15m", "30m", "1h", "4h", "1d"]
 TF_TO_MINUTES = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
-PANDAS_RULES = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1H", "4h": "4H", "1d": "1D"}
+PANDAS_RULES = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h", "1d": "1D"}
 YF_INTERVALS = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "60m", "1d": "1d"}
 YF_PERIODS = {"5m": "60d", "15m": "60d", "30m": "60d", "1h": "730d", "1d": "10y"}
 
@@ -207,16 +207,53 @@ def fetch_gold(tf):
         interval=YF_INTERVALS[tf],
         auto_adjust=True,
         progress=False,
-    ).reset_index()
+        group_by="column",
+    )
 
-    if "Datetime" in df.columns:
-        df = df.rename(columns={"Datetime": "timestamp"})
-    elif "Date" in df.columns:
-        df = df.rename(columns={"Date": "timestamp"})
+    if df is None or df.empty:
+        raise Exception(f"Gold {tf} returned empty data from Yahoo")
 
+    # yfinance sometimes returns MultiIndex columns like ("Close", "GC=F").
+    # Flatten them so the bot always gets timestamp/open/high/low/close/volume.
+    if isinstance(df.columns, pd.MultiIndex):
+        flattened = []
+        for col in df.columns:
+            first = str(col[0]).lower()
+            last = str(col[-1]).lower()
+            if first in ["open", "high", "low", "close", "volume"]:
+                flattened.append(first)
+            elif last in ["open", "high", "low", "close", "volume"]:
+                flattened.append(last)
+            else:
+                flattened.append(first)
+        df.columns = flattened
+    else:
+        df.columns = [str(c).lower() for c in df.columns]
+
+    df = df.reset_index()
     df.columns = [str(c).lower() for c in df.columns]
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]].dropna()
+
+    if "datetime" in df.columns:
+        df = df.rename(columns={"datetime": "timestamp"})
+    elif "date" in df.columns:
+        df = df.rename(columns={"date": "timestamp"})
+    elif "index" in df.columns:
+        df = df.rename(columns={"index": "timestamp"})
+
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    needed = ["timestamp", "open", "high", "low", "close", "volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise Exception(f"Gold {tf} missing columns: {missing}. Got columns: {list(df.columns)}")
+
+    df = df[needed].dropna()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna()
 
     valid, reason = validate_data(df)
     if not valid:
@@ -225,7 +262,6 @@ def fetch_gold(tf):
     df = df.sort_values("timestamp").reset_index(drop=True)
     FETCH_CACHE[cache_key] = df.copy()
     return df
-
 
 def fetch_market_tf(market, tf):
     if market == "BTC":
