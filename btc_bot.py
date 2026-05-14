@@ -82,6 +82,35 @@ PARAMS = {
 
 FETCH_CACHE = {}
 
+# ============================================================
+# EMOJI CONSTANTS
+# Use unicode escapes instead of pasted emoji characters.
+# This prevents mojibake like Ã°Å¸Å¡â¬ / Ã°Å¸âÅ  in Telegram.
+# ============================================================
+
+E_ALERT = "\U0001F6A8"      # ð¨
+E_GOLD = "\U0001F7E1"       # ð¡
+E_BTC = "\u20BF"            # â¿
+E_LONG = "\U0001F680\U0001F7E2"   # ðð¢
+E_SHORT = "\U0001F53B\U0001F534"  # ð»ð´
+E_BOOM = "\U0001F4A5"       # ð¥
+E_TARGET = "\U0001F3AF"     # ð¯
+E_RETEST = "\U0001F501"     # ð
+E_WATER = "\U0001F4A7"      # ð§
+E_BOX = "\U0001F4E6"        # ð¦
+E_ZAP = "\u26A1"            # â¡
+E_CHART_UP = "\U0001F4C8"   # ð
+E_STOP = "\U0001F6D1"       # ð
+E_MONEY = "\U0001F4B0"      # ð°
+E_SCALE = "\u2696\uFE0F"    # âï¸
+E_CLOCK = "\u23F1\uFE0F"    # â±ï¸
+E_BRAIN = "\U0001F9E0"      # ð§ 
+E_CHART = "\U0001F4CA"      # ð
+E_WEATHER = "\U0001F326\uFE0F"  # ð¦ï¸
+E_PLUS = "\u2795"           # â
+E_TIME = "\U0001F552"       # ð
+
+
 
 # ============================================================
 # HELPERS
@@ -93,14 +122,19 @@ def send_telegram(message: str):
         print("Telegram not configured.")
         return
     try:
+        payload = json.dumps(
+            {"chat_id": CHAT_ID, "text": message},
+            ensure_ascii=False,
+        ).encode("utf-8")
+
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": message},
+            data=payload,
+            headers={"Content-Type": "application/json; charset=utf-8"},
             timeout=10,
         )
     except Exception as e:
         print("Telegram error:", e)
-
 
 def load_json(path, default):
     if not os.path.exists(path):
@@ -1030,36 +1064,36 @@ def format_signal(signal):
     direction = signal["direction"]
     model = signal["model"]
 
-    market_emoji = "ð¡" if market == "GOLD" else "â¿"
-    side_emoji = "ðð¢" if direction == "LONG" else "ð»ð´"
+    market_emoji = E_GOLD if market == "GOLD" else E_BTC
+    side_emoji = E_LONG if direction == "LONG" else E_SHORT
 
     model_emojis = {
-        "BREAKOUT_CONTINUATION": "ð¥",
-        "PULLBACK_CONTINUATION": "ð¯",
-        "BREAKOUT_RETEST_REJECTION": "ð",
-        "LIQUIDITY_SWEEP_REVERSAL": "ð§",
-        "RANGE_REJECTION": "ð¦",
-        "COMPRESSION_BREAKOUT": "â¡",
-        "EMA_RECLAIM": "ð",
+        "BREAKOUT_CONTINUATION": E_BOOM,
+        "PULLBACK_CONTINUATION": E_TARGET,
+        "BREAKOUT_RETEST_REJECTION": E_RETEST,
+        "LIQUIDITY_SWEEP_REVERSAL": E_WATER,
+        "RANGE_REJECTION": E_BOX,
+        "COMPRESSION_BREAKOUT": E_ZAP,
+        "EMA_RECLAIM": E_CHART_UP,
     }
 
-    model_emoji = model_emojis.get(model, "ð")
+    model_emoji = model_emojis.get(model, E_CHART)
 
     return (
-        f"ð¨ {market_emoji} {market} {side_emoji} SIGNAL ð¨\n\n"
+        f"{E_ALERT} {market_emoji} {market} {side_emoji} SIGNAL {E_ALERT}\n\n"
         f"{model_emoji} Model: {model}\n"
         f"Direction: {direction}\n"
         f"Score: {signal['score']}/100\n\n"
-        f"ð¯ Entry: {signal['entry']}\n"
-        f"ð Stop Loss: {signal['stop']}\n"
-        f"ð° Take Profit: {signal['target']}\n"
-        f"âï¸ R:R: {signal['rr']}\n\n"
-        f"â±ï¸ Setup: {signal['setup_name']} ({signal['entry_tf']} / {signal['confirm_tf']} / {signal['bias_tf']})\n"
-        f"ð§  Reason: {signal['reason']}\n"
-        f"ð Edge: {signal.get('edge_note', 'no_profile')}\n"
-        f"ð¦ï¸ Regime: {signal.get('regime', 'unknown')}\n"
-        f"â Regime adj: {signal.get('regime_adjustment', 0)}\n"
-        f"ð Time: {signal['time']}"
+        f"{E_TARGET} Entry: {signal['entry']}\n"
+        f"{E_STOP} Stop Loss: {signal['stop']}\n"
+        f"{E_MONEY} Take Profit: {signal['target']}\n"
+        f"{E_SCALE} R:R: {signal['rr']}\n\n"
+        f"{E_CLOCK} Setup: {signal['setup_name']} ({signal['entry_tf']} / {signal['confirm_tf']} / {signal['bias_tf']})\n"
+        f"{E_BRAIN} Reason: {signal['reason']}\n"
+        f"{E_CHART} Edge: {signal.get('edge_note', 'no_profile')}\n"
+        f"{E_WEATHER} Regime: {signal.get('regime', 'unknown')}\n"
+        f"{E_PLUS} Regime adj: {signal.get('regime_adjustment', 0)}\n"
+        f"{E_TIME} Time: {signal['time']}"
     )
 
 def maybe_send_signal(signal):
