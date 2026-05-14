@@ -52,6 +52,9 @@ MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.12"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
 MAX_NEW_ORDERS_PER_SCAN = int(os.getenv("MAX_NEW_ORDERS_PER_SCAN", "1"))
 ONE_POSITION_AT_A_TIME = os.getenv("ONE_POSITION_AT_A_TIME", "false").lower() in ["1", "true", "yes", "y"]
+MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.0075"))
+MAX_DATA_STALE_MINUTES_5M = int(os.getenv("MAX_DATA_STALE_MINUTES_5M", "20"))
+MAX_DATA_STALE_MINUTES_15M = int(os.getenv("MAX_DATA_STALE_MINUTES_15M", "45"))
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "false").lower() in ["1", "true", "yes", "y"]
 
 RR_TARGET = float(os.getenv("RR_TARGET", "1.6"))
@@ -263,23 +266,82 @@ def has_open_order(symbol: str) -> bool:
     return False
 
 
+def get_latest_price(symbol: str):
+    """
+    Get a live-ish Alpaca reference price before submitting a market bracket.
+    This prevents stale candle signals from creating invalid TP/SL brackets.
+    """
+    try:
+        trade = alpaca_get(
+            f"/v2/stocks/{symbol}/trades/latest",
+            params={"feed": ALPACA_DATA_FEED},
+            data_api=True,
+        )
+        price = None
+        if isinstance(trade, dict):
+            price = trade.get("trade", {}).get("p")
+
+        if price is not None:
+            return float(price)
+
+        quote = alpaca_get(
+            f"/v2/stocks/{symbol}/quotes/latest",
+            params={"feed": ALPACA_DATA_FEED},
+            data_api=True,
+        )
+        if isinstance(quote, dict):
+            q = quote.get("quote", {})
+            bid = q.get("bp")
+            ask = q.get("ap")
+            if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+                return (float(bid) + float(ask)) / 2
+            if ask is not None and float(ask) > 0:
+                return float(ask)
+            if bid is not None and float(bid) > 0:
+                return float(bid)
+
+    except Exception as e:
+        print(f"{symbol} latest price error:", e)
+
+    return None
+
+
 # ============================================================
 # DATA
 # ============================================================
 
 def bars_to_df(symbol: str, timeframe: str, limit: int = 400) -> pd.DataFrame:
+    """
+    Fetch recent Alpaca bars safely.
+
+    Important fix:
+    The old version asked for 10 days of bars with sort='asc' and limit=400.
+    Alpaca can return the FIRST 400 bars from that window, not the newest 400.
+    That made signals use stale prices and caused bracket-order rejections.
+
+    This version requests a larger window/limit, then keeps the newest rows.
+    """
     cache_key = (symbol, timeframe, limit, now_ny().strftime("%Y-%m-%d %H:%M"))
     if cache_key in _BAR_CACHE:
         return _BAR_CACHE[cache_key].copy()
 
     end = now_ny()
-    start = end - timedelta(days=10)
+
+    if timeframe == "5Min":
+        start = end - timedelta(days=8)
+    elif timeframe == "15Min":
+        start = end - timedelta(days=25)
+    else:
+        start = end - timedelta(days=30)
+
+    request_limit = max(1000, min(10000, limit * 5))
+
     params = {
         "symbols": symbol,
         "timeframe": timeframe,
         "start": iso_utc(start),
         "end": iso_utc(end),
-        "limit": limit,
+        "limit": request_limit,
         "adjustment": "raw",
         "feed": ALPACA_DATA_FEED,
         "sort": "asc",
@@ -306,10 +368,27 @@ def bars_to_df(symbol: str, timeframe: str, limit: int = 400) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df.dropna(inplace=True)
-    df = df[needed].reset_index(drop=True)
+    df = df[needed].sort_values("time").tail(limit).reset_index(drop=True)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Freshness guard. During market hours, stale bars are dangerous.
+    last_bar_time = df.iloc[-1]["time"]
+    age_minutes = (now_ny() - last_bar_time).total_seconds() / 60
+
+    if timeframe == "5Min" and in_window(now_ny(), MARKET_OPEN, MARKET_CLOSE):
+        if age_minutes > MAX_DATA_STALE_MINUTES_5M:
+            print(f"{symbol} {timeframe} stale data blocked. Last bar {last_bar_time}, age {age_minutes:.1f} min")
+            return pd.DataFrame()
+
+    if timeframe == "15Min" and in_window(now_ny(), MARKET_OPEN, MARKET_CLOSE):
+        if age_minutes > MAX_DATA_STALE_MINUTES_15M:
+            print(f"{symbol} {timeframe} stale data blocked. Last bar {last_bar_time}, age {age_minutes:.1f} min")
+            return pd.DataFrame()
+
     _BAR_CACHE[cache_key] = df.copy()
     return df
-
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < EMA_SLOW + 5:
@@ -891,6 +970,62 @@ def round_price(x: float) -> float:
 
 def submit_bracket_order(signal: dict):
     symbol = signal["symbol"]
+    side = signal["side"]
+
+    original_entry_ref = float(signal["price"])
+    live_price = get_latest_price(symbol)
+
+    if live_price is None or live_price <= 0:
+        return {
+            "ok": False,
+            "reason": "could not get latest Alpaca price before order submit",
+            "dry_run": False,
+            "qty": 0,
+        }
+
+    drift = abs(live_price - original_entry_ref) / max(original_entry_ref, 1e-9)
+
+    if drift > MAX_ENTRY_DRIFT_PCT:
+        return {
+            "ok": False,
+            "reason": (
+                f"live price drift too large. Signal entry_ref=${original_entry_ref:.2f}, "
+                f"latest Alpaca price=${live_price:.2f}, drift={drift:.2%}. "
+                f"Order blocked to prevent stale-data bracket rejection."
+            ),
+            "dry_run": False,
+            "qty": 0,
+        }
+
+    # Re-anchor the bracket around the latest Alpaca price.
+    # This stops Alpaca rejecting take_profit/stop_loss because its base_price
+    # differs slightly from the candle close.
+    signal["price"] = float(live_price)
+
+    sl = float(signal["sl"])
+
+    if side == "buy":
+        risk = live_price - sl
+        if risk <= 0:
+            return {
+                "ok": False,
+                "reason": f"invalid buy risk after live price check: live=${live_price:.2f}, sl=${sl:.2f}",
+                "dry_run": False,
+                "qty": 0,
+            }
+        signal["tp"] = live_price + risk * RR_TARGET
+
+    elif side == "sell":
+        risk = sl - live_price
+        if risk <= 0:
+            return {
+                "ok": False,
+                "reason": f"invalid sell risk after live price check: live=${live_price:.2f}, sl=${sl:.2f}",
+                "dry_run": False,
+                "qty": 0,
+            }
+        signal["tp"] = live_price - risk * RR_TARGET
+
     qty = calculate_qty(signal)
 
     if qty <= 0:
@@ -901,29 +1036,26 @@ def submit_bracket_order(signal: dict):
             "qty": 0,
         }
 
-    side = signal["side"]
     entry_ref = float(signal["price"])
     sl = round_price(signal["sl"])
     tp = round_price(signal["tp"])
 
-    # Safety check before sending bracket order.
-    # For a buy: TP must be above entry ref and SL below entry ref.
-    # For a sell/short: TP must be below entry ref and SL above entry ref.
-    if side == "buy" and not (tp > entry_ref and sl < entry_ref):
-        return {
-            "ok": False,
-            "reason": f"invalid buy bracket prices: entry_ref={entry_ref:.2f}, tp={tp:.2f}, sl={sl:.2f}",
-            "dry_run": False,
-            "qty": qty,
-        }
+    # Alpaca market bracket validation uses its own base_price.
+    # Keep TP/SL safely on the correct side of live reference.
+    if side == "buy":
+        min_tp = round_price(entry_ref + 0.02)
+        max_sl = round_price(entry_ref - 0.02)
+        tp = max(tp, min_tp)
+        sl = min(sl, max_sl)
 
-    if side == "sell" and not (tp < entry_ref and sl > entry_ref):
-        return {
-            "ok": False,
-            "reason": f"invalid sell bracket prices: entry_ref={entry_ref:.2f}, tp={tp:.2f}, sl={sl:.2f}",
-            "dry_run": False,
-            "qty": qty,
-        }
+    if side == "sell":
+        max_tp = round_price(entry_ref - 0.02)
+        min_sl = round_price(entry_ref + 0.02)
+        tp = min(tp, max_tp)
+        sl = max(sl, min_sl)
+
+    signal["sl"] = sl
+    signal["tp"] = tp
 
     if not EXECUTE_ORDERS:
         return {"ok": True, "dry_run": True, "qty": qty, "id": "DRY_RUN"}
@@ -962,7 +1094,6 @@ def submit_bracket_order(signal: dict):
         "qty": qty,
         "payload": payload,
     }
-
 
 def handle_signal(signal: dict):
     symbol = signal["symbol"]
@@ -1104,7 +1235,8 @@ def startup_check():
         f"Volume mult: {MIN_VOLUME_MULT}\n"
         f"RR target: {RR_TARGET}\n"
         f"Max trades/day: {MAX_TRADES_PER_DAY}\n"
-        f"One position at a time: {ONE_POSITION_AT_A_TIME}"
+        f"One position at a time: {ONE_POSITION_AT_A_TIME}\n"
+        f"Max entry drift pct: {MAX_ENTRY_DRIFT_PCT:.2%}"
     )
     return True
 
@@ -1156,22 +1288,33 @@ def run():
 
                 orders_sent = 0
                 used_symbols = set()
+                attempted_symbols = set()
 
                 for signal in ranked:
                     if orders_sent >= MAX_NEW_ORDERS_PER_SCAN:
                         break
                     if BOT_STATE["TRADES_TODAY"] >= MAX_TRADES_PER_DAY:
                         break
-                    if signal["symbol"] in used_symbols:
+
+                    symbol = signal["symbol"]
+
+                    # Only attempt one model per symbol each scan.
+                    # This prevents TREND_PULLBACK and EMA_RECLAIM firing duplicate rejected orders
+                    # for the same stale/live-price issue.
+                    if symbol in attempted_symbols:
                         continue
-                    if STATE[signal["symbol"]]["TRADED_TODAY"]:
+                    attempted_symbols.add(symbol)
+
+                    if symbol in used_symbols:
                         continue
-                    if has_position(signal["symbol"]) or has_open_order(signal["symbol"]):
+                    if STATE[symbol]["TRADED_TODAY"]:
+                        continue
+                    if has_position(symbol) or has_open_order(symbol):
                         continue
 
                     ok = handle_signal(signal)
                     if ok:
-                        used_symbols.add(signal["symbol"])
+                        used_symbols.add(symbol)
                         orders_sent += 1
 
             check_order_updates()
