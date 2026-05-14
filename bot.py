@@ -51,6 +51,7 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.005"))
 MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.12"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
 MAX_NEW_ORDERS_PER_SCAN = int(os.getenv("MAX_NEW_ORDERS_PER_SCAN", "1"))
+ONE_POSITION_AT_A_TIME = os.getenv("ONE_POSITION_AT_A_TIME", "false").lower() in ["1", "true", "yes", "y"]
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "false").lower() in ["1", "true", "yes", "y"]
 
 RR_TARGET = float(os.getenv("RR_TARGET", "1.6"))
@@ -202,13 +203,30 @@ def alpaca_get(path: str, params=None, data_api=False):
 def alpaca_post(path: str, payload: dict):
     try:
         r = requests.post(f"{ALPACA_TRADE_BASE}{path}", headers=HEADERS, json=payload, timeout=20)
+
         if r.status_code >= 400:
-            print("ALPACA POST ERROR:", r.status_code, r.text[:400])
-            return None
-        return r.json()
+            error_text = r.text[:1000]
+            print("ALPACA POST ERROR:", r.status_code, error_text)
+            return {
+                "_ok": False,
+                "_status_code": r.status_code,
+                "_error": error_text,
+                "_payload": payload,
+            }
+
+        data = r.json()
+        if isinstance(data, dict):
+            data["_ok"] = True
+        return data
+
     except Exception as e:
         print("ALPACA POST EXCEPTION:", e)
-        return None
+        return {
+            "_ok": False,
+            "_status_code": "EXCEPTION",
+            "_error": str(e),
+            "_payload": payload,
+        }
 
 
 def get_account():
@@ -876,7 +894,36 @@ def submit_bracket_order(signal: dict):
     qty = calculate_qty(signal)
 
     if qty <= 0:
-        return {"ok": False, "reason": "qty calculated as 0", "dry_run": False, "qty": 0}
+        return {
+            "ok": False,
+            "reason": "qty calculated as 0. This usually means risk per share is too large, buying power is too low, or position cap is too small.",
+            "dry_run": False,
+            "qty": 0,
+        }
+
+    side = signal["side"]
+    entry_ref = float(signal["price"])
+    sl = round_price(signal["sl"])
+    tp = round_price(signal["tp"])
+
+    # Safety check before sending bracket order.
+    # For a buy: TP must be above entry ref and SL below entry ref.
+    # For a sell/short: TP must be below entry ref and SL above entry ref.
+    if side == "buy" and not (tp > entry_ref and sl < entry_ref):
+        return {
+            "ok": False,
+            "reason": f"invalid buy bracket prices: entry_ref={entry_ref:.2f}, tp={tp:.2f}, sl={sl:.2f}",
+            "dry_run": False,
+            "qty": qty,
+        }
+
+    if side == "sell" and not (tp < entry_ref and sl > entry_ref):
+        return {
+            "ok": False,
+            "reason": f"invalid sell bracket prices: entry_ref={entry_ref:.2f}, tp={tp:.2f}, sl={sl:.2f}",
+            "dry_run": False,
+            "qty": qty,
+        }
 
     if not EXECUTE_ORDERS:
         return {"ok": True, "dry_run": True, "qty": qty, "id": "DRY_RUN"}
@@ -884,19 +931,37 @@ def submit_bracket_order(signal: dict):
     payload = {
         "symbol": symbol,
         "qty": str(qty),
-        "side": signal["side"],
+        "side": side,
         "type": "market",
         "time_in_force": "day",
         "order_class": "bracket",
-        "take_profit": {"limit_price": str(round_price(signal["tp"]))},
-        "stop_loss": {"stop_price": str(round_price(signal["sl"]))},
+        "take_profit": {"limit_price": str(tp)},
+        "stop_loss": {"stop_price": str(sl)},
     }
 
     result = alpaca_post("/v2/orders", payload)
+
+    if isinstance(result, dict) and result.get("_ok") is False:
+        status = result.get("_status_code", "unknown")
+        error = result.get("_error", "unknown error")
+        return {
+            "ok": False,
+            "reason": f"Alpaca rejected order. Status: {status}. Error: {error}",
+            "dry_run": False,
+            "qty": qty,
+            "payload": payload,
+        }
+
     if result:
         return {"ok": True, "dry_run": False, "qty": qty, "id": result.get("id", "UNKNOWN"), "raw": result}
 
-    return {"ok": False, "reason": "alpaca order rejected or request failed", "dry_run": False, "qty": qty}
+    return {
+        "ok": False,
+        "reason": "Alpaca order rejected or request failed, but no error body was returned.",
+        "dry_run": False,
+        "qty": qty,
+        "payload": payload,
+    }
 
 
 def handle_signal(signal: dict):
@@ -904,7 +969,18 @@ def handle_signal(signal: dict):
     result = submit_bracket_order(signal)
 
     if not result["ok"]:
-        send_once(f"{BOT_STATE['DATE']}:{symbol}:ORDER_FAIL", f"{E_WARN} {symbol} ORDER FAILED\n\nReason: {result['reason']}")
+        send_once(
+            f"{BOT_STATE['DATE']}:{symbol}:ORDER_FAIL:{int(time.time())}",
+            f"{E_WARN} {symbol} ORDER FAILED\n\n"
+            f"Model: {signal.get('model', 'UNKNOWN')}\n"
+            f"Direction: {signal.get('direction', 'UNKNOWN')}\n"
+            f"Score: {signal.get('score', 'UNKNOWN')}\n"
+            f"Qty attempted: {result.get('qty', 'UNKNOWN')}\n"
+            f"Entry ref: ${float(signal.get('price', 0)):.2f}\n"
+            f"SL: ${float(signal.get('sl', 0)):.2f}\n"
+            f"TP: ${float(signal.get('tp', 0)):.2f}\n\n"
+            f"Reason: {result['reason']}"
+        )
         return False
 
     STATE[symbol]["TRADED_TODAY"] = True
@@ -1027,7 +1103,8 @@ def startup_check():
         f"Min ATR pct: {MIN_ATR_PCT}\n"
         f"Volume mult: {MIN_VOLUME_MULT}\n"
         f"RR target: {RR_TARGET}\n"
-        f"Max trades/day: {MAX_TRADES_PER_DAY}"
+        f"Max trades/day: {MAX_TRADES_PER_DAY}\n"
+        f"One position at a time: {ONE_POSITION_AT_A_TIME}"
     )
     return True
 
@@ -1067,6 +1144,13 @@ def run():
                 time.sleep(0.25)
 
             if all_candidates and BOT_STATE["TRADES_TODAY"] < MAX_TRADES_PER_DAY:
+                if ONE_POSITION_AT_A_TIME and len(get_positions()) > 0:
+                    print("ONE_POSITION_AT_A_TIME enabled: skipping new entries while a position is open.")
+                    check_order_updates()
+                    end_of_day_summary()
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+
                 ranked = sorted(all_candidates, key=lambda x: x["score"], reverse=True)
                 ranked = [r for r in ranked if r["score"] >= MIN_SCORE_TO_TRADE]
 
