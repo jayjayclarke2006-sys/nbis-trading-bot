@@ -16,6 +16,7 @@ from ta.volatility import AverageTrueRange
 # - multi-setup scan
 # - ranked best-candidate selection
 # - soft edge weighting only (boost-only)
+# - market regime detection + soft regime scoring
 # - Telegram signals only
 # - tuned to fire more often
 # ============================================================
@@ -29,6 +30,18 @@ LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() in ["1", "true", "yes", "y"]
 TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "2"))
 MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "54"))
+
+# Market regime detection.
+# Default is SOFT scoring, not hard blocking.
+USE_REGIME_DETECTION = os.getenv("USE_REGIME_DETECTION", "true").lower() in ["1", "true", "yes", "y"]
+REGIME_BLOCK_CONFLICTS = os.getenv("REGIME_BLOCK_CONFLICTS", "false").lower() in ["1", "true", "yes", "y"]
+REGIME_TREND_ADX = float(os.getenv("REGIME_TREND_ADX", "18"))
+REGIME_CHOP_ADX = float(os.getenv("REGIME_CHOP_ADX", "10"))
+REGIME_VOL_LOOKBACK = int(os.getenv("REGIME_VOL_LOOKBACK", "100"))
+REGIME_HIGH_VOL_MULT = float(os.getenv("REGIME_HIGH_VOL_MULT", "1.30"))
+REGIME_LOW_VOL_MULT = float(os.getenv("REGIME_LOW_VOL_MULT", "0.70"))
+REGIME_RANGE_WINDOW = int(os.getenv("REGIME_RANGE_WINDOW", "24"))
+REGIME_RANGE_ATR_MULT = float(os.getenv("REGIME_RANGE_ATR_MULT", "3.00"))
 
 MARKETS = ["BTC", "GOLD"]
 
@@ -284,6 +297,7 @@ def add_indicators(df):
     out["rsi"] = RSIIndicator(out["close"], 14).rsi()
     out["adx"] = ADXIndicator(out["high"], out["low"], out["close"], 14).adx()
     out["atr"] = AverageTrueRange(out["high"], out["low"], out["close"], 14).average_true_range()
+    out["atr_pct"] = out["atr"] / out["close"]
     out["avg_volume"] = out["volume"].rolling(30).mean()
     out["body"] = (out["close"] - out["open"]).abs()
     out["range"] = out["high"] - out["low"]
@@ -496,6 +510,213 @@ def edge_adjustment(signal, row):
     signal["edge_note"] = f"expR={expectancy_r:.2f}, wr={win_rate:.1%}, n={trades}"
     return signal
 
+
+
+# ============================================================
+# MARKET REGIME DETECTION
+# ============================================================
+
+def detect_market_regime(df, i, row):
+    """
+    Detects the current market regime for the active market/timeframe stack.
+
+    It does NOT predict the future. It classifies the current structure so
+    the bot can favor the setup type that fits the environment.
+    """
+    if not USE_REGIME_DETECTION:
+        return {
+            "name": "REGIME_OFF",
+            "score_bias": 0,
+            "note": "regime detection disabled",
+        }
+
+    ltf = entry_trend(row)
+    ctf = confirm_trend(row)
+    btf = bias_trend(row)
+
+    adx = float(row.get("adx", 0))
+    close = float(row.get("close", 0))
+    open_ = float(row.get("open", 0))
+    atr = float(row.get("atr", 0))
+
+    if atr <= 0 or i < max(REGIME_RANGE_WINDOW, 30):
+        return {
+            "name": "UNKNOWN",
+            "score_bias": 0,
+            "note": "not enough data",
+        }
+
+    vol_start = max(0, i - REGIME_VOL_LOOKBACK)
+    atr_med = float(df["atr"].iloc[vol_start:i].median())
+    atr_ratio = atr / atr_med if atr_med > 0 else 1.0
+
+    range_width = recent_range_width(df, i, REGIME_RANGE_WINDOW)
+    range_atr = range_width / atr if range_width is not None and atr > 0 else 999.0
+
+    high_level = breakout_level_high(df, i, REGIME_RANGE_WINDOW)
+    low_level = breakout_level_low(df, i, REGIME_RANGE_WINDOW)
+
+    body = abs(close - open_)
+    candle_range = float(row["high"] - row["low"]) if "high" in row.index and "low" in row.index else 0.0
+    displacement = candle_range > atr * 1.10 and body >= candle_range * 0.50 if candle_range > 0 else False
+
+    broke_up = high_level is not None and close > high_level
+    broke_down = low_level is not None and close < low_level
+
+    trend_bull = ltf == "BULLISH" and ctf in ["BULLISH", "NEUTRAL"] and btf in ["BULLISH", "NEUTRAL"]
+    trend_bear = ltf == "BEARISH" and ctf in ["BEARISH", "NEUTRAL"] and btf in ["BEARISH", "NEUTRAL"]
+
+    strong_bull = ltf == "BULLISH" and ctf == "BULLISH" and btf == "BULLISH"
+    strong_bear = ltf == "BEARISH" and ctf == "BEARISH" and btf == "BEARISH"
+
+    if atr_ratio >= REGIME_HIGH_VOL_MULT and displacement and broke_up:
+        return {
+            "name": "HIGH_VOL_BREAKOUT_BULL",
+            "score_bias": 8,
+            "note": f"high vol bull breakout | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if atr_ratio >= REGIME_HIGH_VOL_MULT and displacement and broke_down:
+        return {
+            "name": "HIGH_VOL_BREAKOUT_BEAR",
+            "score_bias": 8,
+            "note": f"high vol bear breakout | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if strong_bull and adx >= REGIME_TREND_ADX:
+        return {
+            "name": "STRONG_BULL_TREND",
+            "score_bias": 7,
+            "note": f"all TF bullish | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if strong_bear and adx >= REGIME_TREND_ADX:
+        return {
+            "name": "STRONG_BEAR_TREND",
+            "score_bias": 7,
+            "note": f"all TF bearish | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if trend_bull and adx >= REGIME_TREND_ADX:
+        return {
+            "name": "BULL_TREND",
+            "score_bias": 5,
+            "note": f"bull trend | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if trend_bear and adx >= REGIME_TREND_ADX:
+        return {
+            "name": "BEAR_TREND",
+            "score_bias": 5,
+            "note": f"bear trend | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if atr_ratio <= REGIME_LOW_VOL_MULT:
+        return {
+            "name": "LOW_VOL_COMPRESSION",
+            "score_bias": 2,
+            "note": f"low vol compression | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if adx <= REGIME_CHOP_ADX and range_atr <= REGIME_RANGE_ATR_MULT:
+        return {
+            "name": "CHOP_RANGE",
+            "score_bias": -2,
+            "note": f"chop/range | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    if range_atr <= REGIME_RANGE_ATR_MULT:
+        return {
+            "name": "RANGE",
+            "score_bias": 1,
+            "note": f"range | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+        }
+
+    return {
+        "name": "MIXED",
+        "score_bias": 0,
+        "note": f"mixed | adx={adx:.1f}, atr_ratio={atr_ratio:.2f}, range_atr={range_atr:.2f}",
+    }
+
+
+def apply_regime_adjustment(signal, regime):
+    """
+    Soft regime-based scoring. This makes the bot favor the setups that fit
+    the market environment without killing trade frequency.
+
+    REGIME_BLOCK_CONFLICTS can be enabled, but it is false by default.
+    """
+    if not USE_REGIME_DETECTION:
+        signal["regime"] = "REGIME_OFF"
+        signal["regime_note"] = "regime detection disabled"
+        return signal
+
+    name = regime.get("name", "UNKNOWN")
+    model = signal.get("model", "")
+    direction = signal.get("direction", "")
+
+    adj = 0
+    blocked = False
+
+    trend_models = ["BREAKOUT_CONTINUATION", "PULLBACK_CONTINUATION", "BREAKOUT_RETEST_REJECTION", "EMA_RECLAIM"]
+    reversal_models = ["LIQUIDITY_SWEEP_REVERSAL", "RANGE_REJECTION"]
+    compression_models = ["COMPRESSION_BREAKOUT"]
+
+    if name in ["STRONG_BULL_TREND", "BULL_TREND"]:
+        if direction == "LONG" and model in trend_models:
+            adj += 8
+        elif direction == "LONG" and model in reversal_models:
+            adj += 3
+        elif direction == "SHORT":
+            adj -= 6
+            blocked = REGIME_BLOCK_CONFLICTS and name == "STRONG_BULL_TREND"
+
+    elif name in ["STRONG_BEAR_TREND", "BEAR_TREND"]:
+        if direction == "SHORT" and model in trend_models:
+            adj += 8
+        elif direction == "SHORT" and model in reversal_models:
+            adj += 3
+        elif direction == "LONG":
+            adj -= 6
+            blocked = REGIME_BLOCK_CONFLICTS and name == "STRONG_BEAR_TREND"
+
+    elif name == "HIGH_VOL_BREAKOUT_BULL":
+        if direction == "LONG" and model in ["BREAKOUT_CONTINUATION", "BREAKOUT_RETEST_REJECTION", "EMA_RECLAIM"]:
+            adj += 10
+        elif direction == "SHORT":
+            adj -= 5
+
+    elif name == "HIGH_VOL_BREAKOUT_BEAR":
+        if direction == "SHORT" and model in ["BREAKOUT_CONTINUATION", "BREAKOUT_RETEST_REJECTION", "EMA_RECLAIM"]:
+            adj += 10
+        elif direction == "LONG":
+            adj -= 5
+
+    elif name in ["RANGE", "CHOP_RANGE"]:
+        if model in reversal_models:
+            adj += 8
+        elif model in compression_models:
+            adj += 4
+        elif model == "BREAKOUT_CONTINUATION":
+            adj -= 4
+
+    elif name == "LOW_VOL_COMPRESSION":
+        if model in compression_models:
+            adj += 8
+        elif model in reversal_models:
+            adj += 3
+        else:
+            adj -= 2
+
+    # Mild global regime bias
+    adj += float(regime.get("score_bias", 0)) * 0.25
+
+    signal["score"] = round(float(signal["score"]) + adj, 1)
+    signal["regime"] = name
+    signal["regime_note"] = regime.get("note", "")
+    signal["regime_adjustment"] = round(adj, 1)
+    signal["blocked_by_regime"] = blocked
+    return signal
 
 # ============================================================
 # MODELS
@@ -720,12 +941,14 @@ def scan_setup_market(market, setup):
 
     i = len(df) - 2
     row = df.iloc[i]
+    regime = detect_market_regime(df, i, row)
 
     print(
         f"{market} {setup['name']} | "
         f"{setup['entry_tf']}/{setup['confirm_tf']}/{setup['bias_tf']} | "
         f"LTF={entry_trend(row)} CTF={confirm_trend(row)} BTF={bias_trend(row)} | "
-        f"RSI={row['rsi']:.2f} ADX={row['adx']:.2f}"
+        f"RSI={row['rsi']:.2f} ADX={row['adx']:.2f} | "
+        f"REGIME={regime['name']}"
     )
 
     candidates = []
@@ -745,10 +968,20 @@ def scan_setup_market(market, setup):
         c["time"] = str(df.iloc[i]["timestamp"])
         c["rr"] = round(abs(c["target"] - c["entry"]) / max(abs(c["entry"] - c["stop"]), 1e-9), 2)
         c = edge_adjustment(c, row)
+        c = apply_regime_adjustment(c, regime)
+
+        if c.get("blocked_by_regime", False):
+            print(
+                f"{market} {setup['name']} {c['model']} {c['direction']} "
+                f"blocked_by_regime={c.get('regime')} score={c['score']}"
+            )
+            continue
+
         out.append(c)
         print(
             f"{market} {setup['name']} {c['model']} {c['direction']} "
-            f"score={c['score']} edge={c.get('edge_note', 'none')}"
+            f"score={c['score']} edge={c.get('edge_note', 'none')} "
+            f"regime={c.get('regime', 'none')} reg_adj={c.get('regime_adjustment', 0)}"
         )
 
     return out
@@ -780,6 +1013,8 @@ def format_signal(signal):
         f"Setup: {signal['setup_name']} ({signal['entry_tf']} / {signal['confirm_tf']} / {signal['bias_tf']})\n"
         f"Reason: {signal['reason']}\n"
         f"Edge: {signal.get('edge_note', 'no_profile')}\n"
+        f"Regime: {signal.get('regime', 'unknown')}\n"
+        f"Regime adj: {signal.get('regime_adjustment', 0)}\n"
         f"Time: {signal['time']}"
     )
 
@@ -816,6 +1051,7 @@ def run():
         "- compression breakout\n"
         "- EMA reclaim\n\n"
         "Soft edge weighting only.\n"
+        "Market regime detection enabled.\n"
         "Swing disabled by default.\n\n"
         "Enabled setups:\n" +
         "\n".join(f"- {s['name']}: {s['entry_tf']} / {s['confirm_tf']} / {s['bias_tf']}" for s in enabled_setups) +
