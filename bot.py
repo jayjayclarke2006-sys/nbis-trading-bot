@@ -52,6 +52,9 @@ MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.12"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "4"))
 MAX_NEW_ORDERS_PER_SCAN = int(os.getenv("MAX_NEW_ORDERS_PER_SCAN", "1"))
 ONE_POSITION_AT_A_TIME = os.getenv("ONE_POSITION_AT_A_TIME", "false").lower() in ["1", "true", "yes", "y"]
+PROTECT_UNCOVERED_POSITIONS = os.getenv("PROTECT_UNCOVERED_POSITIONS", "true").lower() in ["1", "true", "yes", "y"]
+AUTO_CLOSE_UNPROTECTED_PAPER = os.getenv("AUTO_CLOSE_UNPROTECTED_PAPER", "true").lower() in ["1", "true", "yes", "y"]
+AUTO_CLOSE_UNPROTECTED_LIVE = os.getenv("AUTO_CLOSE_UNPROTECTED_LIVE", "false").lower() in ["1", "true", "yes", "y"]
 MAX_ENTRY_DRIFT_PCT = float(os.getenv("MAX_ENTRY_DRIFT_PCT", "0.0075"))
 MAX_DATA_STALE_MINUTES_5M = int(os.getenv("MAX_DATA_STALE_MINUTES_5M", "20"))
 MAX_DATA_STALE_MINUTES_15M = int(os.getenv("MAX_DATA_STALE_MINUTES_15M", "45"))
@@ -231,6 +234,41 @@ def alpaca_post(path: str, payload: dict):
             "_payload": payload,
         }
 
+
+
+def alpaca_delete(path: str):
+    try:
+        r = requests.delete(f"{ALPACA_TRADE_BASE}{path}", headers=HEADERS, timeout=20)
+
+        if r.status_code >= 400:
+            error_text = r.text[:1000]
+            print("ALPACA DELETE ERROR:", r.status_code, error_text)
+            return {
+                "_ok": False,
+                "_status_code": r.status_code,
+                "_error": error_text,
+            }
+
+        try:
+            data = r.json()
+        except Exception:
+            data = {}
+
+        if isinstance(data, dict):
+            data["_ok"] = True
+        return data
+
+    except Exception as e:
+        print("ALPACA DELETE EXCEPTION:", e)
+        return {
+            "_ok": False,
+            "_status_code": "EXCEPTION",
+            "_error": str(e),
+        }
+
+
+def close_position_market(symbol: str):
+    return alpaca_delete(f"/v2/positions/{symbol}")
 
 def get_account():
     return alpaca_get("/v2/account")
@@ -1165,6 +1203,105 @@ def check_order_updates():
         s["ORDER_STATUS_NOTIFIED"] = status
 
 
+
+def is_exit_order_for_position(order, symbol: str, qty: float) -> bool:
+    if order.get("symbol") != symbol:
+        return False
+
+    status = order.get("status")
+    if status not in ["new", "accepted", "pending_new", "held", "partially_filled"]:
+        return False
+
+    side = order.get("side")
+
+    # Long positions need sell exits.
+    if qty > 0 and side != "sell":
+        return False
+
+    # Short positions need buy exits.
+    if qty < 0 and side != "buy":
+        return False
+
+    return True
+
+
+def protect_uncovered_positions():
+    if not PROTECT_UNCOVERED_POSITIONS:
+        return
+
+    positions = get_positions()
+    if not positions:
+        return
+
+    open_orders = get_open_orders()
+
+    for p in positions:
+        symbol = p.get("symbol")
+        if not symbol:
+            continue
+
+        try:
+            qty = float(p.get("qty", 0))
+            avg_entry = float(p.get("avg_entry_price", 0))
+            market_value = float(p.get("market_value", 0))
+            unrealized_pl = float(p.get("unrealized_pl", 0))
+        except Exception:
+            qty = 0
+            avg_entry = 0
+            market_value = 0
+            unrealized_pl = 0
+
+        if qty == 0:
+            continue
+
+        exits = [o for o in open_orders if is_exit_order_for_position(o, symbol, qty)]
+
+        if exits:
+            if symbol in STATE:
+                STATE[symbol]["LAST_REASON"] = "POSITION_PROTECTED"
+            continue
+
+        direction = "LONG" if qty > 0 else "SHORT"
+
+        send_once(
+            f"{BOT_STATE['DATE']}:{symbol}:UNPROTECTED_POSITION",
+            f"{E_WARN} UNPROTECTED POSITION FOUND\n\n"
+            f"Symbol: {symbol}\n"
+            f"Direction: {direction}\n"
+            f"Qty: {qty}\n"
+            f"Avg entry: ${avg_entry:.2f}\n"
+            f"Market value: ${market_value:.2f}\n"
+            f"Unrealized P/L: ${unrealized_pl:.2f}\n\n"
+            f"No open TP/SL exit orders were found."
+        )
+
+        should_auto_close = (
+            (ALPACA_PAPER and AUTO_CLOSE_UNPROTECTED_PAPER)
+            or ((not ALPACA_PAPER) and AUTO_CLOSE_UNPROTECTED_LIVE)
+        )
+
+        if not should_auto_close:
+            continue
+
+        result = close_position_market(symbol)
+
+        if isinstance(result, dict) and result.get("_ok") is False:
+            send_once(
+                f"{BOT_STATE['DATE']}:{symbol}:AUTO_CLOSE_FAILED",
+                f"{E_WARN} AUTO-CLOSE FAILED\n\n"
+                f"Symbol: {symbol}\n"
+                f"Reason: {result.get('_error', 'unknown')}"
+            )
+        else:
+            send_once(
+                f"{BOT_STATE['DATE']}:{symbol}:AUTO_CLOSED_UNPROTECTED",
+                f"{E_CROSS} AUTO-CLOSED UNPROTECTED POSITION\n\n"
+                f"Symbol: {symbol}\n"
+                f"Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}\n"
+                f"Reason: no open TP/SL exit orders found."
+            )
+
+
 def end_of_day_summary():
     t = now_ny()
     if minute_of_day(t) < to_minutes(EOD_SUMMARY_TIME):
@@ -1236,7 +1373,9 @@ def startup_check():
         f"RR target: {RR_TARGET}\n"
         f"Max trades/day: {MAX_TRADES_PER_DAY}\n"
         f"One position at a time: {ONE_POSITION_AT_A_TIME}\n"
-        f"Max entry drift pct: {MAX_ENTRY_DRIFT_PCT:.2%}"
+        f"Max entry drift pct: {MAX_ENTRY_DRIFT_PCT:.2%}\n"
+        f"Protect uncovered positions: {PROTECT_UNCOVERED_POSITIONS}\n"
+        f"Auto-close unprotected paper: {AUTO_CLOSE_UNPROTECTED_PAPER}"
     )
     return True
 
@@ -1253,6 +1392,7 @@ def run():
     while True:
         try:
             reset_daily_state()
+            protect_uncovered_positions()
             t = now_ny()
 
             if not in_window(t, MARKET_OPEN, MARKET_CLOSE):
