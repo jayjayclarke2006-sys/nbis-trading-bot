@@ -33,6 +33,15 @@ MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "54"))
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "30"))
 SAME_DIRECTION_COOLDOWN = os.getenv("SAME_DIRECTION_COOLDOWN", "true").lower() in ["1", "true", "yes", "y"]
 
+# Signal result tracking.
+# This tracks the alerts as virtual trades because this BTC/gold bot sends signals only.
+TRACK_SIGNAL_RESULTS = os.getenv("TRACK_SIGNAL_RESULTS", "true").lower() in ["1", "true", "yes", "y"]
+TRADE_STATE_FILE = os.getenv("CRYPTO_GOLD_TRADE_STATE_FILE", "crypto_gold_signal_trade_state.json")
+SIGNAL_RISK_CASH = float(os.getenv("SIGNAL_RISK_CASH", "100"))
+TP_SL_CHECK_TIMEFRAME = os.getenv("TP_SL_CHECK_TIMEFRAME", "5m")
+CONSERVATIVE_SAME_CANDLE_EXIT = os.getenv("CONSERVATIVE_SAME_CANDLE_EXIT", "true").lower() in ["1", "true", "yes", "y"]
+MAX_OPEN_SIGNAL_TRADES = int(os.getenv("MAX_OPEN_SIGNAL_TRADES", "10"))
+
 # Market regime detection.
 # Default is SOFT scoring, not hard blocking.
 USE_REGIME_DETECTION = os.getenv("USE_REGIME_DETECTION", "true").lower() in ["1", "true", "yes", "y"]
@@ -109,6 +118,12 @@ E_CHART = "\U0001F4CA"      # ð
 E_WEATHER = "\U0001F326\uFE0F"  # ð¦ï¸
 E_PLUS = "\u2795"           # â
 E_TIME = "\U0001F552"       # ð
+E_CHECK = "\u2705"          # â
+E_CROSS = "\u274C"          # â
+E_TROPHY = "\U0001F3C6"     # ð
+E_BAG = "\U0001F4B0"        # ð°
+E_BOOK = "\U0001F4D2"       # ð
+E_WARNING = "\u26A0\uFE0F" # â ï¸
 
 
 
@@ -1143,6 +1158,301 @@ def maybe_send_signal(signal):
 
 
 # ============================================================
+# SIGNAL TRADE RESULT TRACKER
+# ============================================================
+
+def utc_day_key():
+    return pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+
+
+def empty_daily_stats():
+    return {
+        "signals": 0,
+        "wins": 0,
+        "losses": 0,
+        "breakeven": 0,
+        "total_r": 0.0,
+        "total_points": 0.0,
+        "cash_pnl": 0.0,
+    }
+
+
+def load_trade_state():
+    state = load_json(TRADE_STATE_FILE, {})
+    today = utc_day_key()
+
+    if not isinstance(state, dict) or not state:
+        state = {
+            "date": today,
+            "open_trades": [],
+            "closed_trades": [],
+            "daily": empty_daily_stats(),
+        }
+
+    state.setdefault("open_trades", [])
+    state.setdefault("closed_trades", [])
+    state.setdefault("daily", empty_daily_stats())
+
+    if state.get("date") != today:
+        # Keep open trades across days, but reset the daily scoreboard.
+        state["date"] = today
+        state["daily"] = empty_daily_stats()
+
+    return state
+
+
+def save_trade_state(state):
+    # Keep history from growing forever.
+    state["closed_trades"] = state.get("closed_trades", [])[-300:]
+    save_json(TRADE_STATE_FILE, state)
+
+
+def trade_id_from_signal(signal):
+    return (
+        f"{signal['market']}|{signal['setup_name']}|{signal['model']}|"
+        f"{signal['direction']}|{signal['time']}|{signal['entry']}"
+    )
+
+
+def format_daily_scoreboard(daily):
+    wins = int(daily.get("wins", 0))
+    losses = int(daily.get("losses", 0))
+    signals = int(daily.get("signals", 0))
+    total_r = float(daily.get("total_r", 0.0))
+    points = float(daily.get("total_points", 0.0))
+    cash = float(daily.get("cash_pnl", 0.0))
+    return (
+        f"{E_BOOK} Today: {wins}W / {losses}L | Signals: {signals}\n"
+        f"{E_CHART} P/L: {total_r:+.2f}R | {points:+.2f} pts | ${cash:+.2f}"
+    )
+
+
+def register_signal_trade(signal):
+    if not TRACK_SIGNAL_RESULTS:
+        return
+
+    state = load_trade_state()
+    tid = trade_id_from_signal(signal)
+
+    for t in state.get("open_trades", []):
+        if t.get("id") == tid:
+            return
+
+    for t in state.get("closed_trades", []):
+        if t.get("id") == tid:
+            return
+
+    if len(state.get("open_trades", [])) >= MAX_OPEN_SIGNAL_TRADES:
+        print("Max open signal trades reached; signal not tracked:", tid)
+        return
+
+    trade = {
+        "id": tid,
+        "status": "OPEN",
+        "market": signal["market"],
+        "model": signal["model"],
+        "setup_name": signal["setup_name"],
+        "entry_tf": signal["entry_tf"],
+        "direction": signal["direction"],
+        "entry": float(signal["entry"]),
+        "stop": float(signal["stop"]),
+        "target": float(signal["target"]),
+        "rr": float(signal.get("rr", 0)),
+        "opened_at": str(signal["time"]),
+        "created_at_utc": pd.Timestamp.utcnow().isoformat(),
+        "reason": signal.get("reason", ""),
+        "score": float(signal.get("score", 0)),
+    }
+
+    state["open_trades"].append(trade)
+    state["daily"]["signals"] = int(state["daily"].get("signals", 0)) + 1
+    save_trade_state(state)
+
+
+def get_signal_monitor_df(market):
+    # 5m is used so TP/SL detection is faster even for 15m or 1h alerts.
+    df = fetch_market_tf(market, TP_SL_CHECK_TIMEFRAME)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+def evaluate_trade_exit(trade, df):
+    opened_at = pd.to_datetime(trade["opened_at"], utc=True)
+    after = df[df["timestamp"] > opened_at].copy()
+
+    if after.empty:
+        return None
+
+    direction = trade["direction"]
+    entry = float(trade["entry"])
+    stop = float(trade["stop"])
+    target = float(trade["target"])
+
+    for _, candle in after.iterrows():
+        high = float(candle["high"])
+        low = float(candle["low"])
+        ts = str(candle["timestamp"])
+
+        if direction == "LONG":
+            tp_hit = high >= target
+            sl_hit = low <= stop
+
+            if tp_hit and sl_hit:
+                if CONSERVATIVE_SAME_CANDLE_EXIT:
+                    return {"result": "SL", "exit_price": stop, "exit_time": ts, "same_candle": True}
+                return {"result": "TP", "exit_price": target, "exit_time": ts, "same_candle": True}
+
+            if sl_hit:
+                return {"result": "SL", "exit_price": stop, "exit_time": ts, "same_candle": False}
+            if tp_hit:
+                return {"result": "TP", "exit_price": target, "exit_time": ts, "same_candle": False}
+
+        else:
+            tp_hit = low <= target
+            sl_hit = high >= stop
+
+            if tp_hit and sl_hit:
+                if CONSERVATIVE_SAME_CANDLE_EXIT:
+                    return {"result": "SL", "exit_price": stop, "exit_time": ts, "same_candle": True}
+                return {"result": "TP", "exit_price": target, "exit_time": ts, "same_candle": True}
+
+            if sl_hit:
+                return {"result": "SL", "exit_price": stop, "exit_time": ts, "same_candle": False}
+            if tp_hit:
+                return {"result": "TP", "exit_price": target, "exit_time": ts, "same_candle": False}
+
+    return None
+
+
+def close_trade_result(trade, exit_info):
+    direction = trade["direction"]
+    entry = float(trade["entry"])
+    stop = float(trade["stop"])
+    target = float(trade["target"])
+    rr = float(trade.get("rr", 0))
+
+    if exit_info["result"] == "TP":
+        if rr <= 0:
+            if direction == "LONG":
+                rr = abs(target - entry) / max(abs(entry - stop), 1e-9)
+            else:
+                rr = abs(entry - target) / max(abs(stop - entry), 1e-9)
+        r_mult = rr
+        if direction == "LONG":
+            points = target - entry
+        else:
+            points = entry - target
+    else:
+        r_mult = -1.0
+        if direction == "LONG":
+            points = stop - entry
+        else:
+            points = entry - stop
+
+    cash_pnl = r_mult * SIGNAL_RISK_CASH
+
+    closed = dict(trade)
+    closed.update({
+        "status": exit_info["result"],
+        "exit_price": float(exit_info["exit_price"]),
+        "exit_time": exit_info["exit_time"],
+        "r_multiple": float(r_mult),
+        "points_pnl": float(points),
+        "cash_pnl": float(cash_pnl),
+        "same_candle": bool(exit_info.get("same_candle", False)),
+    })
+    return closed
+
+
+def format_trade_close_message(closed, daily):
+    win = closed["status"] == "TP"
+    icon = E_CHECK if win else E_CROSS
+    title = "TP HIT" if win else "SL HIT"
+    direction_icon = E_LONG if closed["direction"] == "LONG" else E_SHORT
+    same_candle_note = "\nâ ï¸ TP and SL touched in same candle. Counted conservatively." if closed.get("same_candle") else ""
+
+    return (
+        f"{icon} {closed['market']} {direction_icon} {title}\n\n"
+        f"Model: {closed['model']}\n"
+        f"Direction: {closed['direction']}\n"
+        f"Entry: {closed['entry']:.2f}\n"
+        f"Exit: {closed['exit_price']:.2f}\n"
+        f"SL: {closed['stop']:.2f}\n"
+        f"TP: {closed['target']:.2f}\n\n"
+        f"{E_BAG} Result: {closed['r_multiple']:+.2f}R | "
+        f"{closed['points_pnl']:+.2f} pts | ${closed['cash_pnl']:+.2f}"
+        f"{same_candle_note}\n\n"
+        f"{format_daily_scoreboard(daily)}\n"
+        f"{E_TIME} Closed: {closed['exit_time']}"
+    )
+
+
+def check_signal_trade_results():
+    if not TRACK_SIGNAL_RESULTS:
+        return
+
+    state = load_trade_state()
+    open_trades = state.get("open_trades", [])
+
+    if not open_trades:
+        return
+
+    dfs = {}
+    still_open = []
+    closed_now = []
+
+    for trade in open_trades:
+        market = trade["market"]
+        try:
+            if market not in dfs:
+                dfs[market] = get_signal_monitor_df(market)
+
+            df = dfs.get(market, pd.DataFrame())
+            if df.empty:
+                still_open.append(trade)
+                continue
+
+            exit_info = evaluate_trade_exit(trade, df)
+            if not exit_info:
+                still_open.append(trade)
+                continue
+
+            closed = close_trade_result(trade, exit_info)
+            closed_now.append(closed)
+
+        except Exception as e:
+            print(f"Trade tracking error for {market}:", e)
+            still_open.append(trade)
+
+    if not closed_now:
+        return
+
+    daily = state.get("daily", empty_daily_stats())
+
+    for closed in closed_now:
+        if closed["status"] == "TP":
+            daily["wins"] = int(daily.get("wins", 0)) + 1
+        elif closed["status"] == "SL":
+            daily["losses"] = int(daily.get("losses", 0)) + 1
+        else:
+            daily["breakeven"] = int(daily.get("breakeven", 0)) + 1
+
+        daily["total_r"] = float(daily.get("total_r", 0.0)) + float(closed["r_multiple"])
+        daily["total_points"] = float(daily.get("total_points", 0.0)) + float(closed["points_pnl"])
+        daily["cash_pnl"] = float(daily.get("cash_pnl", 0.0)) + float(closed["cash_pnl"])
+
+        state["closed_trades"].append(closed)
+        send_telegram(format_trade_close_message(closed, daily))
+
+    state["daily"] = daily
+    state["open_trades"] = still_open
+    save_trade_state(state)
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1166,12 +1476,13 @@ def run():
         "Swing disabled by default.\n\n"
         "Enabled setups:\n" +
         "\n".join(f"- {s['name']}: {s['entry_tf']} / {s['confirm_tf']} / {s['bias_tf']}" for s in enabled_setups) +
-        f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}\nCooldown: {SIGNAL_COOLDOWN_MINUTES} min"
+        f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}\nCooldown: {SIGNAL_COOLDOWN_MINUTES} min\nTP/SL tracking: {TRACK_SIGNAL_RESULTS}\nRisk cash per signal: ${SIGNAL_RISK_CASH:.2f}"
     )
 
     while True:
         try:
             FETCH_CACHE.clear()
+            check_signal_trade_results()
             all_candidates = []
 
             for market in MARKETS:
