@@ -1380,6 +1380,529 @@ def startup_check():
     return True
 
 
+
+# ============================================================
+# QUIET TRADE-ONLY ALERTS + REALIZED P/L TRACKER
+# Overrides the noisy alert functions above.
+# Messages sent:
+# - trade placed
+# - TP hit
+# - SL hit
+# - cut early / manually closed / unprotected auto-close
+# - end-of-day P/L summary
+# ============================================================
+
+STOCK_TRADE_STATE_FILE = os.getenv("STOCK_TRADE_STATE_FILE", "stock_trade_state.json")
+SEND_STARTUP_ALERT = os.getenv("SEND_STARTUP_ALERT", "false").lower() in ["1", "true", "yes", "y"]
+SEND_ORDER_FAILURE_ALERTS = os.getenv("SEND_ORDER_FAILURE_ALERTS", "false").lower() in ["1", "true", "yes", "y"]
+SEND_AUTO_CLOSE_FAILURE_ALERTS = os.getenv("SEND_AUTO_CLOSE_FAILURE_ALERTS", "true").lower() in ["1", "true", "yes", "y"]
+AUTO_CLOSE_RETRIES = int(os.getenv("AUTO_CLOSE_RETRIES", "3"))
+AUTO_CLOSE_RETRY_DELAY = float(os.getenv("AUTO_CLOSE_RETRY_DELAY", "3"))
+INCLUDE_OPEN_UNREALIZED_IN_EOD = os.getenv("INCLUDE_OPEN_UNREALIZED_IN_EOD", "true").lower() in ["1", "true", "yes", "y"]
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        print("SAVE JSON ERROR:", e)
+
+
+def today_key():
+    return now_ny().date().isoformat()
+
+
+def empty_stock_trade_state():
+    return {
+        "date": today_key(),
+        "trades": [],
+        "last_eod_date": None,
+    }
+
+
+def load_stock_trade_state():
+    state = load_json(STOCK_TRADE_STATE_FILE, empty_stock_trade_state())
+    if not isinstance(state, dict):
+        state = empty_stock_trade_state()
+    state.setdefault("date", today_key())
+    state.setdefault("trades", [])
+    state.setdefault("last_eod_date", None)
+    return state
+
+
+def save_stock_trade_state(state):
+    # Keep recent trade history but avoid unlimited file growth.
+    state["trades"] = state.get("trades", [])[-500:]
+    save_json(STOCK_TRADE_STATE_FILE, state)
+
+
+def get_order_nested(order_id: str):
+    if not order_id or order_id == "DRY_RUN":
+        return None
+    return alpaca_get(f"/v2/orders/{order_id}", params={"nested": "true"})
+
+
+def get_position_obj(symbol: str):
+    for p in get_positions():
+        if p.get("symbol") == symbol and float(p.get("qty", 0)) != 0:
+            return p
+    return None
+
+
+def calc_trade_pnl(side: str, qty: float, entry: float, exit_price: float):
+    try:
+        qty = abs(float(qty))
+        entry = float(entry)
+        exit_price = float(exit_price)
+    except Exception:
+        return 0.0
+
+    if side == "buy":
+        return (exit_price - entry) * qty
+    return (entry - exit_price) * qty
+
+
+def trade_r_value(trade, pnl):
+    try:
+        risk_cash = abs(float(trade.get("entry", 0)) - float(trade.get("sl", 0))) * abs(float(trade.get("qty", 0)))
+        if risk_cash <= 0:
+            return 0.0
+        return float(pnl) / risk_cash
+    except Exception:
+        return 0.0
+
+
+def detect_exit_reason_from_leg(leg, trade):
+    order_type = str(leg.get("type", "")).lower()
+    side = str(trade.get("side", "")).lower()
+
+    # Alpaca bracket exits usually have one limit TP leg and one stop SL leg.
+    if "stop" in order_type or leg.get("stop_price") not in [None, ""]:
+        return "SL"
+
+    if "limit" in order_type or leg.get("limit_price") not in [None, ""]:
+        return "TP"
+
+    # Fallback by comparing fill price to stored SL/TP.
+    try:
+        exit_price = float(leg.get("filled_avg_price") or leg.get("limit_price") or leg.get("stop_price"))
+        sl = float(trade.get("sl", 0))
+        tp = float(trade.get("tp", 0))
+        if side == "buy":
+            return "TP" if exit_price >= tp else "SL" if exit_price <= sl else "CUT_EARLY"
+        else:
+            return "TP" if exit_price <= tp else "SL" if exit_price >= sl else "CUT_EARLY"
+    except Exception:
+        return "CUT_EARLY"
+
+
+def format_trade_placed_message(signal, result):
+    icon = E_ROCKET if signal["side"] == "buy" else E_DOWN
+    mode_text = "PAPER TRADE PLACED" if ALPACA_PAPER else "LIVE TRADE PLACED"
+
+    return (
+        f"{icon} {signal['symbol']} {mode_text}\n\n"
+        f"Model: {signal['model']}\n"
+        f"Direction: {signal['direction']}\n"
+        f"Bias: {signal.get('bias', 'UNKNOWN')}\n"
+        f"Score: {signal.get('score', 'UNKNOWN')}/100\n"
+        f"Qty: {result.get('qty', 'UNKNOWN')}\n\n"
+        f"Entry ref: ${float(signal.get('price', 0)):.2f}\n"
+        f"SL: ${float(signal.get('sl', 0)):.2f}\n"
+        f"TP: ${float(signal.get('tp', 0)):.2f}\n\n"
+        f"Reason: {signal.get('reason', 'UNKNOWN')}\n"
+        f"Edge: {signal.get('edge_note', 'no_profile')}"
+    )
+
+
+def format_exit_message(trade, reason, exit_price, pnl):
+    symbol = trade.get("symbol", "UNKNOWN")
+    qty = float(trade.get("qty", 0))
+    entry = float(trade.get("entry", 0))
+    r_val = trade_r_value(trade, pnl)
+
+    if reason == "TP":
+        title = f"{E_CHECK} {symbol} TAKE PROFIT HIT"
+    elif reason == "SL":
+        title = f"{E_CROSS} {symbol} STOP LOSS HIT"
+    else:
+        title = f"{E_WARN} {symbol} CUT EARLY / CLOSED"
+
+    return (
+        f"{title}\n\n"
+        f"Model: {trade.get('model', 'UNKNOWN')}\n"
+        f"Direction: {trade.get('direction', 'UNKNOWN')}\n"
+        f"Qty: {qty:g}\n\n"
+        f"Entry: ${entry:.2f}\n"
+        f"Exit: ${float(exit_price):.2f}\n"
+        f"SL: ${float(trade.get('sl', 0)):.2f}\n"
+        f"TP: ${float(trade.get('tp', 0)):.2f}\n\n"
+        f"P/L: ${float(pnl):.2f}\n"
+        f"R: {r_val:.2f}R"
+    )
+
+
+def register_stock_trade(signal, result):
+    state = load_stock_trade_state()
+
+    trade = {
+        "date": today_key(),
+        "placed_at": now_ny().isoformat(),
+        "symbol": signal["symbol"],
+        "side": signal["side"],
+        "direction": signal["direction"],
+        "model": signal.get("model"),
+        "score": signal.get("score"),
+        "bias": signal.get("bias"),
+        "qty": float(result.get("qty", 0) or 0),
+        "entry": float(signal.get("price", 0) or 0),
+        "sl": float(signal.get("sl", 0) or 0),
+        "tp": float(signal.get("tp", 0) or 0),
+        "parent_order_id": result.get("id"),
+        "dry_run": bool(result.get("dry_run", False)),
+        "status": "open",
+        "entry_filled_price": None,
+        "exit_reason": None,
+        "exit_price": None,
+        "pnl": 0.0,
+        "r": 0.0,
+        "exit_notified": False,
+        "raw_order_id": result.get("id"),
+    }
+
+    state.setdefault("trades", []).append(trade)
+    save_stock_trade_state(state)
+    return trade
+
+
+def find_open_tracked_trade(symbol):
+    state = load_stock_trade_state()
+    for trade in reversed(state.get("trades", [])):
+        if trade.get("symbol") == symbol and trade.get("status") in ["open", "closing_early"]:
+            return trade, state
+    return None, state
+
+
+def close_tracked_trade(state, trade, reason, exit_price, pnl):
+    trade["status"] = "closed"
+    trade["closed_at"] = now_ny().isoformat()
+    trade["exit_reason"] = reason
+    trade["exit_price"] = float(exit_price)
+    trade["pnl"] = float(pnl)
+    trade["r"] = trade_r_value(trade, pnl)
+
+    if not trade.get("exit_notified"):
+        send(format_exit_message(trade, reason, exit_price, pnl))
+        trade["exit_notified"] = True
+
+    save_stock_trade_state(state)
+
+
+def handle_signal(signal: dict):
+    symbol = signal["symbol"]
+    result = submit_bracket_order(signal)
+
+    if not result["ok"]:
+        print(f"{symbol} ORDER FAILED: {result.get('reason')}")
+        if SEND_ORDER_FAILURE_ALERTS:
+            send_once(
+                f"{BOT_STATE['DATE']}:{symbol}:ORDER_FAIL:{int(time.time())}",
+                f"{E_WARN} {symbol} ORDER FAILED\n\nReason: {result['reason']}"
+            )
+        return False
+
+    STATE[symbol]["TRADED_TODAY"] = True
+    STATE[symbol]["ORDER_ID"] = result["id"]
+    STATE[symbol]["ORDER_STATUS_NOTIFIED"] = "submitted"
+    BOT_STATE["TRADES_TODAY"] += 1
+
+    register_stock_trade(signal, result)
+
+    # Single entry alert only.
+    send_once(
+        f"{BOT_STATE['DATE']}:{symbol}:TRADE_PLACED:{result.get('id')}",
+        format_trade_placed_message(signal, result)
+    )
+    return True
+
+
+def check_order_updates():
+    state = load_stock_trade_state()
+    changed = False
+
+    for trade in state.get("trades", []):
+        if trade.get("status") not in ["open", "closing_early"]:
+            continue
+
+        symbol = trade.get("symbol")
+        parent_id = trade.get("parent_order_id")
+        if not symbol:
+            continue
+
+        # DRY_RUN cannot have real Alpaca child orders. Leave it out of real P/L tracking.
+        if trade.get("dry_run") or parent_id == "DRY_RUN":
+            continue
+
+        order = get_order_nested(parent_id)
+        if isinstance(order, dict):
+            parent_status = order.get("status", "")
+
+            if order.get("filled_avg_price") not in [None, ""]:
+                try:
+                    trade["entry_filled_price"] = float(order.get("filled_avg_price"))
+                    trade["entry"] = float(order.get("filled_avg_price"))
+                    changed = True
+                except Exception:
+                    pass
+
+            # Check bracket child legs for TP/SL fills.
+            legs = order.get("legs") or []
+            for leg in legs:
+                if str(leg.get("status", "")).lower() == "filled":
+                    reason = detect_exit_reason_from_leg(leg, trade)
+                    exit_price = float(
+                        leg.get("filled_avg_price")
+                        or leg.get("limit_price")
+                        or leg.get("stop_price")
+                        or get_latest_price(symbol)
+                        or trade.get("entry", 0)
+                    )
+                    pnl = calc_trade_pnl(trade.get("side", "buy"), trade.get("qty", 0), trade.get("entry", 0), exit_price)
+                    close_tracked_trade(state, trade, reason, exit_price, pnl)
+                    changed = True
+                    break
+
+            if trade.get("status") == "closed":
+                continue
+
+            if parent_status in ["canceled", "expired", "rejected", "suspended"] and not trade.get("entry_filled_price"):
+                trade["status"] = parent_status
+                trade["closed_at"] = now_ny().isoformat()
+                changed = True
+                continue
+
+        # If the position has disappeared and no TP/SL leg was found, it was likely cut manually or auto-closed.
+        pos = get_position_obj(symbol)
+        if pos is None and trade.get("entry_filled_price"):
+            exit_price = get_latest_price(symbol) or trade.get("entry", 0)
+            pnl = calc_trade_pnl(trade.get("side", "buy"), trade.get("qty", 0), trade.get("entry", 0), exit_price)
+            close_tracked_trade(state, trade, "CUT_EARLY", exit_price, pnl)
+            changed = True
+
+    if changed:
+        save_stock_trade_state(state)
+
+
+def protect_uncovered_positions():
+    if not PROTECT_UNCOVERED_POSITIONS:
+        return
+
+    positions = get_positions()
+    if not positions:
+        return
+
+    open_orders = get_open_orders()
+
+    for p in positions:
+        symbol = p.get("symbol")
+        if not symbol:
+            continue
+
+        try:
+            qty = float(p.get("qty", 0))
+            avg_entry = float(p.get("avg_entry_price", 0))
+            unrealized_pl = float(p.get("unrealized_pl", 0))
+        except Exception:
+            qty = 0
+            avg_entry = 0
+            unrealized_pl = 0
+
+        if qty == 0:
+            continue
+
+        exits = [o for o in open_orders if is_exit_order_for_position(o, symbol, qty)]
+        if exits:
+            if symbol in STATE:
+                STATE[symbol]["LAST_REASON"] = "POSITION_PROTECTED"
+            continue
+
+        should_auto_close = (
+            (ALPACA_PAPER and AUTO_CLOSE_UNPROTECTED_PAPER)
+            or ((not ALPACA_PAPER) and AUTO_CLOSE_UNPROTECTED_LIVE)
+        )
+
+        if not should_auto_close:
+            # Quiet mode: no warning spam unless auto-close is enabled.
+            print(f"UNPROTECTED POSITION FOUND: {symbol}, but auto-close is off.")
+            continue
+
+        trade, state = find_open_tracked_trade(symbol)
+
+        result = None
+        for attempt in range(1, AUTO_CLOSE_RETRIES + 1):
+            result = close_position_market(symbol)
+            if not (isinstance(result, dict) and result.get("_ok") is False):
+                break
+            time.sleep(AUTO_CLOSE_RETRY_DELAY)
+
+        if isinstance(result, dict) and result.get("_ok") is False:
+            print(f"AUTO-CLOSE FAILED for {symbol}: {result.get('_error', 'unknown')}")
+            if SEND_AUTO_CLOSE_FAILURE_ALERTS:
+                send_once(
+                    f"{BOT_STATE['DATE']}:{symbol}:AUTO_CLOSE_FAILED",
+                    f"{E_WARN} {symbol} AUTO-CLOSE FAILED\n\n"
+                    f"Reason: {result.get('_error', 'unknown')}\n\n"
+                    f"This position may still be unprotected."
+                )
+            continue
+
+        # Message once when the bot cuts an unprotected position early.
+        exit_price = get_latest_price(symbol) or avg_entry
+        if trade:
+            trade["status"] = "closing_early"
+            trade["entry_filled_price"] = trade.get("entry_filled_price") or avg_entry
+            trade["entry"] = trade.get("entry_filled_price") or avg_entry
+            trade["exit_reason"] = "CUT_EARLY"
+            trade["exit_price"] = float(exit_price)
+            trade["pnl"] = calc_trade_pnl(trade.get("side", "buy"), trade.get("qty", abs(qty)), trade.get("entry", avg_entry), exit_price)
+            trade["r"] = trade_r_value(trade, trade["pnl"])
+            trade["closed_at"] = now_ny().isoformat()
+            trade["status"] = "closed"
+            if not trade.get("exit_notified"):
+                send(format_exit_message(trade, "CUT_EARLY", exit_price, trade["pnl"]))
+                trade["exit_notified"] = True
+            save_stock_trade_state(state)
+        else:
+            direction = "LONG" if qty > 0 else "SHORT"
+            send_once(
+                f"{BOT_STATE['DATE']}:{symbol}:CUT_EARLY_UNTRACKED",
+                f"{E_WARN} {symbol} CUT EARLY / AUTO-CLOSED\n\n"
+                f"Direction: {direction}\n"
+                f"Qty: {abs(qty):g}\n"
+                f"Avg entry: ${avg_entry:.2f}\n"
+                f"Approx exit: ${float(exit_price):.2f}\n"
+                f"Approx P/L from Alpaca: ${unrealized_pl:.2f}\n\n"
+                f"Reason: position had no open TP/SL exit orders."
+            )
+
+
+def eod_pnl_from_state():
+    state = load_stock_trade_state()
+    today = today_key()
+
+    closed = [
+        t for t in state.get("trades", [])
+        if str(t.get("date")) == today and t.get("status") == "closed"
+    ]
+
+    wins = [t for t in closed if float(t.get("pnl", 0)) > 0]
+    losses = [t for t in closed if float(t.get("pnl", 0)) < 0]
+    flats = [t for t in closed if abs(float(t.get("pnl", 0))) < 0.005]
+
+    pnl = sum(float(t.get("pnl", 0)) for t in closed)
+    r_total = sum(float(t.get("r", 0)) for t in closed)
+
+    tp_hits = sum(1 for t in closed if t.get("exit_reason") == "TP")
+    sl_hits = sum(1 for t in closed if t.get("exit_reason") == "SL")
+    cut_early = sum(1 for t in closed if t.get("exit_reason") == "CUT_EARLY")
+
+    open_tracked = [
+        t for t in state.get("trades", [])
+        if str(t.get("date")) == today and t.get("status") in ["open", "closing_early"]
+    ]
+
+    return {
+        "closed": closed,
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "pnl": pnl,
+        "r_total": r_total,
+        "tp_hits": tp_hits,
+        "sl_hits": sl_hits,
+        "cut_early": cut_early,
+        "open_tracked": open_tracked,
+    }
+
+
+def end_of_day_summary():
+    t = now_ny()
+    if minute_of_day(t) < to_minutes(EOD_SUMMARY_TIME):
+        return
+    if BOT_STATE["EOD_SENT"]:
+        return
+
+    data = eod_pnl_from_state()
+    positions = get_positions()
+    open_orders = get_open_orders()
+
+    open_unrealized = 0.0
+    if INCLUDE_OPEN_UNREALIZED_IN_EOD:
+        for p in positions:
+            try:
+                open_unrealized += float(p.get("unrealized_pl", 0))
+            except Exception:
+                pass
+
+    traded_symbols = sorted(set(t.get("symbol", "?") for t in data["closed"] + data["open_tracked"]))
+    traded_text = ", ".join(traded_symbols) if traded_symbols else "NONE"
+
+    send(
+        f"{E_SLEEP} STOCK END OF DAY P/L\n\n"
+        f"Date: {today_key()}\n"
+        f"Closed trades: {len(data['closed'])}\n"
+        f"Wins/Losses/Flat: {len(data['wins'])}/{len(data['losses'])}/{len(data['flats'])}\n"
+        f"TP hits: {data['tp_hits']}\n"
+        f"SL hits: {data['sl_hits']}\n"
+        f"Cut early: {data['cut_early']}\n\n"
+        f"Realized P/L: ${data['pnl']:.2f}\n"
+        f"Total R: {data['r_total']:.2f}R\n"
+        f"Open unrealized P/L: ${open_unrealized:.2f}\n\n"
+        f"Symbols: {traded_text}\n"
+        f"Open positions: {len(positions)}\n"
+        f"Open orders: {len(open_orders)}\n"
+        f"Paper: {ALPACA_PAPER}\n"
+        f"Execute: {EXECUTE_ORDERS}"
+    )
+
+    BOT_STATE["EOD_SENT"] = True
+
+
+def startup_check():
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        send(f"{E_WARN} ALPACA KEYS MISSING\n\nSet ALPACA_API_KEY and ALPACA_SECRET_KEY.")
+        return False
+
+    account = get_account()
+    if not account:
+        send(f"{E_WARN} ALPACA ACCOUNT CHECK FAILED\n\nCheck API keys, paper/live setting, or Alpaca connection.")
+        return False
+
+    msg = (
+        f"{E_FIRE} STOCK BOT RUNNING - TRADE ONLY ALERTS {E_FIRE}\n\n"
+        f"Mode: {'PAPER' if ALPACA_PAPER else 'LIVE'}\n"
+        f"Execute orders: {EXECUTE_ORDERS}\n"
+        f"Watchlist: {', '.join(WATCHLIST)}\n"
+        f"Min score to trade: {MIN_SCORE_TO_TRADE}\n"
+        f"Max trades/day: {MAX_TRADES_PER_DAY}\n"
+        f"Max orders/scan: {MAX_NEW_ORDERS_PER_SCAN}\n"
+        f"One position at a time: {ONE_POSITION_AT_A_TIME}\n\n"
+        f"Telegram alerts now only for:\n"
+        f"- trade placed\n"
+        f"- TP hit\n"
+        f"- SL hit\n"
+        f"- cut early / safety close\n"
+        f"- end-of-day P/L"
+    )
+
+    print(msg)
+    if SEND_STARTUP_ALERT:
+        send(msg)
+    return True
+
+
+
 # ============================================================
 # MAIN
 # ============================================================
