@@ -58,7 +58,12 @@ TRADE_STATE_FILE = os.getenv("CRYPTO_GOLD_TRADE_STATE_FILE", "crypto_gold_signal
 SIGNAL_RISK_CASH = safe_float_env("SIGNAL_RISK_CASH", 100)
 TP_SL_CHECK_TIMEFRAME = os.getenv("TP_SL_CHECK_TIMEFRAME", "5m")
 CONSERVATIVE_SAME_CANDLE_EXIT = os.getenv("CONSERVATIVE_SAME_CANDLE_EXIT", "true").lower() in ["1", "true", "yes", "y"]
-MAX_OPEN_SIGNAL_TRADES = int(os.getenv("MAX_OPEN_SIGNAL_TRADES", "10"))
+MAX_OPEN_SIGNAL_TRADES = safe_int_env("MAX_OPEN_SIGNAL_TRADES", 10)
+SEND_DAILY_PL_SUMMARY = os.getenv("SEND_DAILY_PL_SUMMARY", "true").lower() in ["1", "true", "yes", "y"]
+DAILY_PL_SUMMARY_HOUR_UTC = safe_int_env("DAILY_PL_SUMMARY_HOUR_UTC", 21)
+DAILY_PL_SUMMARY_MINUTE_UTC = safe_int_env("DAILY_PL_SUMMARY_MINUTE_UTC", 0)
+SEND_SUMMARY_WHEN_NO_TRADES = os.getenv("SEND_SUMMARY_WHEN_NO_TRADES", "true").lower() in ["1", "true", "yes", "y"]
+
 
 # Market regime detection.
 # Default is SOFT scoring, not hard blocking.
@@ -1174,13 +1179,18 @@ def maybe_send_signal(signal):
 
     save_json(SENT_SIGNAL_FILE, sent)
 
+    # IMPORTANT:
+    # Once a signal is sent, register it as a virtual trade so the bot can
+    # later check whether TP or SL was hit and update the daily P/L tracker.
+    register_signal_trade(signal)
+
 
 # ============================================================
 # SIGNAL TRADE RESULT TRACKER
 # ============================================================
 
 def utc_day_key():
-    return pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    return pd.Timestamp.now("UTC").strftime("%Y-%m-%d")
 
 
 def empty_daily_stats():
@@ -1277,7 +1287,7 @@ def register_signal_trade(signal):
         "target": float(signal["target"]),
         "rr": float(signal.get("rr", 0)),
         "opened_at": str(signal["time"]),
-        "created_at_utc": pd.Timestamp.utcnow().isoformat(),
+        "created_at_utc": pd.Timestamp.now("UTC").isoformat(),
         "reason": signal.get("reason", ""),
         "score": float(signal.get("score", 0)),
     }
@@ -1470,6 +1480,68 @@ def check_signal_trade_results():
     save_trade_state(state)
 
 
+
+def format_daily_pl_summary(state):
+    daily = state.get("daily", empty_daily_stats())
+    open_trades = state.get("open_trades", [])
+
+    open_text = "None"
+    if open_trades:
+        lines = []
+        for t in open_trades[:8]:
+            lines.append(
+                f"- {t['market']} {t['direction']} {t['model']} | "
+                f"Entry {float(t['entry']):.2f} | SL {float(t['stop']):.2f} | TP {float(t['target']):.2f}"
+            )
+        open_text = "\n".join(lines)
+
+    return (
+        f"{E_BOOK} DAILY BTC/GOLD P/L SUMMARY\n\n"
+        f"Date: {state.get('date', utc_day_key())} UTC\n\n"
+        f"{format_daily_scoreboard(daily)}\n\n"
+        f"Open tracked trades: {len(open_trades)}\n"
+        f"{open_text}\n\n"
+        f"Risk cash per signal: ${SIGNAL_RISK_CASH:.2f}\n"
+        f"Tracking: {TRACK_SIGNAL_RESULTS}"
+    )
+
+
+def maybe_send_daily_pl_summary():
+    if not SEND_DAILY_PL_SUMMARY:
+        return
+
+    now = pd.Timestamp.now("UTC")
+    current_minutes = now.hour * 60 + now.minute
+    summary_minutes = DAILY_PL_SUMMARY_HOUR_UTC * 60 + DAILY_PL_SUMMARY_MINUTE_UTC
+
+    if current_minutes < summary_minutes:
+        return
+
+    state = load_trade_state()
+    today = state.get("date", utc_day_key())
+
+    if state.get("last_summary_date") == today:
+        return
+
+    daily = state.get("daily", empty_daily_stats())
+    has_activity = (
+        int(daily.get("signals", 0)) > 0
+        or int(daily.get("wins", 0)) > 0
+        or int(daily.get("losses", 0)) > 0
+        or len(state.get("open_trades", [])) > 0
+    )
+
+    if not has_activity and not SEND_SUMMARY_WHEN_NO_TRADES:
+        state["last_summary_date"] = today
+        save_trade_state(state)
+        return
+
+    send_telegram(format_daily_pl_summary(state))
+    state["last_summary_date"] = today
+    save_trade_state(state)
+
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -1494,13 +1566,14 @@ def run():
         "Swing disabled by default.\n\n"
         "Enabled setups:\n" +
         "\n".join(f"- {s['name']}: {s['entry_tf']} / {s['confirm_tf']} / {s['bias_tf']}" for s in enabled_setups) +
-        f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}\nCooldown: {SIGNAL_COOLDOWN_MINUTES} min\nTP/SL tracking: {TRACK_SIGNAL_RESULTS}\nRisk cash per signal: ${SIGNAL_RISK_CASH:.2f}"
+        f"\n\nMin score to alert: {MIN_SCORE_TO_ALERT}\nSignals per cycle: {TOP_SIGNALS_TO_SEND}\nCooldown: {SIGNAL_COOLDOWN_MINUTES} min\nTP/SL tracking: {TRACK_SIGNAL_RESULTS}\nRisk cash per signal: ${SIGNAL_RISK_CASH:.2f}\nDaily P/L summary: {SEND_DAILY_PL_SUMMARY} at {DAILY_PL_SUMMARY_HOUR_UTC:02d}:{DAILY_PL_SUMMARY_MINUTE_UTC:02d} UTC"
     )
 
     while True:
         try:
             FETCH_CACHE.clear()
             check_signal_trade_results()
+            maybe_send_daily_pl_summary()
             all_candidates = []
 
             for market in MARKETS:
