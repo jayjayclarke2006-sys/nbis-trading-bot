@@ -11,6 +11,24 @@ from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
+def safe_float_env(name, default):
+    raw = os.getenv(name, str(default))
+    try:
+        return float(raw)
+    except Exception:
+        print(f"WARNING: {name} must be a number. Got {raw!r}. Using default {default}.")
+        return float(default)
+
+
+def safe_int_env(name, default):
+    raw = os.getenv(name, str(default))
+    try:
+        return int(raw)
+    except Exception:
+        print(f"WARNING: {name} must be an integer. Got {raw!r}. Using default {default}.")
+        return int(default)
+
+
 # ============================================================
 # CRYPTO / GOLD MERGED LIVE BOT - LOOSER VERSION
 # - multi-setup scan
@@ -26,18 +44,18 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 SENT_SIGNAL_FILE = "crypto_gold_sent_signals.json"
 EDGE_PROFILE_FILE = os.getenv("CRYPTO_GOLD_EDGE_PROFILE_FILE", "crypto_gold_edge_profile.json")
 
-LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
+LIVE_SCAN_SECONDS = safe_int_env("LIVE_SCAN_SECONDS", 60)
 ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() in ["1", "true", "yes", "y"]
-TOP_SIGNALS_TO_SEND = int(os.getenv("TOP_SIGNALS_TO_SEND", "1"))
-MIN_SCORE_TO_ALERT = float(os.getenv("MIN_SCORE_TO_ALERT", "54"))
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "30"))
+TOP_SIGNALS_TO_SEND = safe_int_env("TOP_SIGNALS_TO_SEND", 1)
+MIN_SCORE_TO_ALERT = safe_float_env("MIN_SCORE_TO_ALERT", 54)
+SIGNAL_COOLDOWN_MINUTES = safe_int_env("SIGNAL_COOLDOWN_MINUTES", 30)
 SAME_DIRECTION_COOLDOWN = os.getenv("SAME_DIRECTION_COOLDOWN", "true").lower() in ["1", "true", "yes", "y"]
 
 # Signal result tracking.
 # This tracks the alerts as virtual trades because this BTC/gold bot sends signals only.
 TRACK_SIGNAL_RESULTS = os.getenv("TRACK_SIGNAL_RESULTS", "true").lower() in ["1", "true", "yes", "y"]
 TRADE_STATE_FILE = os.getenv("CRYPTO_GOLD_TRADE_STATE_FILE", "crypto_gold_signal_trade_state.json")
-SIGNAL_RISK_CASH = float(os.getenv("SIGNAL_RISK_CASH", "100"))
+SIGNAL_RISK_CASH = safe_float_env("SIGNAL_RISK_CASH", 100)
 TP_SL_CHECK_TIMEFRAME = os.getenv("TP_SL_CHECK_TIMEFRAME", "5m")
 CONSERVATIVE_SAME_CANDLE_EXIT = os.getenv("CONSERVATIVE_SAME_CANDLE_EXIT", "true").lower() in ["1", "true", "yes", "y"]
 MAX_OPEN_SIGNAL_TRADES = int(os.getenv("MAX_OPEN_SIGNAL_TRADES", "10"))
@@ -76,17 +94,17 @@ SETUPS = [
 ]
 
 PARAMS = {
-    "min_adx": float(os.getenv("MIN_ADX", "10")),
-    "rsi_bull": float(os.getenv("RSI_BULL", "48")),
-    "rsi_bear": float(os.getenv("RSI_BEAR", "52")),
-    "volume_mult": float(os.getenv("VOLUME_MULT", "0.70")),
-    "atr_stop": float(os.getenv("ATR_STOP", "1.10")),
-    "rr": float(os.getenv("RR_TARGET", "1.50")),
-    "pullback_buffer_atr": float(os.getenv("PULLBACK_BUFFER_ATR", "0.50")),
-    "retest_buffer_atr": float(os.getenv("RETEST_BUFFER_ATR", "0.40")),
-    "compression_window": int(os.getenv("COMPRESSION_WINDOW", "10")),
-    "range_window": int(os.getenv("RANGE_WINDOW", "16")),
-    "sweep_lookback": int(os.getenv("SWEEP_LOOKBACK", "6")),
+    "min_adx": safe_float_env("MIN_ADX", 10),
+    "rsi_bull": safe_float_env("RSI_BULL", 48),
+    "rsi_bear": safe_float_env("RSI_BEAR", 52),
+    "volume_mult": safe_float_env("VOLUME_MULT", 0.70),
+    "atr_stop": safe_float_env("ATR_STOP", 1.10),
+    "rr": safe_float_env("RR_TARGET", 1.50),
+    "pullback_buffer_atr": safe_float_env("PULLBACK_BUFFER_ATR", 0.50),
+    "retest_buffer_atr": safe_float_env("RETEST_BUFFER_ATR", 0.40),
+    "compression_window": safe_int_env("COMPRESSION_WINDOW", 10),
+    "range_window": safe_int_env("RANGE_WINDOW", 16),
+    "sweep_lookback": safe_int_env("SWEEP_LOOKBACK", 6),
 }
 
 FETCH_CACHE = {}
