@@ -1903,6 +1903,215 @@ def startup_check():
 
 
 
+
+# ============================================================
+# PROTECTION GRACE FIX
+# Stops false "AUTO-CLOSE FAILED" alerts right after new entries.
+# Reason: Alpaca can show the position before bracket TP/SL child orders
+# are visible through the open orders endpoint.
+# ============================================================
+
+PROTECTION_GRACE_SECONDS = int(os.getenv("PROTECTION_GRACE_SECONDS", "900"))  # 15 minutes
+TREAT_QTY_HELD_AS_PROTECTED = os.getenv("TREAT_QTY_HELD_AS_PROTECTED", "true").lower() in ["1", "true", "yes", "y"]
+
+# Default quiet: do not Telegram spam failed auto-close attempts.
+SEND_AUTO_CLOSE_FAILURE_ALERTS = os.getenv("SEND_AUTO_CLOSE_FAILURE_ALERTS", "false").lower() in ["1", "true", "yes", "y"]
+
+
+def get_open_orders_nested():
+    data = alpaca_get("/v2/orders", params={"status": "open", "limit": 500, "nested": "true"})
+    return data if isinstance(data, list) else []
+
+
+def order_or_leg_is_exit(order, symbol: str, qty: float) -> bool:
+    if order.get("symbol") != symbol:
+        return False
+
+    status = str(order.get("status", "")).lower()
+    good_statuses = ["new", "accepted", "pending_new", "held", "partially_filled"]
+    if status and status not in good_statuses:
+        return False
+
+    side = str(order.get("side", "")).lower()
+
+    # Long positions need sell exits. Short positions need buy exits.
+    if qty > 0 and side == "sell":
+        return True
+    if qty < 0 and side == "buy":
+        return True
+
+    return False
+
+
+def position_has_exit_order(symbol: str, qty: float, open_orders=None) -> bool:
+    open_orders = open_orders if open_orders is not None else get_open_orders_nested()
+
+    for order in open_orders:
+        if order_or_leg_is_exit(order, symbol, qty):
+            return True
+
+        for leg in order.get("legs") or []:
+            if order_or_leg_is_exit(leg, symbol, qty):
+                return True
+
+    return False
+
+
+def get_recent_tracked_trade(symbol: str):
+    trade, state = find_open_tracked_trade(symbol)
+    return trade, state
+
+
+def trade_age_seconds(trade) -> float:
+    if not trade:
+        return 10**9
+    try:
+        placed = pd.Timestamp(trade.get("placed_at"))
+        now = pd.Timestamp(now_ny().isoformat())
+        if placed.tzinfo is None:
+            placed = placed.tz_localize(NY_TZ)
+        return max(0.0, (now - placed).total_seconds())
+    except Exception:
+        return 10**9
+
+
+def position_qty_available(position, qty):
+    for key in ["qty_available", "available", "available_qty"]:
+        if position.get(key) not in [None, ""]:
+            try:
+                return float(position.get(key))
+            except Exception:
+                pass
+    # If Alpaca does not provide qty_available, return None.
+    return None
+
+
+def protect_uncovered_positions():
+    if not PROTECT_UNCOVERED_POSITIONS:
+        return
+
+    positions = get_positions()
+    if not positions:
+        return
+
+    open_orders = get_open_orders_nested()
+
+    for p in positions:
+        symbol = p.get("symbol")
+        if not symbol:
+            continue
+
+        try:
+            qty = float(p.get("qty", 0))
+            avg_entry = float(p.get("avg_entry_price", 0))
+            unrealized_pl = float(p.get("unrealized_pl", 0))
+        except Exception:
+            qty = 0
+            avg_entry = 0
+            unrealized_pl = 0
+
+        if qty == 0:
+            continue
+
+        # 1) If any open opposite-side order/leg exists, the position is protected/held.
+        if position_has_exit_order(symbol, qty, open_orders):
+            if symbol in STATE:
+                STATE[symbol]["LAST_REASON"] = "POSITION_PROTECTED"
+            continue
+
+        # 2) If Alpaca says all shares are already unavailable/held for orders,
+        # do NOT try another close order. This prevents the "available: 0" failure.
+        qty_available = position_qty_available(p, qty)
+        if TREAT_QTY_HELD_AS_PROTECTED and qty_available is not None and abs(qty_available) <= 0.000001:
+            if symbol in STATE:
+                STATE[symbol]["LAST_REASON"] = "POSITION_HELD_FOR_ORDERS"
+            print(f"{symbol}: qty_available is 0, treating as protected/held for orders.")
+            continue
+
+        # 3) Give new bracket orders time to show their child TP/SL orders.
+        trade, state = get_recent_tracked_trade(symbol)
+        age = trade_age_seconds(trade)
+        if age < PROTECTION_GRACE_SECONDS:
+            if symbol in STATE:
+                STATE[symbol]["LAST_REASON"] = f"PROTECTION_GRACE_{int(age)}s"
+            print(f"{symbol}: protection grace active ({int(age)}s/{PROTECTION_GRACE_SECONDS}s).")
+            continue
+
+        should_auto_close = (
+            (ALPACA_PAPER and AUTO_CLOSE_UNPROTECTED_PAPER)
+            or ((not ALPACA_PAPER) and AUTO_CLOSE_UNPROTECTED_LIVE)
+        )
+
+        if not should_auto_close:
+            print(f"UNPROTECTED POSITION FOUND: {symbol}, but auto-close is off.")
+            continue
+
+        result = None
+        for attempt in range(1, AUTO_CLOSE_RETRIES + 1):
+            result = close_position_market(symbol)
+
+            # If Alpaca says quantity is already held for orders, treat as protected.
+            if isinstance(result, dict) and result.get("_ok") is False:
+                err = str(result.get("_error", ""))
+                if "held_for_orders" in err or "available" in err and "0" in err:
+                    print(f"{symbol}: Alpaca says shares are held for orders. Not alerting as failure.")
+                    if symbol in STATE:
+                        STATE[symbol]["LAST_REASON"] = "HELD_FOR_ORDERS_CLOSE_BLOCK"
+                    result = {"_ok": True, "_held_for_orders": True}
+                    break
+
+            if not (isinstance(result, dict) and result.get("_ok") is False):
+                break
+
+            time.sleep(AUTO_CLOSE_RETRY_DELAY)
+
+        if isinstance(result, dict) and result.get("_ok") is False:
+            print(f"AUTO-CLOSE FAILED for {symbol}: {result.get('_error', 'unknown')}")
+            if SEND_AUTO_CLOSE_FAILURE_ALERTS:
+                send_once(
+                    f"{BOT_STATE['DATE']}:{symbol}:AUTO_CLOSE_FAILED",
+                    f"{E_WARN} {symbol} AUTO-CLOSE FAILED\n\n"
+                    f"Reason: {result.get('_error', 'unknown')}\n\n"
+                    f"This position may still be unprotected."
+                )
+            continue
+
+        if isinstance(result, dict) and result.get("_held_for_orders"):
+            continue
+
+        # Message once when the bot actually cuts an unprotected position early.
+        exit_price = get_latest_price(symbol) or avg_entry
+        if trade:
+            trade["status"] = "closing_early"
+            trade["entry_filled_price"] = trade.get("entry_filled_price") or avg_entry
+            trade["entry"] = trade.get("entry_filled_price") or avg_entry
+            trade["exit_reason"] = "CUT_EARLY"
+            trade["exit_price"] = float(exit_price)
+            trade["pnl"] = calc_trade_pnl(trade.get("side", "buy"), trade.get("qty", abs(qty)), trade.get("entry", avg_entry), exit_price)
+            trade["r"] = trade_r_value(trade, trade["pnl"])
+            trade["closed_at"] = now_ny().isoformat()
+            trade["status"] = "closed"
+            if not trade.get("exit_notified"):
+                send(format_exit_message(trade, "CUT_EARLY", exit_price, trade["pnl"]))
+                trade["exit_notified"] = True
+            save_stock_trade_state(state)
+        else:
+            # Untracked old position. Keep this quiet unless failure alerts are enabled.
+            direction = "LONG" if qty > 0 else "SHORT"
+            if SEND_AUTO_CLOSE_FAILURE_ALERTS:
+                send_once(
+                    f"{BOT_STATE['DATE']}:{symbol}:CUT_EARLY_UNTRACKED",
+                    f"{E_WARN} {symbol} CUT EARLY / AUTO-CLOSED\n\n"
+                    f"Direction: {direction}\n"
+                    f"Qty: {abs(qty):g}\n"
+                    f"Avg entry: ${avg_entry:.2f}\n"
+                    f"Approx exit: ${float(exit_price):.2f}\n"
+                    f"Approx P/L from Alpaca: ${unrealized_pl:.2f}\n\n"
+                    f"Reason: position had no visible TP/SL exit orders."
+                )
+
+
+
 # ============================================================
 # MAIN
 # ============================================================
